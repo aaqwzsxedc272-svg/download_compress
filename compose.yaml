@@ -1,0 +1,8 @@
+services:
+  clipwell:
+    build: .
+    init: true
+    restart: unless-stopped
+    # Access privately over SSH; do not publish this unauthenticated app to the internet.
+    ports:
+      - "127.0.0.1:8000:8000"

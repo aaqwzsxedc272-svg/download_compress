@@ -1,6 +1,6 @@
 # Clipwell
 
-A local web app that downloads a video from a supported public link and compresses it to a shareable MP4. It uses yt-dlp for downloading and FFmpeg (provided by imageio-ffmpeg) for encoding.
+A web app that downloads a video from a supported public link and compresses it to a shareable MP4. Run it locally or on a remote server. It uses yt-dlp for downloading and FFmpeg (provided by imageio-ffmpeg) for encoding.
 
 ## Run locally
 
@@ -27,6 +27,28 @@ python app.py
 Open http://localhost:8000. Set `PORT` to change the port. Paste a public video link, choose a quality preset, and wait for the download and encoding to finish; then use the Download MP4 button. The bundled FFmpeg binary must support libx264 and AAC (the standard imageio-ffmpeg binaries do). Keep the app running until you have downloaded the result.
 
 To run the tests: `python -m unittest discover -s tests -v`.
+
+## Run on a remote server (private access)
+
+To avoid downloading the original video to your PC, run Clipwell on **another machine**. That server downloads and compresses the video; your browser downloads only the finished MP4. The server needs Docker with Compose, internet access to the source, and enough disk space for the original and output files. Encoding can take significant CPU time. Hosting costs, if any, depend on your provider.
+
+On your Linux server, clone this branch and start the app:
+
+```sh
+git clone --branch arena/c1987889-download-compress https://github.com/aaqwzsxedc272-svg/download_compress.git
+cd download_compress
+docker compose up -d --build
+```
+
+The Compose configuration binds the app to the server's loopback address, **not** the public internet. From Windows Command Prompt, open an SSH tunnel (replace `YOUR_USER` and `YOUR_SERVER` with your server's SSH username and hostname or IP):
+
+```cmd
+ssh -L 8000:127.0.0.1:8000 YOUR_USER@YOUR_SERVER
+```
+
+Keep that SSH window open and visit http://localhost:8000 on your PC. If port 8000 is already in use on Windows, use `ssh -L 8001:127.0.0.1:8000 YOUR_USER@YOUR_SERVER` and open http://localhost:8001 instead. You must have SSH access to the server; the placeholders are not literal commands to use unchanged.
+
+On the server, `docker compose logs -f` shows logs and `docker compose down` stops and removes the container. Restarting or removing the container loses all jobs and results. The temporary source is deleted after a job succeeds or fails; forced stops may leave temporary files until the container is removed. Do not expose the app publicly: it has no authentication, quotas, or comprehensive SSRF protection. Use it only with trusted users and links.
 
 ## How it works
 

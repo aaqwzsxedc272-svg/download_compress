@@ -28,9 +28,15 @@ Open http://localhost:8000. Set `PORT` to change the port. Paste a public video 
 
 To run the tests: `python -m unittest discover -s tests -v`.
 
+## Free cloud option: Google Colab (no server setup)
+
+For occasional interactive use, open [Clipwell in Google Colab](https://colab.research.google.com/github/aaqwzsxedc272-svg/download_compress/blob/arena/c1987889-download-compress/Clipwell_Colab.ipynb), sign in to your Google account, paste the link in the form, and run the cell. Use the free CPU runtime. The source and encoding remain in the temporary cloud runtime; download only the completed MP4 to your computer. Disconnect and delete the runtime after the download finishes.
+
+This uses a notebook interface rather than the dark-mode website. Colab's free resources and session duration are limited and not guaranteed; large files can fail or take a long time, and results disappear when the runtime is deleted. Colab prohibits file-hosting/media-serving web services and other activities; see its [FAQ](https://research.google.com/colaboratory/faq.html). Only process content you have permission to use. If the direct link fails, open Colab, choose **File → Open notebook → GitHub**, enter `aaqwzsxedc272-svg/download_compress`, select branch `arena/c1987889-download-compress`, and open `Clipwell_Colab.ipynb`.
+
 ## Free cloud option: Render
 
-Render's Free web service can run Clipwell remotely; you do not need your own server or a credit card to use a Free instance. Sign-up and connecting your GitHub repository still require a few steps. On Render, the source and encoding stay on the remote instance and only the final MP4 is downloaded to your computer.
+Render's Free web service can run Clipwell remotely; you do not need your own server; however, Render may request card verification depending on the account or region. Sign-up and connecting your GitHub repository still require a few steps. On Render, the source and encoding stay on the remote instance and only the final MP4 is downloaded to your computer.
 
 1. Create a free account at [Render](https://render.com/) and connect GitHub.
 2. Select **New → Web Service** and select `aaqwzsxedc272-svg/download_compress`. Choose branch `arena/c1987889-download-compress`, runtime **Docker**, and instance type **Free**. (Alternatively, deploy `render.yaml` as a Blueprint.)

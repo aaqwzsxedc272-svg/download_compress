@@ -15,7 +15,7 @@ class NotebookTests(unittest.TestCase):
             self.assertEqual(cell['outputs'], [])
             compile(''.join(cell['source']), 'Clipwell_Colab.ipynb', 'exec')
         source = ''.join(code_cells[0]['source'])
-        self.assertIn('video_url = ""', source)
+        self.assertIn('video_urls = ""', source)
         self.assertIn('files.download(str(result_path))', source)
 
 

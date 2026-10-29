@@ -17,9 +17,9 @@
     <section class="workspace" aria-label="Video compression tool">
       <div class="card-top"><div><div class="card-kicker"><span class="mini-spark">✦</span> THE VIDEO WORKSPACE</div><h2>Let’s make some room.</h2><p>From link to lighter file in just a few steps.</p></div><div class="card-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="16" rx="3" stroke="currentColor" stroke-width="1.6"/><path d="m10 8.5 5 3.5-5 3.5v-7Z" fill="currentColor"/></svg></div></div>
       <form id="video-form">
-        <div class="section-label"><span class="step">01</span><label for="url">Paste your video link</label><span class="required">REQUIRED</span></div>
-        <div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><path d="M10 13a4 4 0 0 0 5.7 0l3-3A4 4 0 1 0 13 4.3l-1.7 1.8M14 11a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.7-1.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="url" name="url" type="url" placeholder="https://example.com/your-video" required autocomplete="url"><button type="button" class="paste" id="paste">Paste</button></div>
-        <div class="helper"><span class="helper-icon">i</span> Works with direct video links, public Filester files, and supported video sites.</div>
+        <div class="section-label"><span class="step">01</span><label for="url">Paste your video links</label><span class="required">REQUIRED</span></div>
+        <div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><path d="M10 13a4 4 0 0 0 5.7 0l3-3A4 4 0 1 0 13 4.3l-1.7 1.8M14 11a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.7-1.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><textarea id="url" name="url" rows="3" placeholder="https://example.com/your-video&#10;One link per line" required></textarea><button type="button" class="paste" id="paste">Paste</button></div>
+        <div class="helper"><span class="helper-icon">i</span> One link per line, up to 20. Videos process one at a time. Keep this tab open.</div>
         <div class="section-label quality-heading"><span class="step">02</span><span>Choose your quality</span><span class="optional">PICK WHAT MATTERS MOST</span></div>
         <div class="presets" role="radiogroup" aria-label="Compression quality">
           <label class="preset"><input type="radio" name="preset" value="high"><span class="preset-content"><span class="preset-head"><span class="preset-icon">✧</span><span class="radio"></span></span><strong>Highest quality</strong><small>More detail, larger file</small></span></label>

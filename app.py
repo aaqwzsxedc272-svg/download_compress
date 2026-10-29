@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import imageio_ffmpeg
 import yt_dlp
 import filester
+import filehosts
 from flask import Flask, jsonify, request, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -83,6 +84,28 @@ def readable_error(exc: Exception) -> str:
     return message[:350] or "Something went wrong. Please try again."
 
 
+def probe_duration(ffmpeg: str, source: Path) -> float:
+    """FFmpeg reports duration in its input diagnostics, without a separate ffprobe binary."""
+    try:
+        result = subprocess.run([ffmpeg, "-hide_banner", "-i", str(source)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, timeout=30, errors="replace")
+        match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+        if match:
+            hours, minutes, seconds = match.groups()
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 0
+
+
+def remaining_seconds(completed, total, elapsed):
+    """Estimate a stage's remaining time once enough work has been observed."""
+    if elapsed < 3 or completed <= 0 or total <= 0 or completed >= total:
+        return None
+    return max(0, int((total - completed) * elapsed / completed))
+
+
 def run_job(job_id: str):
     job = JOBS[job_id]
     folder = WORK_DIR / job_id
@@ -95,9 +118,9 @@ def run_job(job_id: str):
             if data.get("status") == "downloading":
                 total = data.get("total_bytes") or data.get("total_bytes_estimate")
                 percent = min(99, int(data.get("downloaded_bytes", 0) / total * 100)) if total else None
-                update(job_id, stage="downloading", progress=percent)
+                update(job_id, stage="downloading", progress=percent, eta_seconds=data.get("eta"))
             elif data.get("status") == "finished":
-                update(job_id, stage="preparing", progress=None)
+                update(job_id, stage="preparing", progress=None, eta_seconds=None)
 
         options = {
             "format": "bestvideo*+bestaudio/best",
@@ -113,11 +136,16 @@ def run_job(job_id: str):
         }
         update(job_id, stage="downloading", progress=None)
         if filester.share_slug(job["url"]):
+            download_started = time.monotonic()
             def filester_progress(downloaded, total):
                 percentage = min(99, int(downloaded / total * 100)) if total else None
-                update(job_id, stage="downloading", progress=percentage)
+                eta = remaining_seconds(downloaded, total, time.monotonic() - download_started) if total else None
+                update(job_id, stage="downloading", progress=percentage, eta_seconds=eta)
             title = filester.download(job["url"], folder / "source.bin", filester_progress)
-            duration = 0  # Filester does not supply video duration in its download ticket.
+            duration = 0  # Probe the downloaded file below.
+        elif filehosts.supported(job["url"]):
+            title = filehosts.download(job["url"], folder)
+            duration = 0
         else:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(job["url"], download=True)
@@ -129,7 +157,11 @@ def run_job(job_id: str):
             raise RuntimeError("The download finished but no video file was found.")
         source = max(sources, key=lambda p: p.stat().st_size)
         source_size = source.stat().st_size
-        update(job_id, stage="compressing", progress=0 if duration else None, title=title, source_size=source_size)
+        if not duration:
+            update(job_id, stage="preparing", progress=None, eta_seconds=None)
+            duration = probe_duration(ffmpeg, source)
+        update(job_id, stage="compressing", progress=0 if duration else None, eta_seconds=None, title=title, source_size=source_size)
+        encode_started = time.monotonic()
         output = folder / "compressed.mp4"
         # CRF controls perceptual quality; slow encoding improves compression at the same quality.
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
@@ -145,8 +177,10 @@ def run_job(job_id: str):
             for line in process.stdout:
                 if line.startswith("out_time_us=") and duration:
                     try:
-                        percentage = min(99, max(0, int(int(line.split("=", 1)[1]) / 1_000_000 / duration * 100)))
-                        update(job_id, progress=percentage)
+                        encoded_seconds = int(line.split("=", 1)[1]) / 1_000_000
+                        percentage = min(99, max(0, int(encoded_seconds / duration * 100)))
+                        eta = remaining_seconds(encoded_seconds, duration, time.monotonic() - encode_started)
+                        update(job_id, progress=percentage, eta_seconds=eta)
                     except ValueError:
                         pass
             process.stdout.close()
@@ -159,10 +193,10 @@ def run_job(job_id: str):
         for path in folder.iterdir():
             if path != output and path.is_file():
                 path.unlink()
-        update(job_id, stage="done", progress=100, output_size=output_size, path=str(output), finished_at=time.time())
+        update(job_id, stage="done", progress=100, eta_seconds=None, output_size=output_size, path=str(output), finished_at=time.time())
     except Exception as exc:
         shutil.rmtree(folder, ignore_errors=True)
-        update(job_id, stage="error", progress=None, error=readable_error(exc), finished_at=time.time())
+        update(job_id, stage="error", progress=None, eta_seconds=None, error=readable_error(exc), finished_at=time.time())
 
 
 @app.get("/")

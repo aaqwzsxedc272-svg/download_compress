@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 import imageio_ffmpeg
 import yt_dlp
+import filester
 from flask import Flask, jsonify, request, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -60,7 +61,7 @@ def validate_url(url: str):
 
 
 def readable_error(exc: Exception) -> str:
-    message = str(exc).replace("ERROR: ", "")
+    message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc)).replace("ERROR: ", "")
     # Avoid exposing local file paths or very long extractor diagnostics in the UI.
     message = re.sub(r"/[^\s:]+/clipwell-[^\s:]+", "[working directory]", message)
     return message[:350] or "Something went wrong. Please try again."
@@ -95,17 +96,24 @@ def run_job(job_id: str):
             "socket_timeout": 30,
         }
         update(job_id, stage="downloading", progress=None)
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(job["url"], download=True)
-            title = info.get("title") or "Video"
-            duration = info.get("duration") or 0
+        if filester.share_slug(job["url"]):
+            def filester_progress(downloaded, total):
+                percentage = min(99, int(downloaded / total * 100)) if total else None
+                update(job_id, stage="downloading", progress=percentage)
+            title = filester.download(job["url"], folder / "source.bin", filester_progress)
+            duration = 0  # Filester does not supply video duration in its download ticket.
+        else:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(job["url"], download=True)
+                title = info.get("title") or "Video"
+                duration = info.get("duration") or 0
         # yt-dlp may merge streams; pick the final media, not partial files.
         sources = [p for p in folder.glob("source.*") if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
         if not sources:
             raise RuntimeError("The download finished but no video file was found.")
         source = max(sources, key=lambda p: p.stat().st_size)
         source_size = source.stat().st_size
-        update(job_id, stage="compressing", progress=0, title=title, source_size=source_size)
+        update(job_id, stage="compressing", progress=0 if duration else None, title=title, source_size=source_size)
         output = folder / "compressed.mp4"
         # CRF controls perceptual quality; slow encoding improves compression at the same quality.
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),

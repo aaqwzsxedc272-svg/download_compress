@@ -51,6 +51,22 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(result.mimetype, 'video/mp4')
                 result.close()
 
+    def test_filester_source_runs_through_encoder(self):
+        ffmpeg = app.imageio_ffmpeg.get_ffmpeg_exe()
+        job_id = 'filester-job'
+        app.JOBS[job_id] = {'id': job_id, 'url': 'https://filester.si/d/abc',
+                            'preset': 'high', 'stage': 'queued'}
+        def fake_download(url, destination, progress):
+            subprocess.run([ffmpeg, '-loglevel', 'error', '-f', 'lavfi', '-i',
+                            'testsrc2=size=160x120:rate=10', '-t', '1', '-c:v', 'libx264',
+                            '-f', 'mp4', '-y', str(destination)], check=True)
+            progress(destination.stat().st_size, destination.stat().st_size)
+            return 'Filester video.mp4'
+        with patch.object(app.filester, 'download', side_effect=fake_download):
+            app.run_job(job_id)
+        self.assertEqual(app.JOBS[job_id]['stage'], 'done', app.JOBS[job_id].get('error'))
+        self.assertGreater(app.JOBS[job_id]['output_size'], 0)
+
     def test_setup_errors_are_reported(self):
         job_id = 'setup-error'
         app.JOBS[job_id] = {'id': job_id, 'url': 'https://example.com/video',

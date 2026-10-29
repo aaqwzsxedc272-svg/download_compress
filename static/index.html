@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#f8f9f6">
+  <title>Clipwell — Make room for better video</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/" aria-label="Clipwell home"><span class="brand-mark"><svg viewBox="0 0 24 24" fill="none"><path d="M5 4.5h8.8a4 4 0 0 1 4 4v1.1l2.4-1.4v7.6l-2.4-1.4v1.1a4 4 0 0 1-4 4H5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m10 9 4 3-4 3V9Z" fill="currentColor"/></svg></span>clipwell<span class="brand-dot">.</span></a><div class="top-right"><span class="status-dot"></span> YOUR VIDEO TOOLKIT <span class="top-divider"></span> <span class="top-note">Made for better sharing</span></div></header>
+  <main>
+    <div class="page-heading"><div class="eyebrow"><span class="sparkle">✳</span> LESS FILE, MORE FILM</div><h1>Big video? <span>Small problem.</span></h1><p>Download and compress your videos in one place.<br class="desktop-break"> Keep the moments crisp, not the file size.</p></div>
+    <section class="workspace" aria-label="Video compression tool">
+      <div class="card-top"><div><div class="card-kicker"><span class="mini-spark">✦</span> THE VIDEO WORKSPACE</div><h2>Let’s make some room.</h2><p>From link to lighter file in just a few steps.</p></div><div class="card-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="16" rx="3" stroke="currentColor" stroke-width="1.6"/><path d="m10 8.5 5 3.5-5 3.5v-7Z" fill="currentColor"/></svg></div></div>
+      <form id="video-form">
+        <div class="section-label"><span class="step">01</span><label for="url">Paste your video link</label><span class="required">REQUIRED</span></div>
+        <div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><path d="M10 13a4 4 0 0 0 5.7 0l3-3A4 4 0 1 0 13 4.3l-1.7 1.8M14 11a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.7-1.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="url" name="url" type="url" placeholder="https://example.com/your-video" required autocomplete="url"><button type="button" class="paste" id="paste">Paste</button></div>
+        <div class="helper"><span class="helper-icon">i</span> Works with direct video links and supported video sites.</div>
+        <div class="section-label quality-heading"><span class="step">02</span><span>Choose your quality</span><span class="optional">PICK WHAT MATTERS MOST</span></div>
+        <div class="presets" role="radiogroup" aria-label="Compression quality">
+          <label class="preset"><input type="radio" name="preset" value="high"><span class="preset-content"><span class="preset-head"><span class="preset-icon">✧</span><span class="radio"></span></span><strong>Highest quality</strong><small>More detail, larger file</small></span></label>
+          <label class="preset"><input type="radio" name="preset" value="balanced" checked><span class="preset-content"><span class="preset-head"><span class="preset-icon balance-icon">◈</span><span class="radio"></span></span><strong>Balanced <em>POPULAR</em></strong><small>Great quality, smaller file</small></span></label>
+          <label class="preset"><input type="radio" name="preset" value="small"><span class="preset-content"><span class="preset-head"><span class="preset-icon">↙</span><span class="radio"></span></span><strong>Smallest file</strong><small>Less size, softer details</small></span></label>
+        </div>
+        <div id="message" class="message" role="alert" hidden></div>
+        <button class="submit" id="submit" type="submit"><span>Make my video smaller</span><span class="arrow">↗</span></button>
+        <div class="under-button"><span>✦</span> No resolution downscaling <i></i> MP4 output</div>
+        <p class="quality-note">Compression can reduce quality, and already-efficient videos may not get smaller. Results vary by source.</p>
+      </form>
+      <div id="job-panel" class="job-panel" hidden aria-live="polite"></div>
+    </section>
+    <div class="below-card"><div class="lock-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="5" y="10" width="14" height="10" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div><p><strong>A little note on your videos</strong><br>Only download videos you have permission to use. Processing happens on this server.</p></div>
+    <section class="how"><div class="how-intro"><div class="eyebrow muted">THE SIMPLE VERSION</div><h2>Good things come<br>in smaller packages.</h2><p>Less waiting, more watching. Here’s how it works.</p></div><div class="how-step"><span class="how-number">01</span><div class="how-icon">↗</div><h3>Drop a link</h3><p>Paste the URL of a video you want to download.</p></div><div class="how-step"><span class="how-number">02</span><div class="how-icon">⌁</div><h3>Pick your balance</h3><p>Choose the quality and file size that works for you.</p></div><div class="how-step"><span class="how-number">03</span><div class="how-icon">↓</div><h3>Take it anywhere</h3><p>Download your smaller MP4, ready to share.</p></div></section>
+  </main>
+  <footer><a class="footer-brand" href="/">clipwell<span>.</span></a><span>MADE FOR THE MOMENTS WORTH KEEPING</span><span>LESS FILE. MORE FILM. ✳</span></footer>
+  <script src="/app.js"></script>
+</body>
+</html>

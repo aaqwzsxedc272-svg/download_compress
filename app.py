@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import hmac
 import ipaddress
 import os
 import re
@@ -34,6 +35,21 @@ PRESETS = {
     "balanced": {"crf": 23, "label": "Balanced"},
     "small": {"crf": 28, "label": "Smallest file"},
 }
+
+
+@app.before_request
+def protect_hosted_app():
+    """Require an operator-chosen password for public Render deployments."""
+    password = os.environ.get("CLIPWELL_PASSWORD", "")
+    required = os.environ.get("RENDER") == "true" or os.environ.get("CLIPWELL_REQUIRE_PASSWORD") == "1"
+    if required and len(password) < 16:
+        return "Set CLIPWELL_PASSWORD to a strong password of at least 16 characters.", 503
+    if password:
+        auth = request.authorization
+        valid = (auth and auth.type.lower() == "basic" and auth.username == "clipwell"
+                 and hmac.compare_digest((auth.password or "").encode(), password.encode()))
+        if not valid:
+            return "Authentication required.", 401, {"WWW-Authenticate": 'Basic realm="Clipwell", charset="UTF-8"'}
 
 
 def public_job(job: dict) -> dict:
@@ -117,7 +133,8 @@ def run_job(job_id: str):
         output = folder / "compressed.mp4"
         # CRF controls perceptual quality; slow encoding improves compression at the same quality.
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-               "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "slow",
+               "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-threads", "2",
+               "-preset", "medium" if os.environ.get("RENDER") == "true" else "slow",
                "-crf", str(PRESETS[job["preset"]]["crf"]), "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
                "-progress", "pipe:1", "-nostats", str(output)]
@@ -170,6 +187,8 @@ def create_job():
     job_id = uuid.uuid4().hex
     job = {"id": job_id, "url": url, "preset": preset, "stage": "queued", "progress": None, "created_at": time.time()}
     with LOCK:
+        if any(existing["stage"] not in ("done", "error") for existing in JOBS.values()):
+            return jsonify(error="A video is already being processed. Please wait for it to finish."), 409
         JOBS[job_id] = job
         response_job = public_job(job)
     threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
@@ -194,6 +213,19 @@ def download(job_id):
         path = job["path"]
         title = re.sub(r'[^\w\- .]', '', job.get("title", "video"), flags=re.UNICODE).strip(' .')[:100] or "video"
     return send_file(path, as_attachment=True, download_name=f"{title} - compressed.mp4", mimetype="video/mp4")
+
+
+@app.delete("/api/jobs/<job_id>")
+def delete_job(job_id):
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify(error="Job not found."), 404
+        if job["stage"] not in ("done", "error"):
+            return jsonify(error="Wait for processing to finish first."), 409
+        del JOBS[job_id]
+    shutil.rmtree(WORK_DIR / job_id, ignore_errors=True)
+    return "", 204
 
 
 @app.errorhandler(RequestEntityTooLarge)

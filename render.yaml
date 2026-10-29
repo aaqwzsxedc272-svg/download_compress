@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: clipwell
+    runtime: docker
+    plan: free
+    envVars:
+      # Render prompts for this during Blueprint setup. Do not commit your password.
+      - key: CLIPWELL_PASSWORD
+        sync: false

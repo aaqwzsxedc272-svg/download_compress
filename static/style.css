@@ -21,3 +21,4 @@ body{background:#101a16;color:var(--ink)}
 .below-card{color:#a0b2a3}.below-card strong{color:#c1d2c1}.lock-icon{border-color:#344b3b;color:#b3cdb1}
 .how{border-color:#2c4035}.muted{color:#9ebda0}.how-intro p,.how-step p{color:#a1b2a5}.how-number{color:#6d8972}.how-icon{background:#293e2f;color:#b2d39f}
 footer{border-color:#2b3d32;color:#94a89a}.message{background:#432d27;color:#ffc5b2}.job-panel{border-color:#425c45;background:#203229}.job-panel p{color:#adbeaf}.progress-track{background:#344c39}.progress-bar{background:#a9d291}.result-stats{color:#b1c6b3}.result-stats strong{color:#e5f2df}.job-panel .warning{color:#e7c18e}
+.delete-button{margin:14px 0 0 8px;border:1px solid #57715b;background:transparent;color:#c9decb;border-radius:7px;padding:10px 14px;font:700 12px 'DM Sans',sans-serif;cursor:pointer}.delete-button:hover{background:#304836}

@@ -12,4 +12,4 @@ COPY --chown=clipwell:clipwell app.py filester.py ./
 COPY --chown=clipwell:clipwell static ./static
 USER clipwell
 EXPOSE 8000
-CMD ["python", "app.py"]
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 120 app:app"]

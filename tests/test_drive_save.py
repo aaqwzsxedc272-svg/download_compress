@@ -26,6 +26,22 @@ class DriveSaveTests(unittest.TestCase):
             run.assert_not_called()
             self.assertIn('not connected', ui.message.value)
 
+    def test_opt_out_does_not_copy_to_drive(self):
+        def fake_run(job_id):
+            folder = app.WORK_DIR / job_id
+            folder.mkdir()
+            output = folder / 'compressed.mp4'
+            output.write_bytes(b'output')
+            app.update(job_id, stage='done', progress=100, source_size=100, output_size=6, path=str(output))
+        with tempfile.TemporaryDirectory() as folder:
+            ui = colab_ui.ClipwellUI(lambda _: None, output_dir=Path(folder) / 'out', drive_root=Path(folder))
+            ui.input_urls.value = 'https://example.com/video'
+            with patch.object(app, 'validate_url'), patch.object(app, 'run_job', side_effect=fake_run), \
+                 patch.object(colab_ui.time, 'sleep'), patch.object(colab_ui, 'save_to_drive') as copy:
+                ui._start(None)
+            copy.assert_not_called()
+            self.assertEqual(len(ui.results.children), 1)
+
     def test_copy_completed_file_and_clean_partial_on_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

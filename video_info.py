@@ -75,11 +75,12 @@ def _selected_metadata(info):
 
 
 def _gallery_info(url):
+    target, item_filter = filehosts.gallery_target(url)
     command = [sys.executable, '-m', 'gallery_dl', '--config-ignore', '--no-input',
                '--no-colors', '--quiet', '--retries', '2', '--http-timeout', '30',
                '-o', 'extractor.gofile.recursive=false', '--range', '1',
-               '--filter', 'extension.lower() in ' + repr(filehosts.VIDEO_EXTENSIONS),
-               '--dump-json', '--', url]
+               '--filter', item_filter,
+               '--dump-json', '--', target]
     with tempfile.TemporaryFile(mode='w+b') as output:
         result = subprocess.run(command, stdout=output, stderr=subprocess.DEVNULL, timeout=90)
         if result.returncode:

@@ -54,6 +54,21 @@ class VideoInfoTests(unittest.TestCase):
         self.assertEqual(result['source_size'], 5500)
         self.assertNotIn('secret', str(result))
 
+    def test_gofile_direct_preview_uses_same_exact_id_filter(self):
+        item_id = '12345678-1234-1234-1234-123456789abc'
+        url = f'https://file-na-phx-1.gofile.io/download/web/{item_id}/sample.mp4'
+        commands = []
+        def fake_run(command, stdout, **kwargs):
+            commands.append(command)
+            stdout.write(json.dumps([[3, 'private', {'id': item_id, 'filename': 'sample', 'size': 123}]]).encode())
+            return SimpleNamespace(returncode=0)
+        with patch.object(video_info.subprocess, 'run', side_effect=fake_run), \
+             patch.object(video_info.yt_dlp, 'YoutubeDL', side_effect=AssertionError('wrong downloader')):
+            result = video_info.inspect(url)
+        self.assertEqual(result['source_size'], 123)
+        self.assertEqual(commands[0][-1], 'https://gofile.io/d/' + item_id)
+        self.assertIn(item_id, commands[0][commands[0].index('--filter') + 1])
+
     def test_filester_probe_uses_head_without_exposing_token(self):
         ticket = {'server': 'https://fsc2.cdn.cr', 'file': 'video.mp4', 'token': 'secret'}
         class Opener:

@@ -12,6 +12,7 @@ import ipywidgets as widgets
 from IPython.display import display
 
 import app
+import filehosts
 import video_info
 
 PRESET_TEXT = {
@@ -166,7 +167,9 @@ class ClipwellUI:
                     app.validate_url(url)
                     info = video_info.inspect(url, self.quality.value)
                 except Exception:
-                    info = 'Preview unavailable. This site may not provide details; you can still try processing the link.'
+                    info = ('Preview unavailable for this GoFile download link. Try processing it, or use the public share-page link https://gofile.io/d/... instead.'
+                            if filehosts.is_gofile_download(url) else
+                            'Preview unavailable. This site may not provide details; you can still try processing the link.')
                 self.metadata.append((index, url, info))
                 self._render_previews()
             self.message.value = "<div class='cw-muted'>Preview complete. Estimates are illustrative; choose a quality and start when ready.</div>"

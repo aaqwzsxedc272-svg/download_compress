@@ -32,7 +32,16 @@ To run the tests: `python -m unittest discover -s tests -v`.
 
 For occasional interactive use, open [Clipwell in Google Colab](https://colab.research.google.com/github/aaqwzsxedc272-svg/download_compress/blob/arena/c1987889-download-compress/Clipwell_Colab.ipynb), sign in to Google, select the free CPU runtime, and press **▶ Open Clipwell** once. The notebook hides the code and opens an interactive workspace. Paste up to 20 links, choose quality, and optionally click **Check links** before processing. The source and encoding remain in the temporary cloud runtime; download only the completed MP4 to your computer. Disconnect and delete the runtime after the download finishes.
 
-This uses an inline dark-themed notebook workspace rather than a hosted website. Colab's free resources and session duration are limited and not guaranteed; large files can fail or take a long time, and results disappear when the runtime is deleted. Colab prohibits file-hosting/media-serving web services and other activities; see its [FAQ](https://research.google.com/colaboratory/faq.html). Only process content you have permission to use. If the direct link fails, open Colab, choose **File → Open notebook → GitHub**, enter `aaqwzsxedc272-svg/download_compress`, select branch `arena/c1987889-download-compress`, and open `Clipwell_Colab.ipynb`.
+
+### Optional: save finished MP4s to Google Drive
+
+1. In the notebook, run **▶ Connect Google Drive** and authorize Colab's requested Drive access. This is optional and gives the notebook access to your mounted Drive.
+2. Run **▶ Open Clipwell**, then tick **Save completed videos to Google Drive** before starting the queue.
+3. Each finished MP4 is copied to **My Drive / Clipwell**. Check the result in Google Drive before disconnecting the runtime. The feature uses your Drive storage quota; it does not upload the original video. A failed copy leaves the result in the temporary runtime for manual download, and an interrupted copy may leave a `.partial` file in Drive.
+
+**This does not guarantee background processing on free Colab.** If the runtime is stopped or disconnected before a video finishes and the copy completes, that video will not be available later and must be processed again. Previously copied MP4s remain in Drive. Colab Pro+ offers background execution with sufficient paid compute units, subject to its limits; see [Google's FAQ](https://research.google.com/colaboratory/faq.html). For free Colab, the safer option is to keep the computer awake and the notebook connected until the queue has finished.
+
+This uses an inline dark-themed notebook workspace rather than a hosted website. Colab's free resources and session duration are limited and not guaranteed; large files can fail or take a long time, and runtime-only results disappear when the runtime is deleted. Colab prohibits file-hosting/media-serving web services and other activities; see its [FAQ](https://research.google.com/colaboratory/faq.html). Only process content you have permission to use. If the direct link fails, open Colab, choose **File → Open notebook → GitHub**, enter `aaqwzsxedc272-svg/download_compress`, select branch `arena/c1987889-download-compress`, and open `Clipwell_Colab.ipynb`.
 
 ## Free cloud option: Render
 

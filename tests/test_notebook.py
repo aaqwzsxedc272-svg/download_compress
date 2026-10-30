@@ -14,8 +14,9 @@ class NotebookTests(unittest.TestCase):
             self.assertIsNone(cell['execution_count'])
             self.assertEqual(cell['outputs'], [])
             compile(''.join(cell['source']), 'Clipwell_Colab.ipynb', 'exec')
-        source = ''.join(code_cells[0]['source'])
-        self.assertEqual(code_cells[0]['metadata'].get('cellView'), 'form')
+        source = ''.join(code_cells[1]['source'])
+        self.assertTrue(all(cell['metadata'].get('cellView') == 'form' for cell in code_cells))
+        self.assertIn("drive.mount('/content/drive')", ''.join(code_cells[0]['source']))
         self.assertIn('colab_ui.show(files.download)', source)
 
 

@@ -1,7 +1,8 @@
 """Inline Colab widgets; processing stays in the notebook runtime, not a web server."""
 from html import escape
 from pathlib import Path
-from shutil import move
+from shutil import move, copyfileobj
+import os
 import threading
 import time
 import uuid
@@ -61,16 +62,45 @@ def preview_html(index, url, info, preset):
             f"<div class='cw-estimate'><span>Potential output · {escape(PRESET_TEXT[preset])}</span>{estimate_html}</div></div>")
 
 
+def drive_available(mount_root):
+    """Fail closed: a local /content/drive directory is not a Drive mount."""
+    return os.path.ismount(mount_root) and (Path(mount_root) / 'MyDrive').is_dir()
+
+
+def save_to_drive(source, mount_root):
+    """Copy a finished MP4 to an opted-in mounted Drive; never publish partial files."""
+    if not drive_available(mount_root):
+        raise RuntimeError('Google Drive is not connected. Run the Connect Google Drive cell first.')
+    directory = Path(mount_root) / 'MyDrive' / 'Clipwell'
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / Path(source).name
+    if destination.exists():
+        raise RuntimeError('A result with that name already exists in Google Drive.')
+    temporary = directory / f'.{destination.name}.{uuid.uuid4().hex}.partial'
+    try:
+        with Path(source).open('rb') as src, temporary.open('xb') as dst:
+            copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination
+
+
 class ClipwellUI:
-    def __init__(self, download, output_dir='/content'):
+    def __init__(self, download, output_dir='/content', drive_root='/content/drive'):
         self.download = download
         self.output_dir = Path(output_dir)
+        self.drive_root = Path(drive_root)
         self.metadata = []
         self.input_urls = widgets.Textarea(placeholder='https://example.com/video\nPaste one link per line',
                                            layout=widgets.Layout(width='100%', height='115px'))
         self.quality = widgets.ToggleButtons(options=[('Highest quality', 'high'), ('Balanced', 'balanced'), ('Smallest file', 'small')],
                                              value='balanced', layout=widgets.Layout(width='100%'))
         self.quality.observe(self._quality_changed, names='value')
+        self.save_drive = widgets.Checkbox(value=False, description='Save completed videos to Google Drive', indent=False, layout=widgets.Layout(width='100%'))
         self.check = widgets.Button(description='Check links', icon='search', layout=widgets.Layout(width='150px'))
         self.start = widgets.Button(description='Start processing', icon='play', button_style='success', layout=widgets.Layout(width='180px'))
         self.check.on_click(self._check)
@@ -81,7 +111,7 @@ class ClipwellUI:
         self.root = widgets.VBox([
             widgets.HTML(value='''<style>
             .clipwell-root{background:#17251d;padding:25px;border:1px solid #3a5140;border-radius:16px;max-width:800px;}
-            .clipwell-root .widget-html{color:#e5eee4}.clipwell-root h2,.clipwell-root h3{color:#f0f6ed;margin:7px 0 10px}
+            .clipwell-root .widget-html,.clipwell-root .widget-checkbox label{color:#e5eee4}.clipwell-root h2,.clipwell-root h3{color:#f0f6ed;margin:7px 0 10px}
             .clipwell-root textarea{background:#101d16!important;color:#ecf4e9!important;border:1px solid #526b55!important;border-radius:8px;padding:10px}
             .cw-kicker{color:#b1d89a;font-weight:700;font-size:11px;letter-spacing:1.4px}.cw-muted,.cw-fine{color:#a9bbaa;font-size:12px;line-height:1.5}
             .cw-label{color:#e3eee2;font-size:13px;font-weight:700;margin:14px 0 6px}.cw-card{background:#203329;border:1px solid #3b5742;border-radius:10px;padding:15px;margin:6px 0;color:#e9f2e7}
@@ -92,7 +122,9 @@ class ClipwellUI:
             widgets.HTML(value='<div class="cw-label">01 · Video links</div>'), self.input_urls,
             widgets.HTML(value='<div class="cw-muted">One link per line · up to 20 · processed one at a time</div><div class="cw-label">02 · Choose your balance</div>'),
             self.quality,
-            widgets.HTML(value='<div class="cw-muted">Compression is lossy. Resolution is not intentionally reduced.</div>'),
+            widgets.HTML(value='<div class="cw-muted">Compression is lossy. Resolution is not intentionally reduced.</div><div class="cw-label">03 · Save your results</div>'),
+            self.save_drive,
+            widgets.HTML(value='<div class="cw-muted">Optional: run the Connect Google Drive cell first. Completed videos go to My Drive / Clipwell. Free Colab may stop while you are away; unfinished videos will not be saved.</div>'),
             widgets.HBox([self.check, self.start], layout=widgets.Layout(margin='15px 0 5px 0')),
             self.message, self.previews, self.results,
             widgets.HTML(value='<div class="cw-muted" style="margin-top:14px">Keep the notebook open. Free runtimes can disconnect; output stays temporary. Only process content you have permission to use.</div>'),
@@ -108,7 +140,7 @@ class ClipwellUI:
 
     def _busy(self, value):
         self.check.disabled = self.start.disabled = self.quality.disabled = value
-        self.input_urls.disabled = value
+        self.input_urls.disabled = self.save_drive.disabled = value
 
     def _quality_changed(self, _):
         self._render_previews()
@@ -147,9 +179,15 @@ class ClipwellUI:
         except ValueError as exc:
             self.message.value = f"<div class='cw-muted'>{escape(str(exc))}</div>"
             return
+        save_to_google_drive = self.save_drive.value
+        if save_to_google_drive and not drive_available(self.drive_root):
+            self.message.value = "<div class='cw-muted'>Google Drive is not connected. Run the optional Connect Google Drive cell and authorize it before starting.</div>"
+            return
         self._busy(True)
         preset = self.quality.value
         self.results.children = ()
+        drive_saved = 0
+        drive_failed = 0
         try:
             for index, url in enumerate(urls, 1):
                 heading = widgets.HTML(value=f"<div class='cw-card-title' style='margin-top:16px'>VIDEO {index} OF {len(urls)}</div>")
@@ -183,15 +221,30 @@ class ClipwellUI:
                     button = widgets.Button(description='Download MP4', icon='download', button_style='success')
                     button.on_click(lambda _, path=result_path: self.download(str(path)))
                     difference = 'Output is not smaller.' if job['output_size'] >= job['source_size'] else 'Ready to download.'
+                    drive_status = ''
+                    if save_to_google_drive:
+                        status.value = "<div class='cw-muted'>Saving completed video to Google Drive…</div>"
+                        try:
+                            save_to_drive(result_path, self.drive_root)
+                            drive_saved += 1
+                            drive_status = ' Copied to My Drive / Clipwell; verify it appears in Drive.'
+                        except Exception:
+                            drive_failed += 1
+                            drive_status = ' Could not save to Drive. Download it while this runtime is still open.'
                     status.value = (f"<div class='cw-muted'>{difference} Source {size_label(job['source_size'])} → "
-                                    f"MP4 {size_label(job['output_size'])}. Download buttons work after the queue finishes.</div>")
+                                    f"MP4 {size_label(job['output_size'])}.{drive_status} Download buttons work after the queue finishes.</div>")
                     progress.value = 100
                     progress.bar_style = 'success'
                     item.children = (*item.children, button)
                 except Exception as exc:
                     status.value = f"<div class='cw-muted'>Could not finish: {escape(app.readable_error(exc))}</div>"
                     progress.bar_style = 'danger'
-            self.message.value = "<div class='cw-muted'>Queue finished. Use each Download MP4 button or the Colab Files sidebar. Keep the runtime open until downloads complete.</div>"
+            if save_to_google_drive:
+                self.message.value = (f"<div class='cw-muted'>Queue finished. {drive_saved} copied to Google Drive; "
+                                      f"{drive_failed} Drive copies failed. Verify files in My Drive / Clipwell. "
+                                      "Free Colab cannot guarantee processing while disconnected.</div>")
+            else:
+                self.message.value = "<div class='cw-muted'>Queue finished. Use each Download MP4 button or the Colab Files sidebar. Keep the runtime open until downloads complete.</div>"
         finally:
             self._busy(False)
 

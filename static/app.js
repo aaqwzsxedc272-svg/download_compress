@@ -3,6 +3,9 @@ const urlInput = document.querySelector('#url');
 const submit = document.querySelector('#submit');
 const message = document.querySelector('#message');
 const panel = document.querySelector('#job-panel');
+const inspectButton = document.querySelector('#inspect');
+const previewPanel = document.querySelector('#preview-panel');
+let previewData = [];
 let pollTimer;
 
 function escapeHTML(value) {
@@ -20,7 +23,7 @@ function formatBytes(bytes) {
 function showError(text) { message.textContent = text; message.hidden = false; }
 
 document.querySelector('#paste').addEventListener('click', async () => {
-  try { urlInput.value = await navigator.clipboard.readText(); urlInput.focus(); }
+  try { urlInput.value = await navigator.clipboard.readText(); urlInput.dispatchEvent(new Event('input', {bubbles: true})); urlInput.focus(); }
   catch { showError('Clipboard access is unavailable. Paste your link into the field instead.'); urlInput.focus(); }
 });
 
@@ -32,6 +35,7 @@ form.addEventListener('submit', async event => {
   const urls = urlInput.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
   if (!urls.length || urls.length > 20) { showError('Enter between 1 and 20 links, one per line.'); return; }
   submit.disabled = true;
+  inspectButton.disabled = true;
   submit.querySelector('span').textContent = 'Getting things ready…';
   if (urls.length > 1) { await runBatch(urls, new FormData(form).get('preset')); return; }
   try {
@@ -43,7 +47,48 @@ form.addEventListener('submit', async event => {
     poll(data.id);
   } catch (error) { showError(error.message); resetButton(); }
 });
-function resetButton() { submit.disabled = false; submit.querySelector('span').textContent = 'Make my video smaller'; }
+inspectButton.addEventListener('click', async () => {
+  const urls = urlInput.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+  if (!urls.length || urls.length > 20) { showError('Enter between 1 and 20 links, one per line.'); return; }
+  message.hidden = true;
+  inspectButton.disabled = true;
+  submit.disabled = true;
+  previewData = [];
+  previewPanel.hidden = false;
+  try {
+    for (let i = 0; i < urls.length; i++) {
+      previewPanel.innerHTML = `<p>Checking video ${i + 1} of ${urls.length}…</p>`;
+      const response = await fetch('/api/inspect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: urls[i], preset: new FormData(form).get('preset')})});
+      const data = await response.json();
+      previewData.push(response.ok ? data : {error: data.error || 'Preview unavailable.'});
+    }
+    renderPreviews();
+  } catch (error) { showError('Could not check the links. You can still try processing them.'); }
+  finally { inspectButton.disabled = false; submit.disabled = false; }
+});
+form.querySelectorAll('[name="preset"]').forEach(input => input.addEventListener('change', () => { if (previewData.length) renderPreviews(); }));
+urlInput.addEventListener('input', () => { previewData = []; previewPanel.hidden = true; });
+
+function estimateScenario(info, preset) {
+  const ranges = {high: [0.08, 0.20], balanced: [0.035, 0.12], small: [0.018, 0.065]};
+  const width = info.width, height = info.height, duration = info.duration;
+  const fps = info.fps || 30;
+  if (![width, height, duration, fps].every(value => Number.isFinite(value) && value > 0) || width > 16384 || height > 16384 || fps > 240 || duration > 604800) return null;
+  return ranges[preset].map(bpp => (width * height * fps * bpp + 192000) * duration / 8);
+}
+function renderPreviews() {
+  const preset = new FormData(form).get('preset');
+  const labels = {high: 'Highest quality · CRF 18', balanced: 'Balanced · CRF 23', small: 'Smallest file · CRF 28'};
+  previewPanel.innerHTML = previewData.map((info, index) => {
+    if (info.error) return `<div class="preview-card"><strong>Video ${index + 1}</strong><p>${escapeHTML(info.error)}</p></div>`;
+    const resolution = info.width && info.height ? `${info.width} × ${info.height}` : info.height ? `${info.height}p` : 'Not available';
+    const scenario = estimateScenario(info, preset);
+    const estimate = scenario ? `${formatBytes(scenario[0])} – ${formatBytes(scenario[1])}` : 'Not enough metadata to estimate';
+    return `<div class="preview-card"><div class="preview-kicker">VIDEO ${index + 1}</div><h3>${escapeHTML(info.title || 'Video')}</h3><div class="preview-grid"><span>Source size<strong>${formatBytes(info.source_size)}${info.source_size_approx ? ' (approx.)' : ''}</strong></span><span>Source quality<strong>${escapeHTML(resolution)} · ${escapeHTML(info.codec || 'Codec unknown')}</strong></span><span>Duration<strong>${info.duration ? formatTime(info.duration) : 'Not available'}</strong></span></div><div class="preview-estimate"><span>Potential output · ${labels[preset]}</span><strong>${estimate}</strong><p>${scenario ? `Illustrative bitrate scenario${info.fps ? '' : ', assuming 30 fps'}—not a CRF prediction. The final file can be outside this range or larger than the source.` : 'Resolution and duration are needed for a scenario. Final size is known after encoding.'}</p></div></div>`;
+  }).join('');
+}
+
+function resetButton() { submit.disabled = false; inspectButton.disabled = false; submit.querySelector('span').textContent = 'Make my video smaller'; }
 async function poll(id) {
   try {
     const response = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
@@ -133,6 +178,7 @@ async function runBatch(urls, preset) {
 const savedJob = sessionStorage.getItem('clipwell-job');
 if (savedJob) {
   submit.disabled = true;
+  inspectButton.disabled = true;
   submit.querySelector('span').textContent = 'Checking your video…';
   poll(savedJob);
 }

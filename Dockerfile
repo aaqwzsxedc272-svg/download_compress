@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 clipwell
-COPY --chown=clipwell:clipwell app.py filester.py filehosts.py ./
+COPY --chown=clipwell:clipwell app.py filester.py filehosts.py video_info.py ./
 COPY --chown=clipwell:clipwell static ./static
 USER clipwell
 EXPOSE 8000

@@ -15,8 +15,8 @@ class NotebookTests(unittest.TestCase):
             self.assertEqual(cell['outputs'], [])
             compile(''.join(cell['source']), 'Clipwell_Colab.ipynb', 'exec')
         source = ''.join(code_cells[0]['source'])
-        self.assertIn('video_urls = ""', source)
-        self.assertIn('files.download(str(result_path))', source)
+        self.assertEqual(code_cells[0]['metadata'].get('cellView'), 'form')
+        self.assertIn('colab_ui.show(files.download)', source)
 
 
 if __name__ == '__main__':

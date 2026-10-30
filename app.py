@@ -20,6 +20,7 @@ import imageio_ffmpeg
 import yt_dlp
 import filester
 import filehosts
+import video_info
 from flask import Flask, jsonify, request, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -202,6 +203,23 @@ def run_job(job_id: str):
 @app.get("/")
 def index():
     return app.send_static_file("index.html")
+
+
+@app.post("/api/inspect")
+def inspect_video():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify(error="Invalid request."), 400
+    url = data.get("url", "")
+    preset = data.get("preset", "balanced")
+    if not isinstance(url, str) or len(url) > 4096 or not isinstance(preset, str) or preset not in PRESETS:
+        return jsonify(error="Please provide a valid link and quality preset."), 400
+    try:
+        validate_url(url.strip())
+        return jsonify(video_info.inspect(url.strip(), preset))
+    except Exception:
+        # Extractors can include signed URLs or tokens in diagnostics.
+        return jsonify(error="Could not preview this link. You can still try processing it."), 400
 
 
 @app.post("/api/jobs")

@@ -54,6 +54,18 @@ a real link resolves, a real video compresses to a smaller file, a share link is
 **that share link is publicly downloadable**. It exits non-zero only on real failures, so it
 is safe to use in CI. Add `--keep` to leave the uploaded test file in place.
 
+### No terminal? Do it entirely in the browser
+
+1. Open <https://huggingface.co/new-space>, pick **Docker** → **Blank**, hardware
+   **CPU basic (free)**, and create it. The Space arrives with a `README.md` that already has
+   the `sdk: docker` / `app_port: 3000` front matter — keep it, do not overwrite it.
+2. On GitHub, open the repo → **Code → Download ZIP**, then unzip it.
+3. In the Space, open **Files → Add file → Upload files** and drag in `Dockerfile`,
+   `.dockerignore`, `package.json`, `package-lock.json`, and the `server/`, `public/` and
+   `shared/` folders from the unzipped repo. The uploader keeps folder paths.
+4. Commit. The Space builds itself and serves the app at `https://<user>-<space>.hf.space`.
+   Push later changes the same way, or connect the one-command script once you have a token.
+
 ### Space settings that matter
 
 | Setting | Value |

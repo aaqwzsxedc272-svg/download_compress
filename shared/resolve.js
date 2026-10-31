@@ -146,6 +146,50 @@
     return `https://${host}/download/${file.id}/${encodeURIComponent(file.name || 'video.mp4')}`;
   }
 
+  /* When the API refuses (a rotated wt token makes everything look premium),
+     the public share page is still server-rendered and carries the real download
+     URLs, so read them from there. */
+  async function gofileScrape(code) {
+    try {
+      const res = await fetch(`https://gofile.io/d/${code}`, {
+        headers: { 'user-agent': UA, accept: 'text/html' },
+      });
+      if (!res.ok) return null;
+      const html = await res.text();
+      const found = new Map();
+      const absolute = /https?:\/\/([A-Za-z0-9.-]*gofile\.io)\/download\/web\/([A-Za-z0-9-]+)\/([^"'\\\s<>]+)/g;
+      let match;
+      while ((match = absolute.exec(html))) {
+        const [, host, id, rawName] = match;
+        let name = rawName;
+        try {
+          name = decodeURIComponent(rawName);
+        } catch {
+          /* keep the raw name */
+        }
+        name = name.split('/').pop();
+        if (/^thumb_/i.test(name)) continue;
+        if (!isVideo(name, '')) continue;
+        found.set(id, {
+          id,
+          name,
+          size: 0,
+          mime: '',
+          kind: 'video',
+          ref: {
+            resolver: 'gofile',
+            id,
+            name,
+            link: `https://${host}/download/web/${id}/${encodeURIComponent(name)}`,
+          },
+        });
+      }
+      return [...found.values()];
+    } catch {
+      return null;
+    }
+  }
+
   const gofile = {
     id: 'gofile',
     match: (url) => hostPath(url, /(^|\.)gofile\.io$/i, /\/d\/([A-Za-z0-9_-]+)/i),
@@ -186,6 +230,10 @@
 
       if (!data || data.status !== 'ok') {
         const status = data && data.status ? String(data.status) : null;
+        const scraped = await gofileScrape(code);
+        if (scraped && scraped.length) {
+          return { resolver: 'gofile', title: null, files: scraped };
+        }
         if (status === 'error-notFound') throw new ResolveError('That gofile link no longer exists.', 'NOT_FOUND');
         if (status === 'error-passwordRequired') {
           throw new ResolveError('This gofile folder is password protected.', 'PASSWORD');

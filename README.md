@@ -14,20 +14,22 @@ a free file host and gives you a share link — no account, no card, nothing to 
 - **Automatic re-hosting** to gofile, pixeldrain or catbox (anonymous), with a fallback
   chain, and share links that survive a server restart.
 
-**Want it online for free?** Three routes that need no credit card:
+**Want it online for free?** Card-free routes that keep it in the cloud:
 
-- **Render** — `render.yaml` deploys this repo on the free plan with a plain `npm start`. No
-  container, no card. 0.1 vCPU and it sleeps after 15 minutes idle; a free uptime pinger fixes
-  the sleeping. Best if you want a permanent URL.
+- **Zeabur** (recommended) — free trial plan, up to 1 vCPU / 2 GB, GitHub login, no card. The
+  `Dockerfile` is picked up automatically: create a project → *Deploy from GitHub* → this repo →
+  *Networking → Generate Domain*.
+- **Back4App Containers** — free forever, no card, but only 256 MB: `tiny`/`small` presets only.
+- **SnapDeploy** — free, no card, 512 MB / 0.25 vCPU, 100 running hours a month.
+- **GitHub Codespaces** — 2 vCPU, 8 GB, no card; the `.devcontainer` starts the server and
+  exposes port 3000.
 - **Your own computer + a free tunnel** — `npm start` then
-  `npx cloudflared tunnel --url http://localhost:3000`. Free, no account, and the only route
-  with real CPU, so the quality presets mean what they say.
-- **GitHub Codespaces** — 2 vCPU, 8 GB, no card; the repo ships a `.devcontainer` that starts
-  the server and exposes port 3000.
+  `npx cloudflared tunnel --url http://localhost:3000`.
 
-Hugging Face Spaces used to be the easy answer, but since **July 2026 the Hub requires a paid
-plan (PRO) to create any Space that runs compute** — `scripts/deploy-space.sh` still works there
-if you have one. Full details, limits and the verification command are in [DEPLOY.md](DEPLOY.md).
+Render's free plan asks new accounts for a card, and Hugging Face requires PRO ($9/mo) for any
+Space that runs compute since July 2026, so neither is in the free list. `render.yaml` and
+`scripts/deploy-space.sh` remain for anyone who already has those accounts. Limits and exact
+steps are in [DEPLOY.md](DEPLOY.md).
 
 Whichever route you pick, `node scripts/verify-deploy.js <url>` proves the whole chain works
 from the outside: app up, presets, hosters, a real link resolved, a real video compressed, and

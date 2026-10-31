@@ -5,75 +5,77 @@ the result), **CPU to encode video**, and **staying up when you are not watching
 free-without-a-card tier gives you the first two and only partly the third. This page is honest
 about that and tells you which button to press.
 
-> **No Hugging Face.** Since July 2026 the Hub requires a paid plan to *create* anything that
-> runs compute: _"Static Spaces are free for everyone. Gradio and Docker Spaces run on compute
-> and require a paid plan to create: PRO for personal accounts, Team or Enterprise for
-> organizations."_ ([spaces-overview](https://huggingface.co/docs/hub/spaces-overview)). The
-> `deploy-space.sh` script here still works, but only with HF PRO ($9/mo).
+> **Hugging Face is out.** Since July 2026 the Hub requires a paid plan to *create* anything
+> that runs compute: _"Static Spaces are free for everyone. Gradio and Docker Spaces run on
+> compute and require a paid plan to create: PRO for personal accounts, Team or Enterprise for
+> organizations."_ ([spaces-overview](https://huggingface.co/docs/hub/spaces-overview)).
+>
+> **Render is out too, in practice.** Its docs still say the free plan needs no card, but new
+> accounts are stopped by a payment step when creating a web service (October 2026).
 
 ---
 
-## Routes that cost nothing and ask for no card
+## Card-free routes, best first
 
-| Route | CPU | Sleeps? | "Link in, share link out" |
+| Route | CPU / RAM | Card | Notes |
 | --- | --- | --- | --- |
-| **Render free** (recommended) | 0.1 vCPU, 512 MB | after 15 min idle — fixable, see below | yes, fully server-side |
-| **SnapDeploy free** | 0.25 vCPU, 512 MB | after 15 min idle, 100 h/month | yes, fully server-side |
-| **GitHub Codespaces** | 2 vCPU, 8 GB | when the session closes | yes, while open |
-| Your own machine + tunnel | all of it | when the PC goes off | yes |
+| **Zeabur free trial** | up to 1 vCPU / 2 GB | no | $5/month credit, auto-sleep, GitHub login |
+| **Back4App Containers** (<https://www.back4app.com/containers>) is the other card-free option:
+one container, 0.25 CPU, 256 MB RAM, 100 GB transfer, free forever, and their own signup page
+says *no credit card required*.
 
-Everything that used to be free now wants a card: Fly.io, Koyeb ($29 hold), Google Cloud Run,
-Oracle Always Free, Railway's paid plans. Hugging Face wants PRO.
+1. Sign up with GitHub, then **New container → GitHub repo → this repo**; it builds from the
+   `Dockerfile` unchanged.
+2. Set `MAX_UPLOAD_MB=250` and stick to `tiny`/`small` — 256 MB will not survive a 1080p encode.
+3. Their free container stops after 60 minutes per deploy, so treat it as a demo host.
 
-**Render free is the one that answers your requirement** — free, no card, no Dockerfile, lives
-in the cloud, keeps working after you close the tab.
+**SnapDeploy** | 0.25 vCPU / 512 MB | no | 100 running hours a month |
+| **GitHub Codespaces** | 2 vCPU / 8 GB | no | only while the session is open |
+| Your own machine + tunnel | all of it | no | fastest, but the PC must stay on |
+
+Zeabur is the only one that gives a real vCPU and a real 2 GB of RAM without a card, so it is
+the recommendation for "best quality while keeping quality".
 
 ---
 
-## 1. Render — free, no card, no Docker
+## 1. Zeabur — free, no card, up to 1 vCPU / 2 GB
 
-`render.yaml` is already configured: free plan, `runtime: node`, `npm ci --omit=dev` then
-`npm start`, health check on `/api/health`.
+The repo already has a working `Dockerfile`, so there is nothing to configure.
 
-### Steps (all in a browser, about two minutes)
+1. Merge the open PR into `main` — Zeabur deploys whatever branch you pick, `main` by default.
+2. Sign in at <https://zeabur.com> with **GitHub** (no card for the free trial plan).
+3. **Create Project** → pick a free region → **Add Service → GitHub** → choose
+   `download_compress`. Zeabur detects the `Dockerfile` and builds it.
+4. In the service's **Networking** tab, click **Generate Domain**. That URL is your app.
+5. Open it, paste a link, pick a preset, press **Compress**, close the tab.
 
-1. Make sure this branch is merged into `main` — Render deploys `main`.
-2. Sign up at <https://render.com> with **GitHub** (no card field on the free path).
-3. **New → Blueprint**, pick the `download_compress` repo. Render reads `render.yaml` and shows
-   one web service on the **Free** plan. Press **Apply / Deploy**.
-4. Watch the build (~2 min). You get `https://squeeze-xxxx.onrender.com`.
-5. Open it, paste a link, pick a preset, press **Compress**. The job keeps running on Render
-   after you close the tab.
+Free-trial facts that matter:
 
-### Keep it awake for free
-
-Render spins a free service down after 15 minutes without traffic. `.github/workflows/keepalive.yml`
-in this repo pings `/api/health` every 10 minutes using **GitHub's own scheduler** — no third-party
-account, no card:
-
-1. Repo → **Settings → Secrets and variables → Actions → Variables → New repository variable**
-2. Name `SQUEEZE_URL`, value `https://squeeze-xxxx.onrender.com`
-3. Actions tab → *keep-alive* → **Run workflow** once to confirm it is green.
-
-750 free instance hours a month is 744 hours — one service at 24/7 fits, barely. If you would
-rather not ping, the service simply cold-starts (~60 s) on your next visit.
-
-### Living with 0.1 vCPU
-
-| Preset | Reality on Render free |
+| Limit | Reality |
 | --- | --- |
-| `max`, `high` | only for short clips — a 10-minute 1080p video is hours |
-| `balanced` | the sensible default here |
-| `small`, `tiny` | fast enough for long videos |
+| $5 credit per month | plenty if the service sleeps between jobs; heavy 24/7 use will burn it |
+| max 1 vCPU / 2 GB per service | choose 1000m CPU / 2048 MB in the service settings |
+| auto-sleep when idle | the next visit cold-starts in a few seconds; a running job keeps it awake |
+| no SLA | fine for personal use |
 
-`MAX_UPLOAD_MB=700` and `MAX_CONCURRENT=1` are already set in `render.yaml`: more than that and
-the 512 MB container gets killed mid-encode.
+Recommended service settings: `MAX_CONCURRENT=1`, `MAX_UPLOAD_MB=1800` (2 GB of RAM handles
+that), `DATA_DIR=/data`.
+
+At 1 vCPU the `high` preset is usable on normal clips; `balanced` is the sweet spot for long
+ones.
 
 ---
 
-## 2. SnapDeploy — same idea, 2.5× the CPU, still no card
+## 2. Back4App and SnapDeploy — smaller, but card-free forever
 
-<https://snapdeploy.dev> runs Docker containers on AWS Fargate. Free tier: **4 containers,
+**Back4App Containers** (<https://www.back4app.com/containers>) is the other card-free
+option: one container, 0.25 CPU, 256 MB RAM, 100 GB transfer, free forever.",
+  "Sign up with GitHub — their own signup page says *no credit card required*. New container →
+  GitHub repo → this repo → build from the `Dockerfile`. Set `MAX_UPLOAD_MB=250` and keep the
+  `tiny`/`small` presets: 256 MB will not survive a 1080p encode. Their free container is also
+  capped at 60 minutes per deploy, so it is a demo host, not a home.
+
+**SnapDeploy** (<https://snapdeploy.dev>) runs Docker containers on AWS Fargate. Free tier: **4 containers,
 512 MB / 0.25 vCPU, 100 running hours a month, no card, no expiry**, sleeping after 15 minutes
 idle and waking on the next visit. The `Dockerfile` in this repo works unchanged.
 
@@ -103,6 +105,14 @@ npx cloudflared tunnel --url http://localhost:3000
 ```
 
 Free, no account, real CPU. Only route where `high` on a long video is quick.
+
+---
+
+## Appendix: Render, if your account is not asked for a card
+
+`render.yaml` is still in the repo (free plan, `runtime: node`, no Dockerfile) and
+`.github/workflows/keepalive.yml` keeps an idle instance from sleeping. New accounts are
+stopped by a payment step, so treat this as a fallback only.
 
 ---
 

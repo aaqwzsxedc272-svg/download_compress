@@ -10,7 +10,7 @@
     "smoke": "node scripts/smoke.js",
     "test:resolve": "node scripts/resolve.test.js",
     "test:hosters": "node scripts/hosters.test.js",
-    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js",
+    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js",
     "deploy:hf": "scripts/deploy-space.sh",
     "package:hf": "node scripts/package-space.js",
     "verify": "node scripts/verify-deploy.js",
@@ -18,7 +18,8 @@
     "browser:install": "npm install --no-save playwright && npx playwright install --with-deps chromium",
     "test:fallback": "node scripts/fallback.test.js",
     "disk": "node scripts/disk.js",
-    "test:refs": "node scripts/refs.test.js"
+    "test:refs": "node scripts/refs.test.js",
+    "test:estimate": "node scripts/estimate.test.js"
   },
   "engines": {
     "node": ">=18"

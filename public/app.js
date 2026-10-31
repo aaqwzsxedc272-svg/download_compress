@@ -202,13 +202,17 @@ function updateCard(entry, job) {
       if (job.progress <= 0) progressWrap.classList.add('is-indeterminate');
       break;
     case 'compressing':
-      statusText = `Compressing · ${pct}%`;
+      // Before the encoder has reported progress the stage says what is going on
+      // ("Checking what is worth encoding"), which matters on a slow file.
+      statusText = pct > 0 ? `Compressing · ${pct}%` : job.stage || 'Compressing';
       break;
     case 'done': {
       const before = job.sourceBytes || 0;
       const after = job.outputBytes || 0;
       const saved = before && after ? Math.max(0, 1 - after / before) : 0;
-      statusText = `Compressed · ${formatBytes(before)} → ${formatBytes(after)}${saved > 0.02 ? ` (−${Math.round(saved * 100)}%)` : ''}`;
+      statusText = job.usedOriginal
+        ? `Already compressed · original kept · ${formatBytes(before)}`
+        : `Compressed · ${formatBytes(before)} → ${formatBytes(after)}${saved > 0.02 ? ` (−${Math.round(saved * 100)}%)` : ''}`;
       statusEl.classList.add('is-done');
       showProgress = false;
       break;
@@ -221,7 +225,9 @@ function updateCard(entry, job) {
       const before = job.sourceBytes || 0;
       const after = job.outputBytes || 0;
       const saved = before && after ? Math.max(0, 1 - after / before) : 0;
-      statusText = `Link ready · ${formatBytes(before)} → ${formatBytes(after)}${saved > 0.02 ? ` (−${Math.round(saved * 100)}%)` : ''}`;
+      statusText = job.usedOriginal
+        ? `Link ready · original kept · ${formatBytes(before)}`
+        : `Link ready · ${formatBytes(before)} → ${formatBytes(after)}${saved > 0.02 ? ` (−${Math.round(saved * 100)}%)` : ''}`;
       statusEl.classList.add('is-done');
       showProgress = false;
       break;
@@ -269,14 +275,29 @@ function updateCard(entry, job) {
     if (job.speed) bits.push(`${job.speed.toFixed(1)}×`);
     const eta = formatDuration(job.etaSeconds);
     if (eta) bits.push(`${eta} left`);
+    // The size was predicted by probing before the real encode started, so the
+    // estimate is worth showing while the long part runs.
+    const proj = job.projection;
+    if (proj && Number.isFinite(proj.projectedBytes) && proj.saving > 0.02) {
+      bits.push(`projected ${formatBytes(proj.projectedBytes)} (−${Math.round(proj.saving * 100)}%)`);
+    }
   }
   if (job.status === 'done' && job.sourceBytes && job.outputBytes) {
     const saved = Math.max(0, 1 - job.outputBytes / job.sourceBytes);
     if (saved > 0.02) bits.push(`<span class="saved">saved ${formatBytes(job.sourceBytes - job.outputBytes)}</span>`);
+    else if (job.usedOriginal) bits.push('no smaller copy was possible');
   }
   if (job.source === 'relay') bits.push('via your browser');
   metaEl.innerHTML = bits.join('<span style="opacity:.3">·</span>');
   metaEl.style.display = bits.length ? '' : 'none';
+
+  // Why a file came back the size it did — especially when it could not shrink.
+  const noteEl = $('[data-field="note"]', el);
+  if (noteEl) {
+    const note = job.status === 'error' ? '' : job.note || '';
+    noteEl.textContent = note;
+    noteEl.hidden = !note;
+  }
 
   actions.innerHTML = '';
 
@@ -1556,7 +1577,11 @@ async function loadResults() {
     meta.className = 'result-meta';
     const bits = [];
     if (result.sourceBytes && result.outputBytes) {
-      bits.push(`${formatBytes(result.sourceBytes)} → ${formatBytes(result.outputBytes)}`);
+      bits.push(
+        result.usedOriginal
+          ? `${formatBytes(result.sourceBytes)} · already small, original kept`
+          : `${formatBytes(result.sourceBytes)} → ${formatBytes(result.outputBytes)}`,
+      );
     }
     if (result.shareUrl) {
       const link = document.createElement('a');

@@ -117,7 +117,9 @@ function render(job) {
   if (job.meta) {
     stats.append(
       stat('Original', formatBytes(job.sourceBytes)),
-      stat('Compressed', done ? formatBytes(job.outputBytes) : '…', done),
+      job.usedOriginal
+        ? stat('Compressed', 'no smaller copy possible', done)
+        : stat('Compressed', done ? formatBytes(job.outputBytes) : '…', done),
     );
     const saved = job.sourceBytes && job.outputBytes ? Math.max(0, 1 - job.outputBytes / job.sourceBytes) : 0;
     if (done && saved > 0.01) stats.append(stat('Saved', `${Math.round(saved * 100)}%`, true));

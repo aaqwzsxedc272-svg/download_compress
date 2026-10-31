@@ -18,6 +18,7 @@ const PRESETS = {
     crf: 19,
     x264Preset: 'slow',
     audioKbps: 192,
+    maxLift: 6,
   },
   high: {
     id: 'high',
@@ -27,6 +28,7 @@ const PRESETS = {
     crf: 22,
     x264Preset: 'medium', // ~2x realtime at 1080p on two cores; slow is available in Max quality
     audioKbps: 160,
+    maxLift: 9,
   },
   balanced: {
     id: 'balanced',
@@ -36,6 +38,7 @@ const PRESETS = {
     crf: 24,
     x264Preset: 'fast',
     audioKbps: 128,
+    maxLift: 12,
   },
   small: {
     id: 'small',
@@ -45,6 +48,7 @@ const PRESETS = {
     crf: 27,
     x264Preset: 'fast',
     audioKbps: 128,
+    maxLift: 12,
   },
   tiny: {
     id: 'tiny',
@@ -107,7 +111,8 @@ function videoFilter(meta, size) {
  *   scaleNote: string|null,
  * }}
  */
-function buildPlan({ input, output, meta, preset, targetMb, passlogBase }) {
+function buildPlan({ input, output, meta, preset, targetMb, passlogBase, crfOverride = null }) {
+  const crf = Number.isFinite(crfOverride) ? crfOverride : preset.crf;
   const size = targetSize(meta, preset);
   const audio = audioPlan(meta, preset);
   const duration = Number(meta.duration) || 0;
@@ -192,7 +197,7 @@ function buildPlan({ input, output, meta, preset, targetMb, passlogBase }) {
         '-i', input,
         ...common,
         ...scaleArgs,
-        '-crf', String(preset.crf),
+        '-crf', String(crf),
         // A ceiling so a long static shot cannot balloon the file.
         '-maxrate', '16M',
         '-bufsize', '32M',
@@ -210,6 +215,7 @@ function buildPlan({ input, output, meta, preset, targetMb, passlogBase }) {
     size,
     audio,
     videoKbps,
+    crf,
     twoPass,
     scaleNote: scaled ? `${meta.width}×${meta.height} → ${size.width}×${size.height}` : null,
   };

@@ -179,6 +179,7 @@ function publicView(job) {
     twoPass: Boolean(job.twoPass),
     scaledTo: job.scaledTo || null,
     usedOriginal: Boolean(job.usedOriginal),
+    projection: job.projection || null,
     hostedUrl: job.hostedUrl || null,
     hostProvider: job.hostProvider || null,
     hostError: job.hostError || null,

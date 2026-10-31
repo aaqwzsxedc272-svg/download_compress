@@ -11,6 +11,7 @@ const jobsStore = require('./jobs');
 const { probe, thumbnail, transcode } = require('./ffmpeg');
 const { downloadWithFallback } = require('./fallback');
 const autoStop = require('./autostop');
+const { chooseCrf } = require('./estimate');
 const {
   PRESET_LIST,
   DEFAULT_PRESET,
@@ -84,7 +85,13 @@ function outputNameFor(job) {
   const preset = getPreset(job.presetId);
   let base = job.name || (job.url ? safeNameFromUrl(job.url) : 'video');
   base = base.replace(/\.[a-z0-9]{2,5}$/i, '');
-  base = base.replace(/[^\w\-. ]+/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
+  base = base
+    .replace(/[^\w\-. ]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[-_. ]+$/, '')
+    .slice(0, 80)
+    .replace(/[-_. ]+$/, '') || 'video';
   const tag = job.targetMb ? `${Math.round(job.targetMb)}mb` : preset.id;
   return `${base}-squeeze-${tag}.mp4`;
 }
@@ -110,6 +117,10 @@ function makeController(job) {
 
 /** Auto-host finished files when a hoster is configured. */
 const AUTO_HOST = process.env.AUTO_HOST !== '0';
+
+/* Below this predicted saving the encode is skipped and the original is shared:
+   spending half an hour to hand back the same bytes is worse than saying so. */
+const SKIP_ENCODE_BELOW = Number(process.env.SQUEEZE_SKIP_BELOW) || 0.02;
 
 async function compressJob(job) {
   const paths = jobsStore.jobPaths(job);
@@ -142,64 +153,131 @@ async function compressJob(job) {
   thumbnail(paths.source, paths.thumb, meta.duration).catch(() => {});
 
   const notes = [];
+  let usedOriginal = false;
+  const note = (pick) => {
+    console.log(
+      `[job ${job.id}] predicted ${formatSize(pick.projectedBytes)} at CRF ${pick.crf} ` +
+        `(${pick.saving >= 0 ? '−' : '+'}${Math.abs(Math.round(pick.saving * 100))}% vs the original)`,
+    );
+  };
   if (job.browserFetched) notes.push('Fetched through a headless browser — the host refuses plain requests.');
   if (job.targetMb && targetTooSmall(meta, preset, job.targetMb)) {
     notes.push(`A ${job.targetMb} MB target is very tight for a clip this long — quality may suffer.`);
   }
 
-  const plan = buildPlan({
-    input: paths.source,
-    output: paths.output,
-    meta,
-    preset,
-    targetMb: job.targetMb,
-    passlogBase: path.join(job.dir, 'x264pass'),
-  });
-
-  // Progress is spread across passes so a two-pass encode still reads 0-100%.
-  const passCount = plan.passes.length;
-  let lastEmit = 0;
-
-  for (let index = 0; index < passCount; index += 1) {
-    const pass = plan.passes[index];
-    const slice = 1 / passCount;
-
-    await transcode(paths.source, paths.output, pass.args, {
-      signal: controller.signal,
-      duration: meta.duration,
-      onProgress: ({ seconds, speed }) => {
-        const now = Date.now();
-        if (seconds != null && meta.duration > 0) {
-          const within = Math.min(1, seconds / meta.duration);
-          job.progress = Math.min(1, index * slice + within * slice);
-        }
-        if (speed != null && speed > 0) {
-          job.speed = speed;
-          const remaining = Math.max(0, meta.duration - (seconds || 0));
-          job.etaSeconds = Math.round(remaining / speed);
-        }
-        if (now - lastEmit > 400) {
-          lastEmit = now;
-          jobsStore.updateJob(job, { stage: passCount > 1 ? `${pass.label} (${index + 1}/${passCount})` : 'Compressing' });
-        }
-      },
+  /* Predict the result before spending an hour on it: a file that is already
+     efficiently compressed can come out bigger at the preset's CRF, and the only
+     way to know is to encode a few short slices first. */
+  let crfOverride = null;
+  let skipEncode = false;
+  if (!job.targetMb) {
+    jobsStore.updateJob(job, { stage: 'Checking what is worth encoding' });
+    const pick = await chooseCrf({
+      input: paths.source,
+      meta,
+      preset,
+      sourceBytes: job.sourceBytes,
+      workDir: job.dir,
     });
+    if (pick.probes) {
+      note(pick);
+      jobsStore.updateJob(job, {
+        projection: {
+          crf: pick.crf,
+          projectedBytes: pick.projectedBytes,
+          saving: Math.round(pick.saving * 1000) / 1000,
+        },
+      });
+      if (pick.saving < SKIP_ENCODE_BELOW) {
+        skipEncode = true;
+        notes.push(
+          'This file is already compressed about as far as it goes — a re-encode would be the same size or bigger, so the original bytes are what gets shared.',
+        );
+      } else if (pick.saving < 0.12) {
+        notes.push(
+          `This file is packed tightly already — about ${Math.round(pick.saving * 100)}% is the most that can be trimmed` +
+            (pick.crf !== preset.crf ? `, so the encoder ran at CRF ${pick.crf} instead of ${preset.crf}.` : '.'),
+        );
+      }
+      if (pick.crf !== preset.crf) crfOverride = pick.crf;
+    }
   }
 
-  await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
-  await fsp.rm(`${path.join(job.dir, 'x264pass')}.log.mbtree`, { force: true }).catch(() => {});
+  if (controller.signal.aborted) {
+    throw Object.assign(new Error('Cancelled.'), { code: 'CANCELLED' });
+  }
 
-  let outStat = await fsp.stat(paths.output);
-  if (!outStat.size) throw Object.assign(new Error('Compression produced an empty file.'), { code: 'EMPTY_OUTPUT' });
+  let outStat = null;
+  let videoKbps = null;
+  let audioMode = null;
+  let twoPass = false;
+  let scaleNote = null;
 
-  // Never hand back a file that is bigger AND no better: if the re-encode did
-  // not pay off, deliver the original bytes instead.
-  let usedOriginal = false;
-  if (!job.targetMb && outStat.size >= job.sourceBytes) {
+  if (skipEncode) {
+    jobsStore.updateJob(job, { stage: 'Keeping the original', progress: 1 });
     await fsp.copyFile(paths.source, paths.output);
     outStat = await fsp.stat(paths.output);
     usedOriginal = true;
-    notes.push('Re-encoding would have made this bigger, so the original file is what gets shared.');
+  } else {
+    const plan = buildPlan({
+      input: paths.source,
+      output: paths.output,
+      meta,
+      preset,
+      targetMb: job.targetMb,
+      passlogBase: path.join(job.dir, 'x264pass'),
+      crfOverride,
+    });
+
+    videoKbps = plan.videoKbps;
+    audioMode = plan.audio.mode;
+    twoPass = plan.twoPass;
+    scaleNote = plan.scaleNote;
+
+    // Progress is spread across passes so a two-pass encode still reads 0-100%.
+    const passCount = plan.passes.length;
+    let lastEmit = 0;
+
+    for (let index = 0; index < passCount; index += 1) {
+      const pass = plan.passes[index];
+      const slice = 1 / passCount;
+
+      await transcode(paths.source, paths.output, pass.args, {
+        signal: controller.signal,
+        duration: meta.duration,
+        onProgress: ({ seconds, speed }) => {
+          const now = Date.now();
+          if (seconds != null && meta.duration > 0) {
+            const within = Math.min(1, seconds / meta.duration);
+            job.progress = Math.min(1, index * slice + within * slice);
+          }
+          if (speed != null && speed > 0) {
+            job.speed = speed;
+            const remaining = Math.max(0, meta.duration - (seconds || 0));
+            job.etaSeconds = Math.round(remaining / speed);
+          }
+          if (now - lastEmit > 400) {
+            lastEmit = now;
+            jobsStore.updateJob(job, { stage: passCount > 1 ? `${pass.label} (${index + 1}/${passCount})` : 'Compressing' });
+          }
+        },
+      });
+    }
+
+    await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+    await fsp.rm(`${path.join(job.dir, 'x264pass')}.log.mbtree`, { force: true }).catch(() => {});
+
+    outStat = await fsp.stat(paths.output);
+    if (!outStat.size) throw Object.assign(new Error('Compression produced an empty file.'), { code: 'EMPTY_OUTPUT' });
+
+    // Never hand back a file that is bigger AND no better: if the re-encode did
+    // not pay off, deliver the original bytes instead.
+    if (!job.targetMb && outStat.size >= job.sourceBytes) {
+      await fsp.copyFile(paths.source, paths.output);
+      outStat = await fsp.stat(paths.output);
+      usedOriginal = true;
+      notes.push('Re-encoding would have made this bigger, so the original file is what gets shared.');
+    }
   }
 
   /* The source is only needed while encoding. Deleting it now roughly halves
@@ -221,11 +299,12 @@ async function compressJob(job) {
     outputBytes: outStat.size,
     outputName: outputNameFor(job),
     note: notes.join(' ') || null,
-    videoKbps: plan.videoKbps,
+    videoKbps,
     usedOriginal,
-    audioMode: plan.audio.mode,
-    twoPass: plan.twoPass,
-    scaledTo: plan.scaleNote,
+    audioMode,
+    twoPass,
+    scaledTo: scaleNote,
+    projection: job.projection || null,
     saved,
   });
   writeResultsFile();
@@ -337,6 +416,8 @@ const FRIENDLY = {
 const OUT_OF_SPACE = /ENOSPC|No space left on device/i;
 
 const formatGb = (bytes) => `${(bytes / 1073741824).toFixed(1)} GB`;
+const formatSize = (bytes) =>
+  bytes >= 1073741824 ? `${(bytes / 1073741824).toFixed(2)} GB` : `${(bytes / 1048576).toFixed(1)} MB`;
 
 /** Total/used/free for the volume that holds the working files. */
 async function diskUsage(dir) {
@@ -1333,6 +1414,7 @@ app.get('/api/results', (req, res) => {
       sourceBytes: view.sourceBytes,
       outputBytes: view.outputBytes,
       saved: view.saved,
+      usedOriginal: view.usedOriginal,
       finishedAt: jobFinishedAt(view),
     })),
   });

@@ -60,7 +60,13 @@ def supported(url):
     subcategory = getattr(obj, 'subcategory', None)
     return ((category == 'bunkr' and subcategory == 'media')
             or (category == 'pixeldrain' and subcategory == 'file')
-            or (category == 'gofile' and subcategory == 'folder'))
+            or (category == 'gofile' and subcategory == 'folder')
+            or (category == 'turbo' and subcategory == 'media'))
+
+
+def is_turbo_media(url):
+    obj = extractor.find(url)
+    return getattr(obj, 'category', None) == 'turbo' and getattr(obj, 'subcategory', None) == 'media'
 
 
 def download(url, folder: Path):
@@ -77,11 +83,15 @@ def download(url, folder: Path):
             # Extractor errors can contain temporary links or cookies; don't expose them.
             if is_gofile_download(url):
                 raise RuntimeError(GOFILE_DIRECT_HELP)
+            if is_turbo_media(url):
+                raise RuntimeError('Turbo.cr could not provide this video. It may require verification, be unavailable, or block the cloud runtime.')
             raise RuntimeError('The file host could not provide this video. It may be unavailable, private, password-protected, or blocked by the host.')
     sources = [path for path in folder.glob('source.*')
                if path.is_file() and path.suffix.lower().lstrip('.') in VIDEO_EXTENSIONS]
     if not sources:
         if is_gofile_download(url):
             raise RuntimeError(GOFILE_DIRECT_HELP)
+        if is_turbo_media(url):
+            raise RuntimeError('Turbo.cr did not provide a video. It may require verification, be unavailable, or block the cloud runtime.')
         raise RuntimeError('No supported video was found. For GoFile, use a public link containing a video in its top-level folder.')
     return 'Downloaded video'

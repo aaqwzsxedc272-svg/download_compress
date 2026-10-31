@@ -1,4 +1,8 @@
+import functools
+import http.server
 import subprocess
+import sys
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,10 +17,11 @@ import filehosts
 class FileHostTests(unittest.TestCase):
     def test_explicit_supported_links_only(self):
         for url in ('https://bunkr.cr/f/example.mp4', 'https://pixeldrain.com/u/abcdefgh',
-                    'https://gofile.io/d/abcdef'):
+                    'https://gofile.io/d/abcdef', 'https://turbo.cr/d/b98ru7NqCI3AV',
+                    'https://turbo.cr/v/example', 'https://turbo.cr/embed/example'):
             self.assertTrue(filehosts.supported(url), url)
         for url in ('https://bunkr.cr/a/album', 'https://pixeldrain.com/l/abcdefgh',
-                    'https://mega.nz/file/abcd#key', 'https://example.com/video.mp4'):
+                    'https://mega.nz/file/abcd#key', 'https://example.com/video.mp4', 'https://turbo.cr/a/example'):
             self.assertFalse(filehosts.supported(url), url)
 
     def test_gofile_download_link_resolves_through_public_api_with_exact_id_filter(self):
@@ -79,6 +84,72 @@ class FileHostTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'share-page'):
                 filehosts.gallery_target(url)
         self.assertIsNone(filehosts.gofile_direct_id('https://file-na.gofile.io.evil.test/download/web/12345678-1234-1234-1234-123456789abc/a.mp4'))
+
+    def test_turbo_extractor_resolves_synthetic_page_and_sign_response(self):
+        from gallery_dl import extractor
+        from types import SimpleNamespace
+        media = extractor.find('https://turbo.cr/d/example123')
+        page = '<span id="fileSizeBytes">123456</span><span>ID: example123</span><span>2026-07-22</span>'
+        with patch.object(media, 'request', return_value=SimpleNamespace(text=page)) as request, \
+             patch.object(media, 'request_json', return_value={'filename': 'sample.mp4', 'url': 'https://dl.turbocdn.st/video.mp4?token=secret'}) as api:
+            item = media._extract_file('example123')
+        request.assert_called_once()
+        api.assert_called_once()
+        self.assertEqual(api.call_args.args[0], 'https://turbo.cr/api/sign?v=example123')
+        self.assertEqual(item['extension'], 'mp4')
+        self.assertEqual(item['size'], 123456)
+
+    def test_turbo_download_extractor_and_real_transcode(self):
+        # Run the real gallery-dl extractor/filter/downloader against an offline
+        # local video, substituting only the provider response (no live Turbo).
+        ffmpeg = app.imageio_ffmpeg.get_ffmpeg_exe()
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args): pass
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'sample.mp4'
+            subprocess.run([ffmpeg, '-loglevel', 'error', '-f', 'lavfi', '-i',
+                            'testsrc2=size=160x120:rate=10', '-t', '1', '-c:v', 'libx264',
+                            '-y', str(source)], check=True)
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Handler, directory=folder))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            local_url = f'http://127.0.0.1:{server.server_port}/sample.mp4'
+            script = """import sys, runpy
+from gallery_dl.extractor.turbo import TurboMediaExtractor
+TurboMediaExtractor._extract_file = lambda self, item: {'id': item, 'filename': 'sample', 'extension': 'mp4', 'file': %r, 'size': 123}
+sys.argv = ['gallery-dl'] + sys.argv[1:]
+runpy.run_module('gallery_dl', run_name='__main__')
+""" % local_url
+            real_popen = subprocess.Popen
+            def run_offline(command, *args, **kwargs):
+                if command[:3] == [sys.executable, '-m', 'gallery_dl']:
+                    command = [sys.executable, '-c', script, *command[3:]]
+                return real_popen(command, *args, **kwargs)
+            job_id = 'turbo-offline-transcode'
+            app.JOBS[job_id] = {'id': job_id, 'url': 'https://turbo.cr/d/b98ru7NqCI3AV', 'preset': 'balanced', 'stage': 'queued'}
+            try:
+                with patch.object(filehosts.subprocess, 'Popen', side_effect=run_offline):
+                    app.run_job(job_id)
+                self.assertEqual(app.JOBS[job_id]['stage'], 'done', app.JOBS[job_id].get('error'))
+                self.assertGreater(app.JOBS[job_id]['output_size'], 0)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(5)
+
+    def test_turbo_failure_explains_verification_without_sensitive_diagnostics(self):
+        class FakeProcess:
+            returncode = 0
+            def __init__(self, *args, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def communicate(self): return None, 'secret-token'
+        with tempfile.TemporaryDirectory() as directory, patch.object(filehosts.subprocess, 'Popen', FakeProcess):
+            with self.assertRaises(RuntimeError) as context:
+                filehosts.download('https://turbo.cr/d/example', Path(directory))
+        self.assertIn('verification', str(context.exception))
+        self.assertNotIn('secret-token', str(context.exception))
 
     def test_gallery_download_first_video_without_recursive_folders(self):
         class FakeProcess:

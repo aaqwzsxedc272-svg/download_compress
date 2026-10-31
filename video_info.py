@@ -94,7 +94,8 @@ def _gallery_info(url):
         if isinstance(record, list) and len(record) >= 3 and record[0] == 3 and isinstance(record[2], dict):
             meta = record[2]
             return {'title': str(meta.get('name') or meta.get('filename') or 'Video')[:200],
-                    'source_size': positive(meta.get('size') or meta.get('filesize')),
+                    # Turbo's page may report a rounded or truncated scientific-notation value.
+                    'source_size': None if filehosts.is_turbo_media(url) else positive(meta.get('size') or meta.get('filesize')),
                     'source_size_approx': False,
                     'width': positive(meta.get('width')), 'height': positive(meta.get('height')),
                     'fps': positive(meta.get('fps')), 'duration': positive(meta.get('duration')),

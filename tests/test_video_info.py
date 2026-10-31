@@ -55,6 +55,18 @@ class VideoInfoTests(unittest.TestCase):
         self.assertEqual(result['source_size'], 5500)
         self.assertNotIn('secret', str(result))
 
+    def test_turbo_preview_avoids_unreliable_source_size(self):
+        def fake_run(command, stdout, **kwargs):
+            stdout.write(json.dumps([[3, 'https://example.com/?token=secret',
+                                      {'filename': 'sample', 'size': 5}]]).encode())
+            return SimpleNamespace(returncode=0)
+        with patch.object(video_info.subprocess, 'run', side_effect=fake_run), \
+             patch.object(video_info.yt_dlp, 'YoutubeDL', side_effect=AssertionError('wrong downloader')):
+            result = video_info.inspect('https://turbo.cr/d/b98ru7NqCI3AV')
+        self.assertEqual(result['title'], 'sample')
+        self.assertIsNone(result['source_size'])
+        self.assertNotIn('secret', str(result))
+
     def test_gofile_direct_preview_uses_same_exact_id_filter(self):
         item_id = '12345678-1234-1234-1234-123456789abc'
         url = f'https://file-na-phx-1.gofile.io/download/web/{item_id}/sample.mp4'

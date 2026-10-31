@@ -235,6 +235,16 @@ app cannot be used to probe the box it runs on.
 Pass a file's `ref` back as `source: "ref"` to compress exactly that file — signed links are
 re-resolved at download time, so they never go stale.
 
+## When a host refuses
+
+Some hosts answer a plain request with a challenge page instead of bytes — fileditch 403s,
+filester runs DDoS-Guard, players hand out signed URLs. Those downloads are retried through the
+headless browser: the page is opened for real, the media request it makes is observed (URL,
+referer and cookie), and the bytes are fetched with exactly those headers. If that still fails the
+job says so instead of pretending; the file can always be dropped on the page by hand.
+
+`npm run test:fallback` covers that path against a fake host that refuses plain requests.
+
 ## Long jobs and idle hosts
 
 Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Two defences:

@@ -195,12 +195,19 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000 } = {}) {
         url: clean,
         contentType: meta.contentType || '',
         size: Number(meta.size) || 0,
+        referer: meta.referer || '',
+        cookie: meta.cookie || '',
       });
     };
 
     page.on('request', (request) => {
-      if (request.resourceType() === 'media') remember(request.url(), { force: true });
-      else remember(request.url());
+      const headers = request.headers();
+      const meta = {
+        force: request.resourceType() === 'media',
+        referer: headers.referer || '',
+        cookie: headers.cookie || '',
+      };
+      remember(request.url(), meta);
     });
     page.on('response', async (response) => {
       const type = (response.headers()['content-type'] || '').toLowerCase();

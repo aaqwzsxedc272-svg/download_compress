@@ -9,6 +9,7 @@ const express = require('express');
 
 const jobsStore = require('./jobs');
 const { probe, thumbnail, transcode } = require('./ffmpeg');
+const { downloadWithFallback } = require('./fallback');
 const {
   PRESET_LIST,
   DEFAULT_PRESET,
@@ -31,6 +32,17 @@ try {
   }
 } catch {
   /* no browser helper on this deployment */
+}
+
+/** The capture function, or null when Chromium is not installed here. */
+function browserCapture() {
+  try {
+    const browser = require('./browser');
+    if (!browser.available()) return null;
+    return (url) => browser.captureMedia(url);
+  } catch {
+    return null;
+  }
 }
 const { ensureSample } = require('./sample');
 
@@ -129,6 +141,7 @@ async function compressJob(job) {
   thumbnail(paths.source, paths.thumb, meta.duration).catch(() => {});
 
   const notes = [];
+  if (job.browserFetched) notes.push('Fetched through a headless browser — the host refuses plain requests.');
   if (job.targetMb && targetTooSmall(meta, preset, job.targetMb)) {
     notes.push(`A ${job.targetMb} MB target is very tight for a clip this long — quality may suffer.`);
   }
@@ -346,7 +359,8 @@ async function fetchThenCompress(job, ref) {
 
     jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading video', progress: 0 });
 
-    await sources.downloadHttp(url, paths.source, {
+    const capture = browserCapture();
+    const downloadOptions = {
       maxBytes: MAX_UPLOAD_BYTES,
       signal: controller.signal,
       onProgress: (received, total) => {
@@ -361,7 +375,22 @@ async function fetchThenCompress(job, ref) {
           jobsStore.updateJob(job, {});
         }
       },
+    };
+
+    /* A host that refuses plain requests (hotlink protection, a bot challenge,
+       a player-only signed URL) is retried through a real browser before the
+       job is allowed to fail. */
+    const attempt = await downloadWithFallback({
+      url,
+      pageUrl: job.url || url,
+      destPath: paths.source,
+      download: (target, dest, options) => sources.downloadHttp(target, dest, options),
+      capture,
+      options: downloadOptions,
     });
+    if (attempt.usedBrowser) {
+      job.browserFetched = true;
+    }
 
     jobsStore.updateJob(job, { progress: 0, sourceBytes: (await fsp.stat(paths.source)).size });
     startCompression(job);

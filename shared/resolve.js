@@ -388,6 +388,10 @@
           found.add(new URL(m[1], parsed.origin).toString());
         }
         if (!found.size) {
+          const viaBrowser = await pageBrowserFiles(url);
+          if (viaBrowser && viaBrowser.length) {
+            return { resolver: 'bunkr', title: null, files: viaBrowser };
+          }
           throw new ResolveError('bunkr returned a bot-check page instead of the album.', 'BUNKR_BLOCKED');
         }
         const files = [];
@@ -403,15 +407,18 @@
         return { resolver: 'bunkr', title: 'bunkr album', files };
       }
 
-      const res = await fetchWithTimeout(url, { headers: { 'user-agent': UA } });
-      if (!res.ok) {
-        throw new ResolveError(`bunkr answered HTTP ${res.status} (it is often bot-protected).`, 'BUNKR_FAILED');
-      }
-      const html = await res.text();
+      const res = await fetchWithTimeout(url, { headers: { 'user-agent': UA } }).catch(() => null);
+      const html = res && res.ok ? await res.text() : '';
       const { cdn, sign } = bunkrExtractSigned(html);
       if (!cdn) {
+        const viaBrowser = await pageBrowserFiles(url);
+        if (viaBrowser && viaBrowser.length) {
+          return { resolver: 'bunkr', title: null, files: viaBrowser };
+        }
         throw new ResolveError(
-          'bunkr served a bot-check page, so the file link could not be read. Open the link and drop the file here.',
+          res && !res.ok
+            ? `bunkr answered HTTP ${res.status} (it is often bot-protected).`
+            : 'bunkr served a bot-check page, and the browser found no video either. Open the link, download the file and drop it here.',
           'BUNKR_BLOCKED',
         );
       }
@@ -478,10 +485,14 @@
       const res = await fetchWithTimeout(url, { headers: { 'user-agent': UA } });
       if (!res.ok) throw new ResolveError(`filester answered HTTP ${res.status}.`, 'FILESTER_FAILED');
       const html = await res.text();
-      const urls = extractVideoUrls(html, url);
+      let urls = extractVideoUrls(html, url);
       if (!urls.length) {
+        const viaBrowser = await pageBrowserFiles(url);
+        if (viaBrowser && viaBrowser.length) {
+          return { resolver: 'filester', title: null, files: viaBrowser };
+        }
         throw new ResolveError(
-          'filester is bot-protected, so the file link could not be read. Open the link and drop the file here.',
+          'filester refused a plain request (DDoS-Guard) and the browser found no video either. Open the link, download the file and drop it here.',
           'FILESTER_BLOCKED',
         );
       }
@@ -506,11 +517,13 @@
     },
     async direct(ref) {
       if (ref.url) return ref.url;
-      const res = await fetchWithTimeout(ref.page, { headers: { 'user-agent': UA } });
-      const html = await res.text();
+      const res = await fetchWithTimeout(ref.page, { headers: { 'user-agent': UA } }).catch(() => null);
+      const html = res && res.ok ? await res.text() : '';
       const urls = extractVideoUrls(html, ref.page);
-      if (!urls.length) throw new ResolveError('filester did not expose a download link.', 'FILESTER_BLOCKED');
-      return urls[0];
+      if (urls.length) return urls[0];
+      const viaBrowser = await pageBrowserFiles(ref.page);
+      if (viaBrowser && viaBrowser.length) return viaBrowser[0].ref.url;
+      throw new ResolveError('filester did not expose a download link.', 'FILESTER_BLOCKED');
     },
   };
 

@@ -217,7 +217,7 @@ async function freeDiskBytes(dir) {
 async function downloadHttp(
   url,
   destPath,
-  { onProgress, maxBytes = 1024 ** 3, idleTimeoutMs = 45_000, signal: outerSignal } = {},
+  { onProgress, maxBytes = 1024 ** 3, idleTimeoutMs = 45_000, signal: outerSignal, extraHeaders = {} } = {},
 ) {
   if (isBlockedHost(url)) {
     throw Object.assign(new Error('That address is not allowed.'), { code: 'BLOCKED_HOST' });
@@ -263,14 +263,14 @@ async function downloadHttp(
   let res;
   try {
     res = await fetch(url, {
-      headers: { ...browserHeaders(false), ...hostHeaders },
+      headers: { ...browserHeaders(false), ...hostHeaders, ...extraHeaders },
       redirect: 'follow',
       signal: controller.signal,
     });
     if ((res.status === 403 || res.status === 401) && origin) {
       res.body?.cancel().catch(() => {});
       const retry = await fetch(url, {
-        headers: { ...browserHeaders(true), ...hostHeaders },
+        headers: { ...browserHeaders(true), ...hostHeaders, ...extraHeaders },
         redirect: 'follow',
         signal: controller.signal,
       });

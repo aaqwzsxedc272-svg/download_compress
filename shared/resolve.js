@@ -86,6 +86,9 @@
      is minted by an obfuscated script, so only a real browser can list a folder
      once the API starts refusing. */
   let gofileBrowserHook = null;
+  /* The accountToken of the browser session that listed the folder. gofile ties
+     a download to the account that opened it, so this is reused verbatim. */
+  let gofileSessionCookie = null;
 
   async function gofileWebToken(force = false) {
     if (!force && gofileWt.at && Date.now() - gofileWt.at < 30 * 60 * 1000) return gofileWt.value;
@@ -237,8 +240,10 @@
         if (gofileBrowserHook) {
           try {
             const viaBrowser = await gofileBrowserHook(code);
-            if (viaBrowser && viaBrowser.length) {
-              return { resolver: 'gofile', title: null, files: viaBrowser };
+            const files = Array.isArray(viaBrowser) ? viaBrowser : viaBrowser && viaBrowser.files;
+            if (files && files.length) {
+              if (viaBrowser && viaBrowser.cookie) gofileSessionCookie = viaBrowser.cookie;
+              return { resolver: 'gofile', title: null, files };
             }
           } catch (err) {
             lastError = lastError || err;
@@ -742,6 +747,10 @@
       answering with an HTML "not allowed" page. */
   async function gofileDownloadHeaders() {
     const headers = { referer: 'https://gofile.io/', origin: 'https://gofile.io' };
+    if (gofileSessionCookie) {
+      headers.cookie = gofileSessionCookie;
+      return headers;
+    }
     try {
       const token = await gofileGuestToken();
       if (token) headers.cookie = `accountToken=${token}`;

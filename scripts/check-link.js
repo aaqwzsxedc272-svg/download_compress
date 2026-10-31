@@ -66,6 +66,7 @@ try {
         JSON.stringify(
           {
             probe: direct,
+            sentCookie: Boolean(extra.cookie),
             status: res.status,
             contentType: res.headers.get('content-type'),
             contentLength: res.headers.get('content-length'),

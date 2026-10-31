@@ -98,9 +98,40 @@ async function gofileFolder(code, { timeoutMs = 60_000 } = {}) {
       await page.waitForTimeout(500);
     }
 
+    /* gofile ties a download to this browser session, so hand its cookie back to
+       the caller: the plain fetch that streams the file then looks like the same
+       visitor who opened the folder. */
+    const cookies = await context.cookies('https://gofile.io').catch(() => []);
+    const account = cookies.find((c) => /accounttoken/i.test(c.name));
+    const cookie = account ? `${account.name}=${account.value}` : null;
+
+    /* The download URL the page itself uses is signed per session; capture it by
+       letting the page start a download and aborting it before the bytes arrive. */
+    let downloadUrl = null;
+    try {
+      await context.route('**/download/**', async (route) => {
+        if (!downloadUrl) downloadUrl = route.request().url();
+        await route.abort();
+      });
+      const button = page.locator('text=/^\s*Download\s*$/').first();
+      if (await button.count()) {
+        await button.click({ timeout: 5000 }).catch(() => {});
+        for (let i = 0; i < 20 && !downloadUrl; i += 1) await page.waitForTimeout(200);
+      }
+      await context.unroute('**/download/**');
+    } catch {
+      /* no clickable download, keep the API link */
+    }
+
     for (const payload of payloads) {
       const files = mapContents(payload, code);
-      if (files) return files;
+      if (files) {
+        if (downloadUrl) {
+          const first = files.find((f) => f.kind === 'video') || files[0];
+          if (first) first.ref.link = downloadUrl;
+        }
+        return { files, cookie, downloadUrl };
+      }
     }
 
     // Last resort: whatever download links the rendered page exposes.
@@ -120,7 +151,7 @@ async function gofileFolder(code, { timeoutMs = 60_000 } = {}) {
           ref: { resolver: 'gofile', id: name, name, link: l.href },
         };
       });
-    return fromDom.length ? fromDom : null;
+    return fromDom.length ? { files: fromDom, cookie, downloadUrl } : null;
   } finally {
     await browser.close().catch(() => {});
   }

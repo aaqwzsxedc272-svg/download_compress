@@ -14,21 +14,24 @@ a free file host and gives you a share link — no account, no card, nothing to 
 - **Automatic re-hosting** to gofile, pixeldrain or catbox (anonymous), with a fallback
   chain, and share links that survive a server restart.
 
-**Want it online for free?** One command puts it on a Hugging Face Space — free, no card,
-full internet:
+**Want it online for free?** Three routes that need no credit card:
 
-```bash
-HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <your-hf-username> [space-name]
-```
+- **Render** — `render.yaml` deploys this repo on the free plan with a plain `npm start`. No
+  container, no card. 0.1 vCPU and it sleeps after 15 minutes idle; a free uptime pinger fixes
+  the sleeping. Best if you want a permanent URL.
+- **Your own computer + a free tunnel** — `npm start` then
+  `npx cloudflared tunnel --url http://localhost:3000`. Free, no account, and the only route
+  with real CPU, so the quality presets mean what they say.
+- **GitHub Codespaces** — 2 vCPU, 8 GB, no card; the repo ships a `.devcontainer` that starts
+  the server and exposes port 3000.
 
-It prints the live URL; then `node scripts/verify-deploy.js <url>` proves the whole chain works
-from the outside — app up, presets, hosters, a real link resolved, a real video compressed, and
+Hugging Face Spaces used to be the easy answer, but since **July 2026 the Hub requires a paid
+plan (PRO) to create any Space that runs compute** — `scripts/deploy-space.sh` still works there
+if you have one. Full details, limits and the verification command are in [DEPLOY.md](DEPLOY.md).
+
+Whichever route you pick, `node scripts/verify-deploy.js <url>` proves the whole chain works
+from the outside: app up, presets, hosters, a real link resolved, a real video compressed, and
 the share link publicly downloadable.
-
-You never install Docker for this: the platform's builder reads the `Dockerfile`. If you would
-rather avoid containers entirely, `render.yaml` deploys the same app on Render's free plan with
-a plain `npm start` — no card either way. Every route and what each can fetch is in
-[DEPLOY.md](DEPLOY.md).
 
 ## Run it
 

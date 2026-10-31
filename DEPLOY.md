@@ -1,164 +1,67 @@
 # Deploying Squeeze for free
 
-## "But isn't Docker paid?" — no, and you never touch it
+Squeeze wants three things from a host: **outbound internet** (to fetch your links and upload
+the result), **enough CPU to encode video**, and **staying up without you watching it**.
+No free-without-a-card host gives all three generously — so pick the trade-off you can live
+with. This page is honest about each one.
 
-The `Dockerfile` in this repo is a plain text recipe. Deploying with it means:
-
-- **you do not install Docker**, you do not run `docker build`, you do not create a Docker Hub
-  account, and you never pay Docker Inc. anything;
-- the hosting platform's own builder reads the recipe and runs the app on *its* servers;
-- on Hugging Face, that build and the machine it runs on (CPU basic: 2 vCPU, 16 GB RAM,
-  50 GB disk) are **free and need no card** — Free accounts get free CPU Basic Spaces
-  indefinitely, they just sleep after 48 h of inactivity and wake on the next request.
-
-Nothing in the free path costs money. If you would rather not see the word "Docker" at all,
-[section 2](#2-render--free-no-card-and-no-docker) deploys the same app straight from GitHub
-with a plain `npm start`.
-
-The whole point of Squeeze is that it fetches a link, compresses the video and uploads the
-result to a free hoster by itself. That needs a machine with **real outbound internet**.
-Hugging Face Spaces gives you exactly that, free, with no credit card — and the repo ships a
-script that does the whole deployment in one command.
+> **Hugging Face Spaces is no longer free for this.** Since July 2026 the Hub requires a paid
+> plan to *create* anything that runs compute: _"Static Spaces are free for everyone. Gradio and
+> Docker Spaces run on compute and require a paid plan to create: PRO for personal accounts,
+> Team or Enterprise for organizations."_ ([spaces-overview](https://huggingface.co/docs/hub/spaces-overview)).
+> The `deploy-space.sh` script in this repo still works, but it needs HF PRO ($9/mo). The free
+> routes below do not.
 
 ---
 
-## 1. Hugging Face Spaces — one command, free, no card
+## Comparison
 
-Free CPU Spaces run Docker, have full internet, 16 GB RAM and 50 GB of disk. That is enough
-for server-side gofile / pixeldrain / turbo / bunkr / filester fetching *and* for uploading the
-result back to a hoster.
+| Route | Card? | Internet | CPU | Stays up | Best for |
+| --- | --- | --- | --- | --- | --- |
+| [Render free](#1-render--free-no-card-no-docker) | no | yes | 0.1 vCPU | sleeps after 15 min idle (defeatable) | always-there URL, small files |
+| [Your own PC + tunnel](#2-your-own-computer--a-free-tunnel) | no | yes | all of it | while the PC is on | big files, best quality, fastest |
+| [GitHub Codespaces](#3-github-codespaces--free-quota) | no | yes | 2 vCPU | while the session runs | a few big jobs without installing anything |
+| [HF Spaces (PRO)](#4-if-you-already-have-hugging-face-pro) | $9/mo | yes | 2 vCPU | sleeps after 48 h idle | set-and-forget if you already pay |
 
-1. Create a free account at <https://huggingface.co>.
-2. Create an access token with **write** scope: <https://huggingface.co/settings/tokens>.
-3. From this repo:
-
-   ```bash
-   HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <your-hf-username> [space-name]
-   ```
-
-That is the whole deployment. The script:
-
-- builds a slim bundle into `dist/hf-space` (`scripts/package-space.js`),
-- creates the Space through the HF API if it does not exist yet,
-- pushes the Docker app to it.
-
-When it finishes it prints the URL and the verification command:
-
-```
-App          https://<user>-<space>.hf.space
-Diagnostics  https://<user>-<space>.hf.space/diagnostics
-
-Verify it once the build finishes:
-  node scripts/verify-deploy.js https://<user>-<space>.hf.space
-```
-
-The Space builds for a few minutes on the first push. Re-running the script is safe — it
-rebuilds the bundle and force-pushes, which triggers a fresh build.
-
-### Confirm it actually works
-
-`scripts/verify-deploy.js` is an end-to-end check you can point at any deployment:
-
-```bash
-node scripts/verify-deploy.js https://<user>-<space>.hf.space --preset tiny
-```
-
-It checks, in order: the app answers, the quality presets are there, the hosters are
-configured, yt-dlp is present (advisory), the container can reach the internet (advisory),
-a real link resolves, a real video compresses to a smaller file, a share link is created, and
-**that share link is publicly downloadable**. It exits non-zero only on real failures, so it
-is safe to use in CI. Add `--keep` to leave the uploaded test file in place.
-
-### No terminal? Do it entirely in the browser
-
-1. Open <https://huggingface.co/new-space>, pick **Docker** → **Blank**, hardware
-   **CPU basic (free)**, and create it. The Space arrives with a `README.md` that already has
-   the `sdk: docker` / `app_port: 3000` front matter — keep it, do not overwrite it.
-2. On GitHub, open the repo → **Code → Download ZIP**, then unzip it.
-3. In the Space, open **Files → Add file → Upload files** and drag in `Dockerfile`,
-   `.dockerignore`, `package.json`, `package-lock.json`, and the `server/`, `public/` and
-   `shared/` folders from the unzipped repo. The uploader keeps folder paths.
-4. Commit. The Space builds itself and serves the app at `https://<user>-<space>.hf.space`.
-   Push later changes the same way, or connect the one-command script once you have a token.
-
-### Space settings that matter
-
-| Setting | Value |
-| --- | --- |
-| SDK | Docker |
-| App port | `3000` (already in the generated `README.md` front matter) |
-| Hardware | CPU basic — free |
-| Persistent storage | optional; without it `/data` is wiped on rebuild, which is fine |
-
-`DATA_DIR=/data` keeps job history across rebuilds if you attach storage; otherwise Squeeze
-only keeps files for a few hours anyway. The container runs as the non-root `node` user and
-owns `/data`.
+**Recommendation:** if your computer can stay on, use route 2 — it is free and it is the only
+one with enough CPU for the quality you asked for. If it cannot, route 1 gives you a permanent
+URL that handles short and medium videos, just slowly.
 
 ---
 
-## 2. Render — free, no card, and no Docker
+## 1. Render — free, no card, no Docker
 
-`render.yaml` at the repo root is already set up for Render's **free** plan on the **Node**
-runtime: `npm ci --omit=dev` then `npm start`. No container, no Dockerfile, no card.
+`render.yaml` at the repo root is already configured for Render's **free** plan on the **Node**
+runtime: `npm ci --omit=dev`, then `npm start`. No container, no Dockerfile, no card.
 
-1. Free account at <https://render.com> (GitHub sign-in is easiest).
+1. Free account at <https://render.com> (sign in with GitHub).
 2. **New → Blueprint**, pick this GitHub repo. Render reads `render.yaml` and creates the
    service on the free plan.
-3. Wait for the build, then use the `https://squeeze-xxxx.onrender.com` URL it gives you.
+3. Wait for the build; you get `https://squeeze-xxxx.onrender.com`.
 
-Honest limits of the free plan, and what the yaml already does about them:
+Real limits of the free plan, and what the yaml already does about them:
 
-| Limit | Effect | Mitigation shipped |
+| Limit | What it means | Mitigation shipped |
 | --- | --- | --- |
-| 512 MB RAM, 0.1 CPU | ffmpeg can be OOM-killed on large sources; encodes are slow | `MAX_UPLOAD_MB=700`, `MAX_CONCURRENT=1` |
-| No persistent disk | working files vanish on restart (fine — files are temporary anyway) | uploads stay in the ephemeral filesystem |
-| Sleeps after 15 min without traffic | a job can be cut off if you close the tab and leave it | keep the tab open, or use Hugging Face for true set-and-forget |
-| 750 instance hours/month | plenty for personal use | — |
+| 0.1 CPU, 512 MB RAM | encodes run far slower than realtime; big sources get OOM-killed | `MAX_UPLOAD_MB=700`, `MAX_CONCURRENT=1` |
+| Sleeps after 15 min with no traffic | a job started and then abandoned can be cut off | point a free pinger at `/api/health` every 5 min — see below |
+| No persistent disk | working files vanish on restart (they are temporary anyway) | files stream to the hoster as soon as the job ends |
+| 750 instance hours / month | one service at 744 h/mo fits exactly | keep it to one service |
 
-Render does have real internet, so gofile / pixeldrain / turbo / bunkr / filester links resolve
-server-side and the finished file is uploaded to a hoster for you.
+**Keeping it awake, free:** create a monitor at <https://uptimerobot.com> (free, no card) or
+<https://cron-job.org> pointing at `https://squeeze-xxxx.onrender.com/api/health` every
+5 minutes. That counts as traffic, so the service stays up, and 5-minute pings fit inside the
+750 free hours. With the pinger running you can paste a link, close the tab, and come back.
 
----
-
-## 3. Oracle Cloud "Always Free" — a real VM, free forever
-
-24 GB RAM and a real network, free forever. A card is required for identity verification, but
-the Ampere/AMD always-free shapes are not charged.
-
-```bash
-sudo apt update && sudo apt install -y docker.io
-git clone https://github.com/aaqwzsxedc272-svg/download_compress
-cd download_compress
-sudo docker build -t squeeze .
-sudo docker run -d --restart=always -p 80:3000 -v squeeze-data:/data --name squeeze squeeze
-```
-
-Open port 80 in the OCI security list and you are live at `http://<your-vm-ip>`. RAM this
-generous means `MAX_CONCURRENT=2` or `3` is comfortable.
+**Pick a faster preset here.** At 0.1 vCPU, `high` on a long 1080p video will feel glacial.
+`balanced` or `small` is the sane choice on this host; `tiny` for anything long.
 
 ---
 
-## 4. Koyeb / Railway / Fly.io / Back4App
+## 2. Your own computer + a free tunnel
 
-All have trial or hobby tiers. PaaS deploys work unchanged (Koyeb now wants a card for
-verification; Railway and Back4App start without one). With Docker:
-
-```bash
-docker build -t squeeze .
-# push to any registry, then create the service with DATA_DIR=/data and a volume
-```
-
-Or use the shipped compose file:
-
-```bash
-docker compose up -d --build
-```
-
----
-
-## 5. Zero sign-up: run it on your own machine and share it
-
-Free, instant, full internet:
+Free, instant, no card, and the only option with real CPU — the quality presets mean what they
+say here.
 
 ```bash
 npm install
@@ -167,12 +70,69 @@ npm start                       # http://localhost:3000
 npx cloudflared tunnel --url http://localhost:3000
 ```
 
-Cloudflare prints a `https://*.trycloudflare.com` URL that works from any device. Your machine
-does the fetching and encoding; nothing is deployed and there is no account to cancel.
+Cloudflare prints a `https://*.trycloudflare.com` URL that works from any device, including
+your phone. Your machine does the fetching, encoding and uploading; nothing is deployed and
+there is no account to cancel. Close the terminal and it is gone.
+
+To keep it running after you close the terminal:
+
+```bash
+nohup npm start > squeeze.log 2>&1 &
+```
+
+and start it the same way after a reboot (or use `pm2`). It also works on a home NAS or a
+Raspberry Pi 4/5 with Node 18+ installed — slow, but always on.
 
 ---
 
-## What each option can actually fetch
+## 3. GitHub Codespaces — free quota
+
+No card, 2 vCPU and 8 GB RAM, real internet, and it runs this repo unchanged.
+
+1. Open the repo on GitHub → **Code → Codespaces → Create codespace on main**.
+2. The `.devcontainer` config installs dependencies and starts the server for you.
+3. In the **Ports** tab, right-click port 3000 → **Port Visibility → Public**. The forwarded
+   `https://<name>-3000.app.github.dev` URL is your app.
+
+Free personal accounts get a monthly Codespaces quota (the 2-core machine burns it at 1× 
+core-hour). The codespace stops after ~30 min of inactivity, so this suits "a few big jobs
+today", not a permanent link.
+
+---
+
+## 4. If you already have Hugging Face PRO
+
+Then a Space is the nicest set-and-forget option (2 vCPU, 16 GB RAM, sleeps after 48 h idle):
+
+```bash
+HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <your-hf-username> [space-name]
+```
+
+It builds a slim bundle, creates the Space through the API, pushes it, and prints the URL. Then:
+
+```bash
+node scripts/verify-deploy.js https://<user>-<space>.hf.space
+```
+
+---
+
+## How to check any deployment actually works
+
+`scripts/verify-deploy.js` tests a live URL from the outside and exits non-zero only on real
+failures:
+
+```bash
+node scripts/verify-deploy.js https://your-app.onrender.com --preset tiny
+```
+
+It checks the app answers, the presets are served, hosters are configured, yt-dlp is present
+(advisory), the container can reach the internet (advisory), a real link resolves, a real video
+compresses to a smaller file, a share link is created, and **that share link is publicly
+downloadable**. `--keep` leaves the uploaded test file in place.
+
+---
+
+## What each host can actually fetch
 
 | Host | Needs server internet? | Works with browser only? |
 | --- | --- | --- |
@@ -182,4 +142,5 @@ does the fetching and encoding; nothing is deployed and there is no account to c
 | bunkr | yes | no — Cloudflare-protected |
 | filester.me | yes | no — DDoS-Guard protected |
 
-Open `/diagnostics` on the deployed app to confirm which rows pass on that host.
+All four routes above give the server real internet, so every row works once deployed. Open
+`/diagnostics` on the deployed app to confirm which rows pass on that host.

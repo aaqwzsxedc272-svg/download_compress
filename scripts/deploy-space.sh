@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 #
-# Deploy Squeeze to a Hugging Face Space (free, no credit card).
+# Deploy Squeeze to a Hugging Face Space.
+#
+# NOTE: since July 2026 the Hub requires a paid plan to CREATE any Space that
+# runs compute (Gradio or Docker): PRO ($9/mo) for personal accounts, Team or
+# Enterprise for organizations. Static Spaces are the only free ones.
+# https://huggingface.co/docs/hub/spaces-overview
+# If you do not have PRO, use the free routes in DEPLOY.md instead (Render,
+# your own machine behind a tunnel, or GitHub Codespaces).
 #
 #   1. Create a free account at https://huggingface.co
 #   2. Create an access token with "write" scope:
@@ -20,6 +27,8 @@ if [[ -z "$USER_NAME" ]]; then
   echo "usage: HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <hf-username> [space-name]" >&2
   exit 64
 fi
+
+echo "Note: creating a Docker Space requires a paid Hugging Face plan (PRO or above)."
 
 if [[ -z "${HF_TOKEN:-}" ]]; then
   echo "HF_TOKEN is not set." >&2

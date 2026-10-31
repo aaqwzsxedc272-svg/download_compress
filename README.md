@@ -245,6 +245,24 @@ job says so instead of pretending; the file can always be dropped on the page by
 
 `npm run test:fallback` covers that path against a fake host that refuses plain requests.
 
+## Disk space
+
+A video needs roughly **three times its own size** free while it encodes: the source, the
+output, and the encoder's scratch files. A 4 GB 4K file therefore wants ~12 GB free.
+
+- The source is deleted the moment the output is complete, so a finished job costs only the
+  compressed file.
+- A failed job deletes its partial source and output immediately.
+- Before a job starts the server checks free space and refuses (with the numbers) rather than
+  dying half way through with `No space left on device`.
+- `npm run disk` reports total/used/free and the largest jobs; `npm run disk -- --clean` deletes
+  finished and failed jobs and the temp directory.
+- `/api/health` returns `freeGb`, so a monitor can watch it.
+
+GitHub Codespaces gives a 2-core machine **32 GB**, shared with `node_modules` (~150 MB),
+Playwright's Chromium (~450 MB) and the OS. That is comfortable for 1080p work and tight for a
+queue of 4K files: do them a few at a time.
+
 ## Long jobs and idle hosts
 
 Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Two defences:

@@ -16,7 +16,8 @@
     "verify": "node scripts/verify-deploy.js",
     "check": "node scripts/check-link.js",
     "browser:install": "npm install --no-save playwright && npx playwright install --with-deps chromium",
-    "test:fallback": "node scripts/fallback.test.js"
+    "test:fallback": "node scripts/fallback.test.js",
+    "disk": "node scripts/disk.js"
   },
   "engines": {
     "node": ">=18"

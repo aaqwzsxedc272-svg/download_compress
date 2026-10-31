@@ -201,6 +201,11 @@ async function compressJob(job) {
     notes.push('Re-encoding would have made this bigger, so the original file is what gets shared.');
   }
 
+  /* The source is only needed while encoding. Deleting it now roughly halves
+     what a job occupies on disk, which matters on a 32 GB machine handling
+     multi-gigabyte 4K files. */
+  await fsp.rm(paths.source, { force: true }).catch(() => {});
+
   const saved = job.sourceBytes ? Math.max(0, 1 - outStat.size / job.sourceBytes) : 0;
   if (!usedOriginal && saved < 0.05 && !job.targetMb) {
     notes.push('This one was already small — the compressed copy is about the same size.');
@@ -326,15 +331,28 @@ const FRIENDLY = {
   YTDLP_FAILED: 'The platform refused the download. It may need a login, or the link is unsupported.',
 };
 
+const OUT_OF_SPACE = /ENOSPC|No space left on device/i;
+
+const formatGb = (bytes) => `${(bytes / 1073741824).toFixed(1)} GB`;
+
 function reportJobError(job, err) {
-  const message = FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
+  const outOfSpace = err.code === 'NO_DISK' || OUT_OF_SPACE.test(String(err.message || ''));
+  const message = outOfSpace
+    ? 'This machine ran out of disk space. Delete finished videos (the Remove button) and try again — a long 4K file needs about three times its own size free.'
+    : FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
   jobsStore.updateJob(job, {
     status: 'error',
-    stage: 'Failed',
+    stage: outOfSpace ? 'Out of disk space' : 'Failed',
     error: message,
     speed: null,
   });
-  console.error(`[job ${job.id}] ${err.code || 'ERR'}:`, err.message?.slice(0, 600));
+  console.error(`[job ${job.id}] ${outOfSpace ? 'NO_DISK' : err.code || 'ERR'}:`, err.message?.slice(0, 600));
+
+  /* A failed job leaves a partial source and half an output behind. On a small
+     disk those are exactly what stops the next job, so drop them now. */
+  const paths = jobsStore.jobPaths(job);
+  fsp.rm(paths.source, { force: true }).catch(() => {});
+  fsp.rm(paths.output, { force: true }).catch(() => {});
 }
 
 /**
@@ -351,10 +369,16 @@ async function fetchThenCompress(job, ref) {
     const url = await directUrl(ref);
     const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
     const expected = Number(ref.size) || 0;
-    if (expected && free < expected * 1.6) {
-      throw Object.assign(new Error('Not enough disk space on this server for that file.'), {
-        code: 'NO_DISK',
-      });
+    /* Encoding needs the source plus the output plus room for the encoder's
+       own scratch files, so require ~2.2x the file and never drop below 1 GB. */
+    const needed = Math.max(expected * 2.2, 1024 ** 3);
+    if (free < needed) {
+      throw Object.assign(
+        new Error(
+          `Not enough disk space: ${formatGb(free)} free, about ${formatGb(needed)} needed for this file.`,
+        ),
+        { code: 'NO_DISK' },
+      );
     }
 
     jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading video', progress: 0 });
@@ -539,8 +563,11 @@ async function adoptUpload(tmpPath, fields) {
 
 app.get('/api/health', async (req, res) => {
   const ytdlp = await sources.hasYtdlp();
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
   res.json({
     ok: true,
+    freeBytes: free,
+    freeGb: Math.round((free / 1073741824) * 10) / 10,
     maxUploadMb: MAX_UPLOAD_MB,
     presets: PRESET_LIST,
     defaultPreset: DEFAULT_PRESET,
@@ -1239,6 +1266,15 @@ async function main() {
   ensureSample().catch((err) => console.warn('Sample clip unavailable:', err.message));
   const ytdlp = await sources.hasYtdlp();
   console.log(`Squeeze listening on http://0.0.0.0:${PORT} (yt-dlp: ${ytdlp ? ytdlp.version : 'not installed'})`);
+
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  console.log(`Free disk: ${formatGb(free)} in ${jobsStore.DATA_DIR}`);
+  if (free < 5 * 1024 ** 3) {
+    console.warn(
+      `[disk] Only ${formatGb(free)} free. A 4K file needs roughly three times its own size ` +
+        `while it encodes. Reclaim space with: npm run disk -- --clean`,
+    );
+  }
   app.listen(PORT, '0.0.0.0');
 }
 

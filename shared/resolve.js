@@ -82,6 +82,10 @@
      It used to be a constant, but a stale one makes every folder look premium,
      so it is read from gofile.io itself and cached for half an hour. */
   let gofileWt = { value: GOFILE_WT, at: 0 };
+  /* Set by the server when a headless browser is available: gofile's wt token
+     is minted by an obfuscated script, so only a real browser can list a folder
+     once the API starts refusing. */
+  let gofileBrowserHook = null;
 
   async function gofileWebToken(force = false) {
     if (!force && gofileWt.at && Date.now() - gofileWt.at < 30 * 60 * 1000) return gofileWt.value;
@@ -230,6 +234,16 @@
 
       if (!data || data.status !== 'ok') {
         const status = data && data.status ? String(data.status) : null;
+        if (gofileBrowserHook) {
+          try {
+            const viaBrowser = await gofileBrowserHook(code);
+            if (viaBrowser && viaBrowser.length) {
+              return { resolver: 'gofile', title: null, files: viaBrowser };
+            }
+          } catch (err) {
+            lastError = lastError || err;
+          }
+        }
         const scraped = await gofileScrape(code);
         if (scraped && scraped.length) {
           return { resolver: 'gofile', title: null, files: scraped };
@@ -724,5 +738,9 @@
     return String(url).trim();
   }
 
-  return { resolve, directUrl, extractVideoUrls, RESOLVERS, ResolveError, isVideo };
+  function setGofileBrowser(hook) {
+    gofileBrowserHook = typeof hook === 'function' ? hook : null;
+  }
+
+  return { resolve, directUrl, extractVideoUrls, RESOLVERS, ResolveError, isVideo, setGofileBrowser };
 });

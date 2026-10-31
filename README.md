@@ -56,6 +56,16 @@ Requires Node 18+ (uses the built-in `fetch`). ffmpeg and ffprobe come bundled a
 binaries through `@ffmpeg-installer/ffmpeg` and `@ffprobe-installer/ffprobe` — nothing to
 install system-wide.
 
+gofile now mints its API token inside an obfuscated browser script, so a plain HTTP client
+cannot list a folder any more. Install the optional headless browser where you need it:
+
+```bash
+npm run browser:install      # playwright + chromium, ~120 MB, skipped by a normal install
+```
+
+Without it, gofile links fall back to your browser (pixeldrain and gofile both allow that);
+with it, the server lists and downloads gofile folders on its own.
+
 For YouTube / TikTok / Instagram / X links, install yt-dlp on the same machine:
 
 ```bash

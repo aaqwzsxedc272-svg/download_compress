@@ -13,7 +13,9 @@
     "test": "node scripts/resolve.test.js && node scripts/hosters.test.js",
     "deploy:hf": "scripts/deploy-space.sh",
     "package:hf": "node scripts/package-space.js",
-    "verify": "node scripts/verify-deploy.js"
+    "verify": "node scripts/verify-deploy.js",
+    "check": "node scripts/check-link.js",
+    "browser:install": "npm install --no-save playwright && npx playwright install --with-deps chromium"
   },
   "engines": {
     "node": ">=18"

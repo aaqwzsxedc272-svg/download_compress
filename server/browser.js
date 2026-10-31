@@ -1,0 +1,129 @@
+'use strict';
+/**
+ * Optional headless-browser fallback for hosts that only talk to a real browser.
+ *
+ * gofile ships `/js/wt.obf.js`, which mints the `wt` token the API demands; a
+ * plain HTTP client can never produce it. Chromium runs that script exactly as a
+ * visitor's browser would, and we read the folder straight out of the API
+ * responses the page makes for itself.
+ *
+ * Playwright is NOT a dependency of this project on purpose: it is ~100 MB and
+ * only some deployments need it. Install it where you need it:
+ *
+ *   npm install --no-save playwright
+ *   npx playwright install chromium
+ *
+ * Without it every function here reports `available() === false` and the app
+ * falls back to its normal HTTP paths.
+ */
+
+const UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+let playwright = null;
+let loadError = null;
+
+function load() {
+  if (playwright || loadError) return playwright;
+  try {
+    // eslint-disable-next-line global-require, import/no-unresolved
+    playwright = require('playwright');
+  } catch (err) {
+    loadError = err;
+    playwright = null;
+  }
+  return playwright;
+}
+
+const available = () => Boolean(load() && load().chromium);
+
+/** Turn one gofile contents payload into our file shape. */
+function mapContents(payload, code) {
+  if (!payload || payload.status !== 'ok' || !payload.data) return null;
+  const node = payload.data;
+  if (node.id && code && node.id !== code && !node.children && !node.contents) return null;
+  const children = node.children || node.contents || {};
+  const files = Object.values(children)
+    .filter((child) => child && child.type === 'file')
+    .map((child) => ({
+      id: child.id,
+      name: child.name || 'video',
+      size: Number(child.size) || 0,
+      mime: child.mimetype || '',
+      kind: /\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|3gp|ogv)$/i.test(child.name || '') ? 'video' : 'other',
+      ref: {
+        resolver: 'gofile',
+        id: child.id,
+        name: child.name,
+        server: child.server || child.serverChoosen || null,
+        link: child.link || null,
+      },
+    }));
+  return files.length ? files : null;
+}
+
+/**
+ * Open a gofile folder in Chromium and return its files.
+ * Throws BROWSER_UNAVAILABLE when Playwright is not installed.
+ */
+async function gofileFolder(code, { timeoutMs = 60_000 } = {}) {
+  const pw = load();
+  if (!pw || !pw.chromium) {
+    throw Object.assign(new Error('The headless browser is not installed on this machine.'), {
+      code: 'BROWSER_UNAVAILABLE',
+    });
+  }
+
+  const browser = await pw.chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  try {
+    const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
+    const page = await context.newPage();
+    const payloads = [];
+
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (!/api\.gofile\.io\/contents\//i.test(url)) return;
+      try {
+        payloads.push(await response.json());
+      } catch {
+        /* not json, ignore */
+      }
+    });
+
+    await page.goto(`https://gofile.io/d/${code}`, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+
+    // The token script runs after load; give the folder call time to happen.
+    const deadline = Date.now() + timeoutMs;
+    while (!payloads.length && Date.now() < deadline) {
+      await page.waitForTimeout(500);
+    }
+
+    for (const payload of payloads) {
+      const files = mapContents(payload, code);
+      if (files) return files;
+    }
+
+    // Last resort: whatever download links the rendered page exposes.
+    const links = await page
+      .$$eval('a[href*="/download/"]', (nodes) => nodes.map((n) => ({ href: n.href, text: n.textContent || '' })))
+      .catch(() => []);
+    const fromDom = links
+      .filter((l) => /\.(mp4|m4v|mov|webm|mkv|avi)$/i.test(new URL(l.href).pathname))
+      .map((l) => {
+        const name = decodeURIComponent(new URL(l.href).pathname.split('/').pop() || 'video.mp4');
+        return {
+          id: name,
+          name,
+          size: 0,
+          mime: '',
+          kind: 'video',
+          ref: { resolver: 'gofile', id: name, name, link: l.href },
+        };
+      });
+    return fromDom.length ? fromDom : null;
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+module.exports = { available, gofileFolder, UA };

@@ -18,7 +18,19 @@ const {
 } = require('./compress');
 const hosters = require('./hosters');
 const sources = require('./sources');
-const { resolve, directUrl } = require('../shared/resolve');
+const { resolve, directUrl, setGofileBrowser } = require('../shared/resolve');
+
+/* gofile mints its API token in an obfuscated browser script, so a headless
+   browser is the only way to list a folder once the plain API says no. It is an
+   optional dependency: if it is not installed this is a no-op. */
+try {
+  const browser = require('./browser');
+  if (browser.available()) {
+    setGofileBrowser((code) => browser.gofileFolder(code));
+  }
+} catch {
+  /* no browser helper on this deployment */
+}
 const { ensureSample } = require('./sample');
 
 const PORT = Number(process.env.PORT) || 3000;

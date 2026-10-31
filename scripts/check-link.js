@@ -9,7 +9,15 @@
  */
 'use strict';
 
-const { resolve } = require('../shared/resolve');
+const { resolve, setGofileBrowser } = require('../shared/resolve');
+
+// If a headless browser is installed, let gofile fall back to it.
+try {
+  const browser = require('../server/browser');
+  if (browser.available()) setGofileBrowser((code) => browser.gofileFolder(code));
+} catch {
+  /* optional */
+}
 
 (async () => {
   const url = process.argv[2];

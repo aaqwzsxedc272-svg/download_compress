@@ -1,15 +1,22 @@
+# Render blueprint — free plan, no container, no credit card.
+# Dashboard: New -> Blueprint -> pick this repo. Render reads this file.
+# Docs: DEPLOY.md
 services:
   - type: web
     name: squeeze
     runtime: node
-    plan: free
+    plan: free            # 512 MB RAM, 0.1 CPU, sleeps after 15 min idle
+    branch: main
+    autoDeploy: true
     buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
         value: "22"
+      # The free plan is 512 MB of RAM: keep per-job memory small and let the
+      # queue handle one video at a time.
       - key: MAX_UPLOAD_MB
-        value: 700          # free plan is 512 MB RAM; bigger files will be OOM-killed
+        value: 700
       - key: MAX_CONCURRENT
         value: 1

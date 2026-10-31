@@ -1,134 +1,122 @@
-# Deploying Squeeze for free
+# Deploying Squeeze for free, in the cloud, without a card
 
-Squeeze wants three things from a host: **outbound internet** (to fetch your links and upload
-the result), **enough CPU to encode video**, and **staying up without you watching it**.
-No free-without-a-card host gives all three generously — so pick the trade-off you can live
-with. This page is honest about each one.
+Squeeze needs three things from a host: **outbound internet** (to fetch your links and upload
+the result), **CPU to encode video**, and **staying up when you are not watching**. In 2026 the
+free-without-a-card tier gives you the first two and only partly the third. This page is honest
+about that and tells you which button to press.
 
-> **Hugging Face Spaces is no longer free for this.** Since July 2026 the Hub requires a paid
-> plan to *create* anything that runs compute: _"Static Spaces are free for everyone. Gradio and
-> Docker Spaces run on compute and require a paid plan to create: PRO for personal accounts,
-> Team or Enterprise for organizations."_ ([spaces-overview](https://huggingface.co/docs/hub/spaces-overview)).
-> The `deploy-space.sh` script in this repo still works, but it needs HF PRO ($9/mo). The free
-> routes below do not.
+> **No Hugging Face.** Since July 2026 the Hub requires a paid plan to *create* anything that
+> runs compute: _"Static Spaces are free for everyone. Gradio and Docker Spaces run on compute
+> and require a paid plan to create: PRO for personal accounts, Team or Enterprise for
+> organizations."_ ([spaces-overview](https://huggingface.co/docs/hub/spaces-overview)). The
+> `deploy-space.sh` script here still works, but only with HF PRO ($9/mo).
 
 ---
 
-## Comparison
+## Routes that cost nothing and ask for no card
 
-| Route | Card? | Internet | CPU | Stays up | Best for |
-| --- | --- | --- | --- | --- | --- |
-| [Render free](#1-render--free-no-card-no-docker) | no | yes | 0.1 vCPU | sleeps after 15 min idle (defeatable) | always-there URL, small files |
-| [Your own PC + tunnel](#2-your-own-computer--a-free-tunnel) | no | yes | all of it | while the PC is on | big files, best quality, fastest |
-| [GitHub Codespaces](#3-github-codespaces--free-quota) | no | yes | 2 vCPU | while the session runs | a few big jobs without installing anything |
-| [HF Spaces (PRO)](#4-if-you-already-have-hugging-face-pro) | $9/mo | yes | 2 vCPU | sleeps after 48 h idle | set-and-forget if you already pay |
+| Route | CPU | Sleeps? | "Link in, share link out" |
+| --- | --- | --- | --- |
+| **Render free** (recommended) | 0.1 vCPU, 512 MB | after 15 min idle — fixable, see below | yes, fully server-side |
+| **SnapDeploy free** | 0.25 vCPU, 512 MB | after 15 min idle, 100 h/month | yes, fully server-side |
+| **GitHub Codespaces** | 2 vCPU, 8 GB | when the session closes | yes, while open |
+| Your own machine + tunnel | all of it | when the PC goes off | yes |
 
-**Recommendation:** if your computer can stay on, use route 2 — it is free and it is the only
-one with enough CPU for the quality you asked for. If it cannot, route 1 gives you a permanent
-URL that handles short and medium videos, just slowly.
+Everything that used to be free now wants a card: Fly.io, Koyeb ($29 hold), Google Cloud Run,
+Oracle Always Free, Railway's paid plans. Hugging Face wants PRO.
+
+**Render free is the one that answers your requirement** — free, no card, no Dockerfile, lives
+in the cloud, keeps working after you close the tab.
 
 ---
 
 ## 1. Render — free, no card, no Docker
 
-`render.yaml` at the repo root is already configured for Render's **free** plan on the **Node**
-runtime: `npm ci --omit=dev`, then `npm start`. No container, no Dockerfile, no card.
+`render.yaml` is already configured: free plan, `runtime: node`, `npm ci --omit=dev` then
+`npm start`, health check on `/api/health`.
 
-1. Free account at <https://render.com> (sign in with GitHub).
-2. **New → Blueprint**, pick this GitHub repo. Render reads `render.yaml` and creates the
-   service on the free plan.
-3. Wait for the build; you get `https://squeeze-xxxx.onrender.com`.
+### Steps (all in a browser, about two minutes)
 
-Real limits of the free plan, and what the yaml already does about them:
+1. Make sure this branch is merged into `main` — Render deploys `main`.
+2. Sign up at <https://render.com> with **GitHub** (no card field on the free path).
+3. **New → Blueprint**, pick the `download_compress` repo. Render reads `render.yaml` and shows
+   one web service on the **Free** plan. Press **Apply / Deploy**.
+4. Watch the build (~2 min). You get `https://squeeze-xxxx.onrender.com`.
+5. Open it, paste a link, pick a preset, press **Compress**. The job keeps running on Render
+   after you close the tab.
 
-| Limit | What it means | Mitigation shipped |
-| --- | --- | --- |
-| 0.1 CPU, 512 MB RAM | encodes run far slower than realtime; big sources get OOM-killed | `MAX_UPLOAD_MB=700`, `MAX_CONCURRENT=1` |
-| Sleeps after 15 min with no traffic | a job started and then abandoned can be cut off | point a free pinger at `/api/health` every 5 min — see below |
-| No persistent disk | working files vanish on restart (they are temporary anyway) | files stream to the hoster as soon as the job ends |
-| 750 instance hours / month | one service at 744 h/mo fits exactly | keep it to one service |
+### Keep it awake for free
 
-**Keeping it awake, free:** create a monitor at <https://uptimerobot.com> (free, no card) or
-<https://cron-job.org> pointing at `https://squeeze-xxxx.onrender.com/api/health` every
-5 minutes. That counts as traffic, so the service stays up, and 5-minute pings fit inside the
-750 free hours. With the pinger running you can paste a link, close the tab, and come back.
+Render spins a free service down after 15 minutes without traffic. `.github/workflows/keepalive.yml`
+in this repo pings `/api/health` every 10 minutes using **GitHub's own scheduler** — no third-party
+account, no card:
 
-**Pick a faster preset here.** At 0.1 vCPU, `high` on a long 1080p video will feel glacial.
-`balanced` or `small` is the sane choice on this host; `tiny` for anything long.
+1. Repo → **Settings → Secrets and variables → Actions → Variables → New repository variable**
+2. Name `SQUEEZE_URL`, value `https://squeeze-xxxx.onrender.com`
+3. Actions tab → *keep-alive* → **Run workflow** once to confirm it is green.
+
+750 free instance hours a month is 744 hours — one service at 24/7 fits, barely. If you would
+rather not ping, the service simply cold-starts (~60 s) on your next visit.
+
+### Living with 0.1 vCPU
+
+| Preset | Reality on Render free |
+| --- | --- |
+| `max`, `high` | only for short clips — a 10-minute 1080p video is hours |
+| `balanced` | the sensible default here |
+| `small`, `tiny` | fast enough for long videos |
+
+`MAX_UPLOAD_MB=700` and `MAX_CONCURRENT=1` are already set in `render.yaml`: more than that and
+the 512 MB container gets killed mid-encode.
 
 ---
 
-## 2. Your own computer + a free tunnel
+## 2. SnapDeploy — same idea, 2.5× the CPU, still no card
 
-Free, instant, no card, and the only option with real CPU — the quality presets mean what they
-say here.
+<https://snapdeploy.dev> runs Docker containers on AWS Fargate. Free tier: **4 containers,
+512 MB / 0.25 vCPU, 100 running hours a month, no card, no expiry**, sleeping after 15 minutes
+idle and waking on the next visit. The `Dockerfile` in this repo works unchanged.
+
+1. Sign up with GitHub or email (no card).
+2. **New container → GitHub repo → this repo**, small container.
+3. Set `MAX_UPLOAD_MB=700`, `MAX_CONCURRENT=1`, `DATA_DIR=/data`.
+4. Deploy; you get `https://<name>.containers.snapdeploy.app`.
+
+100 hours a month is roughly four hours a day of uptime — fine for occasional use, not a
+permanent link.
+
+---
+
+## 3. GitHub Codespaces — 2 vCPU, no card, no signup beyond GitHub
+
+Unchanged from what ships in the repo: open the repo → **Code → Codespaces → Create**, the
+`.devcontainer` installs dependencies and starts the server, then **Ports → 3000 → Public**.
+Best for "one big file today", not for a permanent URL.
+
+---
+
+## 4. Your own computer + a free tunnel
 
 ```bash
-npm install
-npm start                       # http://localhost:3000
-# in another terminal, expose it publicly with a free tunnel:
+npm install && npm start          # http://localhost:3000
 npx cloudflared tunnel --url http://localhost:3000
 ```
 
-Cloudflare prints a `https://*.trycloudflare.com` URL that works from any device, including
-your phone. Your machine does the fetching, encoding and uploading; nothing is deployed and
-there is no account to cancel. Close the terminal and it is gone.
-
-To keep it running after you close the terminal:
-
-```bash
-nohup npm start > squeeze.log 2>&1 &
-```
-
-and start it the same way after a reboot (or use `pm2`). It also works on a home NAS or a
-Raspberry Pi 4/5 with Node 18+ installed — slow, but always on.
+Free, no account, real CPU. Only route where `high` on a long video is quick.
 
 ---
 
-## 3. GitHub Codespaces — free quota
-
-No card, 2 vCPU and 8 GB RAM, real internet, and it runs this repo unchanged.
-
-1. Open the repo on GitHub → **Code → Codespaces → Create codespace on main**.
-2. The `.devcontainer` config installs dependencies and starts the server for you.
-3. In the **Ports** tab, right-click port 3000 → **Port Visibility → Public**. The forwarded
-   `https://<name>-3000.app.github.dev` URL is your app.
-
-Free personal accounts get a monthly Codespaces quota (the 2-core machine burns it at 1× 
-core-hour). The codespace stops after ~30 min of inactivity, so this suits "a few big jobs
-today", not a permanent link.
-
----
-
-## 4. If you already have Hugging Face PRO
-
-Then a Space is the nicest set-and-forget option (2 vCPU, 16 GB RAM, sleeps after 48 h idle):
+## Verify any deployment in one command
 
 ```bash
-HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <your-hf-username> [space-name]
+node scripts/verify-deploy.js https://squeeze-xxxx.onrender.com --preset tiny
 ```
 
-It builds a slim bundle, creates the Space through the API, pushes it, and prints the URL. Then:
-
-```bash
-node scripts/verify-deploy.js https://<user>-<space>.hf.space
-```
-
----
-
-## How to check any deployment actually works
-
-`scripts/verify-deploy.js` tests a live URL from the outside and exits non-zero only on real
-failures:
-
-```bash
-node scripts/verify-deploy.js https://your-app.onrender.com --preset tiny
-```
-
-It checks the app answers, the presets are served, hosters are configured, yt-dlp is present
-(advisory), the container can reach the internet (advisory), a real link resolves, a real video
-compresses to a smaller file, a share link is created, and **that share link is publicly
-downloadable**. `--keep` leaves the uploaded test file in place.
+Checks the app answers, presets are served, hosters configured, yt-dlp present (advisory),
+outbound internet works (advisory), a real link resolves, a real video compresses smaller, a
+share link is created, and **that share link is publicly downloadable**. Exits non-zero only on
+real failures; `--keep` keeps the uploaded test file. Use `--preset tiny` on the free tier so
+the test finishes fast.
 
 ---
 
@@ -142,5 +130,5 @@ downloadable**. `--keep` leaves the uploaded test file in place.
 | bunkr | yes | no — Cloudflare-protected |
 | filester.me | yes | no — DDoS-Guard protected |
 
-All four routes above give the server real internet, so every row works once deployed. Open
+Render and SnapDeploy both give the server real internet, so every row works. Open
 `/diagnostics` on the deployed app to confirm which rows pass on that host.

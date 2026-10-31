@@ -235,6 +235,60 @@ async function main() {
     ).json();
     check('resolve rejects junk input', badResolve.code === 'BAD_URL');
 
+    // --------------------------------------------------- chunked/resumable upload
+    const chunkInit = await (
+      await fetch(`${BASE}/api/upload/init`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'chunked.mp4', size: fileBytes.length, presetId: 'tiny' }),
+      })
+    ).json();
+    check('chunked upload init returns an id', Boolean(chunkInit.uploadId) && chunkInit.chunkSize > 0);
+
+    const chunkCount = 5;
+    const per = Math.ceil(fileBytes.length / chunkCount);
+    let uploaded = 0;
+    for (let i = 0; i < chunkCount; i += 1) {
+      const slice = fileBytes.subarray(i * per, Math.min((i + 1) * per, fileBytes.length));
+      const res = await fetch(`${BASE}/api/upload/chunk/${chunkInit.uploadId}/${i}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: slice,
+      });
+      if (res.ok) uploaded += 1;
+    }
+    check('all chunks accepted', uploaded === chunkCount, `${uploaded}/${chunkCount}`);
+
+    const dupe = await fetch(`${BASE}/api/upload/chunk/${chunkInit.uploadId}/0`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: Buffer.from('x'),
+    });
+    check('a re-sent chunk is tolerated', dupe.status === 200);
+
+    const jump = await fetch(`${BASE}/api/upload/chunk/${chunkInit.uploadId}/99`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: Buffer.from('x'),
+    });
+    check('an out-of-order chunk is rejected', jump.status === 409);
+
+    const chunkDone = await (
+      await fetch(`${BASE}/api/upload/finish/${chunkInit.uploadId}`, { method: 'POST' })
+    ).json();
+    check('chunked upload produces a job', Boolean(chunkDone.job?.id));
+
+    const chunkedJob = await waitForJob(chunkDone.job.id);
+    check('chunked upload results in a video', chunkedJob.status === 'done', chunkedJob.error || '');
+    check(
+      'chunked upload kept every byte',
+      chunkedJob.sourceBytes === fileBytes.length,
+      `${chunkedJob.sourceBytes} vs ${fileBytes.length}`,
+    );
+
+    const ghostUpload = await fetch(`${BASE}/api/upload/finish/not-a-real-upload`, { method: 'POST' });
+    check('unknown upload id is refused', ghostUpload.status === 410);
+
     // --------------------------------------------------------------- failure
     const badUpload = await fetch(`${BASE}/api/upload?name=notes.txt`, {
       method: 'POST',

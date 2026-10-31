@@ -9,6 +9,7 @@ const { EventEmitter } = require('node:events');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const JOBS_DIR = path.join(DATA_DIR, 'jobs');
 const TMP_DIR = path.join(DATA_DIR, 'tmp');
+const UPLOADS_DIR = path.join(TMP_DIR, 'uploads');
 
 const MAX_AGE_MS = 3 * 60 * 60 * 1000; // finished jobs are cleared after 3h
 
@@ -20,6 +21,7 @@ bus.setMaxListeners(0);
 async function init() {
   await fsp.mkdir(JOBS_DIR, { recursive: true });
   await fsp.mkdir(TMP_DIR, { recursive: true });
+  await fsp.mkdir(UPLOADS_DIR, { recursive: true });
   // Nothing survives a restart, so clear out stale working files.
   const entries = await fsp.readdir(JOBS_DIR).catch(() => []);
   await Promise.all(
@@ -124,6 +126,7 @@ module.exports = {
   DATA_DIR,
   JOBS_DIR,
   TMP_DIR,
+  UPLOADS_DIR,
   init,
   createJob,
   getJob,

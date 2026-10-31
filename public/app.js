@@ -374,6 +374,110 @@ function currentOptions() {
   return { presetId: state.presetId, targetMb };
 }
 
+
+/* ------------------------------------------------- chunked (resumable) upload */
+
+const CHUNK_SIZE_FALLBACK = 8 * 1024 * 1024;
+const CHUNKED_THRESHOLD = 48 * 1024 * 1024; // above this, chunk the transfer
+
+/**
+ * Send bytes to the server in slices, so a dropped connection or a proxy that
+ * dislikes giant requests does not lose a multi-GB transfer.
+ * `source` is either a Response (streamed body) or a Blob/File.
+ */
+async function chunkedUpload(source, { name, pageUrl, total, label }) {
+  const opts = currentOptions();
+  const init = await api('/api/upload/init', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      filename: name,
+      size: total || 0,
+      presetId: opts.presetId,
+      targetMb: opts.targetMb,
+      url: pageUrl || null,
+    }),
+  });
+
+  const chunkSize = init.chunkSize || CHUNK_SIZE_FALLBACK;
+  const uploadId = init.uploadId;
+  let index = 0;
+  let sent = 0;
+
+  const report = () => {
+    showTransfer(
+      label || 'Sending to the compressor…',
+      total ? sent / total : null,
+      total ? `${formatBytes(sent)} / ${formatBytes(total)}` : formatBytes(sent),
+    );
+  };
+
+  const put = async (bytes) => {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const res = await fetch(`/api/upload/chunk/${uploadId}/${index}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: bytes,
+        });
+        if (res.ok) return;
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 409) return; // already stored; move on
+        lastError = new Error(data.error || `HTTP ${res.status}`);
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) throw lastError;
+      } catch (err) {
+        lastError = err;
+      }
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
+    throw lastError || new Error('Upload failed.');
+  };
+
+  if (source instanceof Blob) {
+    while (sent < source.size) {
+      const slice = source.slice(sent, sent + chunkSize);
+      const bytes = new Uint8Array(await slice.arrayBuffer());
+      await put(bytes);
+      sent += bytes.length;
+      index += 1;
+      report();
+    }
+  } else {
+    // Stream the response body and send each accumulated slice.
+    const reader = source.body.getReader();
+    let pending = new Uint8Array(chunkSize);
+    let filled = 0;
+
+    const flush = async () => {
+      const bytes = pending.subarray(0, filled);
+      await put(bytes);
+      sent += filled;
+      index += 1;
+      filled = 0;
+      report();
+    };
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      let offset = 0;
+      while (offset < value.length) {
+        const room = chunkSize - filled;
+        const take = Math.min(room, value.length - offset);
+        pending.set(value.subarray(offset, offset + take), filled);
+        filled += take;
+        offset += take;
+        if (filled === chunkSize) await flush();
+      }
+    }
+    if (filled > 0) await flush();
+  }
+
+  const res = await api(`/api/upload/finish/${uploadId}`, { method: 'POST' });
+  return res.job;
+}
+
 /* ------------------------------------------------------------- browser relay */
 
 function supportsStreamingUpload() {
@@ -440,6 +544,17 @@ async function relayBytes(directUrl, { pageUrl, filename } = {}) {
       total ? `${formatBytes(sent)} / ${formatBytes(total)}` : formatBytes(sent),
     );
   };
+
+  // Multi-GB or unknown-size bodies go through the resumable chunked path, which
+  // survives proxies that dislike a single enormous request.
+  if (!total || total > CHUNKED_THRESHOLD) {
+    return chunkedUpload(response, {
+      name: label,
+      pageUrl,
+      total,
+      label: 'Sending to the compressor…',
+    });
+  }
 
   const canStream = response.body && supportsStreamingUpload();
 
@@ -822,10 +937,22 @@ async function handleLink(raw) {
 async function handleFile(file) {
   clearAwait();
   const opts = currentOptions();
-  const qs = new URLSearchParams({ name: file.name, presetId: opts.presetId });
-  if (opts.targetMb) qs.set('targetMb', String(opts.targetMb));
   showTransfer(`Sending ${file.name}…`, 0, formatBytes(file.size));
-  const job = await uploadBlob(file, { endpoint: `/api/upload?${qs}`, method: 'POST', name: file.name });
+
+  let job;
+  if (file.size > CHUNKED_THRESHOLD) {
+    // A 4 GB file as one request is fragile; slice it instead.
+    job = await chunkedUpload(file, {
+      name: file.name,
+      total: file.size,
+      label: `Sending ${file.name}…`,
+    });
+  } else {
+    const qs = new URLSearchParams({ name: file.name, presetId: opts.presetId });
+    if (opts.targetMb) qs.set('targetMb', String(opts.targetMb));
+    job = await uploadBlob(file, { endpoint: `/api/upload?${qs}`, method: 'POST', name: file.name });
+  }
+
   hideTransfer();
   trackJob(job);
 }

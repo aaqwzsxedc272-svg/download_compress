@@ -9,6 +9,11 @@ MP4 back to download.
 - **Presets** from Tiny (360p) to Original resolution, or "fit in N MB" for a hard size target.
 - **Live progress** with speed and ETA, then one-click download.
 - **Three ways to fetch a video**, so a link the server can't reach still has a chance.
+- **Chunked, resumable uploads** — a 4 GB transfer goes up in 8 MB slices, so a dropped
+  connection or a picky proxy doesn't lose the whole file.
+
+**Want it online for free?** See [DEPLOY.md](DEPLOY.md) for four free routes (Oracle Always
+Free, Hugging Face Spaces, Render, or a local run behind a free tunnel) and what each can fetch.
 
 ## Run it
 
@@ -136,6 +141,10 @@ app cannot be used to probe the box it runs on.
 | `POST` | `/api/resolve` | List the files behind a link |
 | `POST` | `/api/jobs` | Create a job: `{ source: "url" \| "ref" \| "sample", url?, ref?, presetId, targetMb }` |
 | `POST` | `/api/upload?name=&presetId=` | Upload a file body directly |
+| `POST` | `/api/upload/init` | Start a chunked upload: `{ filename, size, presetId, targetMb, url }` |
+| `PUT` | `/api/upload/chunk/:id/:index` | Append one 8 MB slice |
+| `GET` | `/api/upload/status/:id` | How many chunks have landed |
+| `POST` | `/api/upload/finish/:id` | Validate and enqueue the job |
 | `PUT` | `/api/relay/:token` | Stream bytes fetched by the browser |
 | `GET` | `/api/jobs/:id` | Job state |
 | `GET` | `/api/jobs/:id/events` | Server-sent progress stream |
@@ -149,8 +158,9 @@ re-resolved at download time, so they never go stale.
 ## Testing
 
 - `npm run test:resolve` — 19 resolver tests against stubbed APIs (real response shapes).
-- `npm run smoke` — 28 end-to-end checks: sample, upload, browser relay, target size, range
-  requests, share-page resolution, reference jobs, and every rejection path. Starts its own
+- `npm run smoke` — 36 end-to-end checks: sample, upload, browser relay, target size, range
+  requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
+  chunk and an out-of-order chunk), and every rejection path. Starts its own
   server and a fake external host on a spare port.
 
 ## Housekeeping

@@ -568,6 +568,151 @@ app.post('/api/jobs', async (req, res) => {
   return undefined;
 });
 
+
+/* ------------------------------------------------- chunked / resumable upload */
+
+/**
+ * A multi-GB video cannot be pushed as one request through every proxy, and a
+ * dropped connection should not lose the whole transfer. Uploads are therefore
+ * split into fixed-size chunks appended to a temp file, then finished in one call.
+ */
+const CHUNK_SIZE = 8 * 1024 * 1024;
+const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000;
+
+/** uploadId -> { dir, metaPath, blobPath, meta } held in memory while active. */
+const uploads = new Map();
+
+function uploadDirFor(id) {
+  return path.join(jobsStore.UPLOADS_DIR, id);
+}
+
+async function writeMeta(entry) {
+  await fsp.writeFile(entry.metaPath, JSON.stringify(entry.meta));
+}
+
+app.post('/api/upload/init', async (req, res) => {
+  const body = req.body || {};
+  const size = Number(body.size) || 0;
+  if (size > MAX_UPLOAD_BYTES) {
+    return fail(res, 413, 'TOO_BIG', `Files up to ${MAX_UPLOAD_MB} MB are supported.`);
+  }
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  if (size && size * 1.5 > free) {
+    return fail(res, 507, 'NO_DISK', 'This server does not have enough free disk space for that file.');
+  }
+
+  const id = crypto.randomBytes(18).toString('base64url');
+  const dir = uploadDirFor(id);
+  await fsp.mkdir(dir, { recursive: true });
+
+  const entry = {
+    dir,
+    metaPath: path.join(dir, 'meta.json'),
+    blobPath: path.join(dir, 'blob.part'),
+    meta: {
+      id,
+      filename: String(body.filename || 'video').slice(0, 200),
+      size,
+      presetId: String(body.presetId || 'balanced'),
+      targetMb: Number(body.targetMb) > 0 ? Number(body.targetMb) : null,
+      url: body.url ? String(body.url).slice(0, 2000) : null,
+      chunks: 0,
+      createdAt: Date.now(),
+    },
+  };
+  await fsp.writeFile(entry.blobPath, '');
+  await writeMeta(entry);
+  uploads.set(id, entry);
+
+  res.status(201).json({ uploadId: id, chunkSize: CHUNK_SIZE });
+});
+
+function liveUpload(id) {
+  const entry = uploads.get(id);
+  if (!entry) return null;
+  if (Date.now() - entry.meta.createdAt > UPLOAD_TTL_MS) {
+    uploads.delete(id);
+    fsp.rm(uploadDirFor(id), { recursive: true, force: true }).catch(() => {});
+    return null;
+  }
+  return entry;
+}
+
+app.get('/api/upload/status/:id', (req, res) => {
+  const entry = liveUpload(req.params.id);
+  if (!entry) return fail(res, 410, 'UPLOAD_EXPIRED', 'That upload expired. Start again.');
+  res.json({ chunks: entry.meta.chunks, chunkSize: CHUNK_SIZE });
+});
+
+app.put('/api/upload/chunk/:id/:index', async (req, res) => {
+  const entry = liveUpload(req.params.id);
+  if (!entry) return fail(res, 410, 'UPLOAD_EXPIRED', 'That upload expired. Start again.');
+
+  const index = Number(req.params.index);
+  if (!Number.isInteger(index) || index < 0) return fail(res, 400, 'BAD_CHUNK', 'Invalid chunk index.');
+  if (index > entry.meta.chunks) {
+    return fail(res, 409, 'OUT_OF_ORDER', `Chunk ${entry.meta.chunks} expected, got ${index}.`);
+  }
+  if (index < entry.meta.chunks) {
+    // Re-sent chunk after a retry: treat as already stored.
+    return res.json({ chunks: entry.meta.chunks, skipped: true });
+  }
+
+  const sizeBefore = (await fsp.stat(entry.blobPath)).size;
+  try {
+    await pipeline(req, fs.createWriteStream(entry.blobPath, { flags: 'a' }));
+  } catch {
+    return fail(res, 400, 'CHUNK_FAILED', 'That chunk did not arrive completely.');
+  }
+
+  const sizeAfter = (await fsp.stat(entry.blobPath)).size;
+  if (sizeAfter > MAX_UPLOAD_BYTES) {
+    uploads.delete(entry.meta.id);
+    await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+    return fail(res, 413, 'TOO_BIG', `Files up to ${MAX_UPLOAD_MB} MB are supported.`);
+  }
+  if (sizeAfter === sizeBefore) return fail(res, 400, 'EMPTY_CHUNK', 'That chunk was empty.');
+
+  entry.meta.chunks = index + 1;
+  await writeMeta(entry);
+  res.json({ chunks: entry.meta.chunks, bytes: sizeAfter });
+});
+
+app.post('/api/upload/finish/:id', async (req, res) => {
+  const entry = liveUpload(req.params.id);
+  if (!entry) return fail(res, 410, 'UPLOAD_EXPIRED', 'That upload expired. Start again.');
+
+  try {
+    const stat = await fsp.stat(entry.blobPath);
+    if (!stat.size) throw Object.assign(new Error('No data was received.'), { code: 'EMPTY' });
+    if (entry.meta.size && stat.size < entry.meta.size * 0.98) {
+      return fail(res, 400, 'INCOMPLETE', `Only ${stat.size} of ${entry.meta.size} bytes arrived.`);
+    }
+
+    const tmp = path.join(jobsStore.TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.part`);
+    await fsp.rename(entry.blobPath, tmp);
+    uploads.delete(entry.meta.id);
+    await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+
+    const job = await adoptUpload(tmp, {
+      source: 'relay',
+      name: entry.meta.filename,
+      url: entry.meta.url,
+      presetId: entry.meta.presetId,
+      targetMb: entry.meta.targetMb,
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+  } catch (err) {
+    await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+    uploads.delete(entry.meta.id);
+    if (err.code === 'NO_VIDEO' || err.code === 'INVALID_MEDIA') {
+      return fail(res, 415, 'NO_VIDEO', 'That file is not a video this server can read.');
+    }
+    if (err.code === 'TOO_BIG') return fail(res, 413, 'TOO_BIG', err.message);
+    return fail(res, 400, 'UPLOAD_FAILED', err.message);
+  }
+});
+
 /** Upload straight from the browser (drag & drop). */
 app.post('/api/upload', async (req, res) => {
   const tmp = path.join(jobsStore.TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.part`);
@@ -706,6 +851,27 @@ app.delete('/api/jobs/:id', async (req, res) => {
   await jobsStore.removeJob(req.params.id);
   res.json({ ok: true });
 });
+
+// Drop half-finished chunked uploads so abandoned transfers do not fill the disk.
+setInterval(async () => {
+  const now = Date.now();
+  for (const [id, entry] of [...uploads]) {
+    if (now - entry.meta.createdAt > UPLOAD_TTL_MS) {
+      uploads.delete(id);
+      await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  // Also clear files left behind by a previous process.
+  const dirs = await fsp.readdir(jobsStore.UPLOADS_DIR).catch(() => []);
+  for (const name of dirs) {
+    if (uploads.has(name)) continue;
+    const full = uploadDirFor(name);
+    const stat = await fsp.stat(full).catch(() => null);
+    if (stat && now - stat.mtimeMs > UPLOAD_TTL_MS) {
+      await fsp.rm(full, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}, 10 * 60 * 1000).unref();
 
 /* -------------------------------------------------------------------- static */
 

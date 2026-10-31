@@ -738,9 +738,31 @@
     return String(url).trim();
   }
 
+  /** Headers gofile's store hosts want before they stream a file instead of
+      answering with an HTML "not allowed" page. */
+  async function gofileDownloadHeaders() {
+    const headers = { referer: 'https://gofile.io/', origin: 'https://gofile.io' };
+    try {
+      const token = await gofileGuestToken();
+      if (token) headers.cookie = `accountToken=${token}`;
+    } catch {
+      /* anonymous attempt */
+    }
+    return headers;
+  }
+
   function setGofileBrowser(hook) {
     gofileBrowserHook = typeof hook === 'function' ? hook : null;
   }
 
-  return { resolve, directUrl, extractVideoUrls, RESOLVERS, ResolveError, isVideo, setGofileBrowser };
+  return {
+    resolve,
+    directUrl,
+    extractVideoUrls,
+    RESOLVERS,
+    ResolveError,
+    isVideo,
+    setGofileBrowser,
+    gofileDownloadHeaders,
+  };
 });

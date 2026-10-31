@@ -248,17 +248,29 @@ async function downloadHttp(
     ...(withReferer && origin ? { referer: `${origin}/`, origin } : {}),
   });
 
+  /* gofile's store hosts answer an HTML page unless the guest account token
+     rides along; its own frontend sends exactly this cookie. */
+  let hostHeaders = {};
+  try {
+    if (/(^|\.)gofile\.io$/i.test(new URL(url).hostname)) {
+      const { gofileDownloadHeaders } = require('../shared/resolve');
+      if (gofileDownloadHeaders) hostHeaders = await gofileDownloadHeaders();
+    }
+  } catch {
+    /* no resolver module (standalone use): carry on without the cookie */
+  }
+
   let res;
   try {
     res = await fetch(url, {
-      headers: browserHeaders(false),
+      headers: { ...browserHeaders(false), ...hostHeaders },
       redirect: 'follow',
       signal: controller.signal,
     });
     if ((res.status === 403 || res.status === 401) && origin) {
       res.body?.cancel().catch(() => {});
       const retry = await fetch(url, {
-        headers: browserHeaders(true),
+        headers: { ...browserHeaders(true), ...hostHeaders },
         redirect: 'follow',
         signal: controller.signal,
       });

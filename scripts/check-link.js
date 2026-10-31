@@ -9,7 +9,7 @@
  */
 'use strict';
 
-const { resolve, setGofileBrowser } = require('../shared/resolve');
+const { resolve, directUrl, setGofileBrowser, gofileDownloadHeaders } = require('../shared/resolve');
 
 // If a headless browser is installed, let gofile fall back to it.
 try {
@@ -43,6 +43,40 @@ try {
         2,
       ),
     );
+    if (process.argv.includes('--probe')) {
+      const file = result.files.find((f) => f.kind === 'video') || result.files[0];
+      const direct = await directUrl(file.ref);
+      let extra = {};
+      try {
+        if (/(^|\.)gofile\.io$/i.test(new URL(direct).hostname)) extra = await gofileDownloadHeaders();
+      } catch {
+        /* not a gofile link */
+      }
+      const res = await fetch(direct, {
+        headers: {
+          'user-agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          accept: '*/*',
+          range: 'bytes=0-0',
+          ...extra,
+        },
+        redirect: 'follow',
+      });
+      console.log(
+        JSON.stringify(
+          {
+            probe: direct,
+            status: res.status,
+            contentType: res.headers.get('content-type'),
+            contentLength: res.headers.get('content-length'),
+            contentRange: res.headers.get('content-range'),
+          },
+          null,
+          2,
+        ),
+      );
+      if (res.body) res.body.cancel().catch(() => {});
+    }
   } catch (err) {
     console.log(JSON.stringify({ ok: false, code: err.code || null, message: err.message }, null, 2));
     process.exit(1);

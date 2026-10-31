@@ -198,6 +198,11 @@ async function compressJob(job) {
           `This file is packed tightly already — about ${Math.round(pick.saving * 100)}% is the most that can be trimmed` +
             (pick.crf !== preset.crf ? `, so the encoder ran at CRF ${pick.crf} instead of ${preset.crf}.` : '.'),
         );
+      } else if (pick.crf - preset.crf >= 6) {
+        notes.push(
+          `This source is dense, so CRF ${pick.crf} was needed (the preset asks for ${preset.crf}) — the saving is real, ` +
+            'but fine detail and fast motion will look softer than the original.',
+        );
       }
       if (pick.crf !== preset.crf) crfOverride = pick.crf;
     }

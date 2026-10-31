@@ -281,11 +281,15 @@ function updateCard(entry, job) {
     if (proj && Number.isFinite(proj.projectedBytes) && proj.saving > 0.02) {
       bits.push(`projected ${formatBytes(proj.projectedBytes)} (−${Math.round(proj.saving * 100)}%)`);
     }
+    if (proj && proj.crf && proj.crf !== preset.crf) bits.push(`CRF ${proj.crf}`);
   }
   if (job.status === 'done' && job.sourceBytes && job.outputBytes) {
     const saved = Math.max(0, 1 - job.outputBytes / job.sourceBytes);
     if (saved > 0.02) bits.push(`<span class="saved">saved ${formatBytes(job.sourceBytes - job.outputBytes)}</span>`);
     else if (job.usedOriginal) bits.push('no smaller copy was possible');
+    if (job.projection && job.projection.crf && job.projection.crf !== preset.crf) {
+      bits.push(`CRF ${job.projection.crf}`);
+    }
   }
   if (job.source === 'relay') bits.push('via your browser');
   metaEl.innerHTML = bits.join('<span style="opacity:.3">·</span>');

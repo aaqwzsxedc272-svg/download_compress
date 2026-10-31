@@ -16,6 +16,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+const { targetSize, audioPlan } = require('./compress');
 
 /** How much smaller a result must be before it is worth the encode. */
 const MIN_SAVING = Number(process.env.SQUEEZE_MIN_SAVING) || 0.12;
@@ -44,11 +45,19 @@ function run(bin, args) {
  * Two slices (a quarter in and three quarters in) keep the guess honest, because
  * a quiet scene early on is a poor predictor of a busy one later.
  */
-async function measureAt(input, { crf, preset, seconds, duration, workDir }) {
+async function measureAt(input, { crf, preset, seconds, duration, workDir, meta = {} }) {
   const sliceSeconds = Math.max(4, Math.min(seconds, Math.floor(duration / 3) || seconds));
   const offsets = duration > sliceSeconds * 4
     ? [Math.floor(duration * 0.2), Math.floor(duration * 0.7)]
     : [0];
+
+  /* Probe exactly what the real encode will do: the "Small"/"Tiny" presets
+     downscale, and probing at full size would overstate the result badly. */
+  const scaled = meta.width && meta.height ? targetSize(meta, preset) : null;
+  const filter =
+    scaled && (scaled.width !== meta.width || scaled.height !== meta.height)
+      ? ['-vf', `scale=${scaled.width}:${scaled.height}:flags=lanczos`]
+      : [];
 
   let totalBytes = 0;
   for (const [index, offset] of offsets.entries()) {
@@ -62,6 +71,7 @@ async function measureAt(input, { crf, preset, seconds, duration, workDir }) {
       '-map', '0:v:0',
       '-an',
       '-sn',
+      ...filter,
       '-c:v', 'libx264',
       '-preset', preset.x264Preset,
       '-crf', String(crf),
@@ -89,7 +99,14 @@ async function measureAt(input, { crf, preset, seconds, duration, workDir }) {
  */
 async function chooseCrf({ input, meta, preset, sourceBytes, workDir, onProbe = () => {} }) {
   const duration = Number(meta.duration) || 0;
-  const audioKbps = meta.hasAudio ? Number(preset.audioKbps) || 128 : 0;
+  /* Match the audio plan the real encode will use: a copied AAC stream keeps its
+     own bitrate, a re-encode uses the preset's. */
+  const audio = audioPlan(meta, preset);
+  const audioKbps = audio.mode === 'copy'
+    ? (Number(meta.audioBitrate) || 0) / 1000 || Number(preset.audioKbps) || 128
+    : audio.mode === 'aac'
+      ? Number(preset.audioKbps) || 128
+      : 0;
   const audioBytes = (audioKbps * 1000 * duration) / 8;
 
   const nope = { crf: preset.crf, projectedBytes: Infinity, saving: 0, probes: 0 };
@@ -114,6 +131,7 @@ async function chooseCrf({ input, meta, preset, sourceBytes, workDir, onProbe = 
         seconds: PROBE_SECONDS,
         duration,
         workDir,
+        meta,
       });
     } catch {
       return null; // probing is a nicety, never a blocker

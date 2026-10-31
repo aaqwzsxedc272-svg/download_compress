@@ -15,7 +15,7 @@ const path = require('node:path');
 const assert = require('node:assert');
 
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-const { chooseCrf, MIN_SAVING } = require('../server/estimate');
+const { chooseCrf, measureAt, MIN_SAVING } = require('../server/estimate');
 const { PRESETS, buildPlan } = require('../server/compress');
 
 let passed = 0;
@@ -148,6 +148,21 @@ async function main() {
     const args = plan.passes[plan.passes.length - 1].args;
     assert.strictEqual(args[args.indexOf('-crf') + 1], String(rescue.crf));
     assert.strictEqual(plan.crf, rescue.crf);
+  });
+
+  // 6. A downscaling preset must be probed at the size it will really encode.
+  const big = path.join(dir, 'wide.mp4');
+  await run([
+    '-hide_banner', '-loglevel', 'error',
+    '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=25:duration=6',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24',
+    '-pix_fmt', 'yuv420p', '-y', big,
+  ]);
+  const metaWide = { duration: 6, hasAudio: false, width: 1280, height: 720 };
+  const fullRes = await measureAt(big, { crf: 22, preset: PRESETS.max, seconds: 4, duration: 6, workDir: dir, meta: metaWide });
+  const scaled = await measureAt(big, { crf: 22, preset: PRESETS.tiny, seconds: 4, duration: 6, workDir: dir, meta: metaWide });
+  check('a downscaling preset is probed at its own size', () => {
+    assert.ok(scaled < fullRes * 0.8, `scaled probe ${Math.round(scaled)} B/s vs full ${Math.round(fullRes)} B/s`);
   });
 
   await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});

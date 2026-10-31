@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Squeeze — compress videos from links</title>
+<meta name="description" content="Paste video links, get smaller files back. Re-encodes with H.264 so the download is a fraction of the size." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c8f560'/%3E%3Cpath d='M9 12h14M11 16h10M13 20h6' stroke='%230b0d0e' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="bg-glow" aria-hidden="true"></div>
+
+<header class="site-header">
+  <a class="brand" href="/">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M5 8h14M7 12h10M9 16h6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    </span>
+    <span class="brand-name">Squeeze</span>
+  </a>
+  <div class="header-meta">
+    <span class="pill" id="enginePill"><span class="dot"></span><span id="engineText">checking engine…</span></span>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <h1>Big video in.<br /><span class="accent">Small file out.</span></h1>
+    <p class="hero-sub">
+      Paste a link or drop a file — Squeeze re-encodes it to H.264 and hands back a download
+      that's a fraction of the size. No watermark, no sign-up.
+    </p>
+  </section>
+
+  <section class="composer card" id="composer">
+    <div class="dropzone" id="dropzone">
+      <div class="dz-idle" id="dzIdle">
+        <label class="field-label" for="urlInput">Video link</label>
+        <textarea
+          id="urlInput"
+          rows="2"
+          spellcheck="false"
+          placeholder="https://example.com/video.mp4 — one link per line"
+        ></textarea>
+        <div class="dz-hint">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>or drop video files here, or <button type="button" class="linkish" id="browseBtn">browse</button></span>
+          <input type="file" id="fileInput" accept="video/*" multiple hidden />
+        </div>
+      </div>
+      <div class="dz-overlay" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="30" height="30"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <strong>Drop to squeeze</strong>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="control-group">
+        <span class="field-label">Quality</span>
+        <div class="segmented" id="quality" role="radiogroup" aria-label="Quality preset"></div>
+      </div>
+      <div class="control-group control-size">
+        <label class="field-label" for="targetMb">Fit in <span class="muted">(optional)</span></label>
+        <div class="size-input">
+          <input type="number" id="targetMb" min="1" max="2000" step="1" placeholder="—" inputmode="numeric" />
+          <span>MB</span>
+        </div>
+      </div>
+      <button class="primary" id="goBtn" type="button">
+        <span>Squeeze</span>
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+    <p class="composer-note">
+      <button type="button" class="linkish" id="sampleBtn">Try a sample video</button>
+      <span class="sep">·</span>
+      <span>Files are processed on this server and deleted automatically.</span>
+    </p>
+  </section>
+
+  <div class="alert" id="alert" role="alert" hidden></div>
+
+  <section class="jobs" id="jobsSection" hidden>
+    <div class="jobs-head">
+      <h2>Your videos</h2>
+      <button class="ghost" id="clearDone" type="button">Clear finished</button>
+    </div>
+    <div class="job-list" id="jobList"></div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <span>Squeeze</span>
+  <span class="sep">·</span>
+  <span>ffmpeg + libx264</span>
+  <span class="sep">·</span>
+  <span id="limitNote">uploads up to 2 GB</span>
+</footer>
+
+<template id="jobCardTemplate">
+  <article class="job card">
+    <div class="job-thumb"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name">Video</div>
+        <div class="job-badge" data-field="badge"></div>
+      </div>
+      <div class="job-status" data-field="status">Queued</div>
+      <div class="progress" data-field="progressWrap"><div class="progress-bar" data-field="progressBar"></div></div>
+      <div class="job-meta" data-field="meta"></div>
+      <div class="job-actions" data-field="actions"></div>
+    </div>
+  </article>
+</template>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: squeeze
+    runtime: docker
+    plan: starter # free instances spin down and have no disk
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: MAX_UPLOAD_MB
+        value: 2048
+      - key: MAX_CONCURRENT
+        value: 1
+    disk:
+      name: squeeze-data
+      mountPath: /data
+      sizeGB: 10

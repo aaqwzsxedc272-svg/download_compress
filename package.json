@@ -1,0 +1,20 @@
+{
+  "name": "squeeze",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Paste video links, get compressed videos back to download",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "node --watch server/server.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "express": "^4.22.3"
+  }
+}

@@ -91,7 +91,7 @@ def save_to_drive(source, mount_root):
 
 
 class ClipwellUI:
-    def __init__(self, download, output_dir='/content', drive_root='/content/drive'):
+    def __init__(self, download, output_dir='/content', drive_root='/content/drive', start_in_cell=False):
         self.download = download
         self.output_dir = Path(output_dir)
         self.drive_root = Path(drive_root)
@@ -106,6 +106,8 @@ class ClipwellUI:
         self.start = widgets.Button(description='Start processing', icon='play', button_style='success', layout=widgets.Layout(width='180px'))
         self.check.on_click(self._check)
         self.start.on_click(self._start)
+        if start_in_cell:
+            self.start.layout.display = 'none'
         self.message = widgets.HTML(value='')
         self.previews = widgets.VBox([])
         self.results = widgets.VBox([])
@@ -127,6 +129,7 @@ class ClipwellUI:
             self.save_drive,
             widgets.HTML(value='<div class="cw-muted">Optional: run the Connect Google Drive cell first. Completed videos go to My Drive / Clipwell. Free Colab may stop while you are away; unfinished videos will not be saved.</div>'),
             widgets.HBox([self.check, self.start], layout=widgets.Layout(margin='15px 0 5px 0')),
+            widgets.HTML(value='<div class="cw-muted">After entering your links, run ▶ Start processing in the notebook cell below.</div>' if start_in_cell else ''),
             self.message, self.previews, self.results,
             widgets.HTML(value='<div class="cw-muted" style="margin-top:14px">Keep the notebook open. Free runtimes can disconnect; output stays temporary. Only process content you have permission to use.</div>'),
         ])
@@ -175,6 +178,10 @@ class ClipwellUI:
             self.message.value = "<div class='cw-muted'>Preview complete. Estimates are illustrative; choose a quality and start when ready.</div>"
         finally:
             self._busy(False)
+
+    def run_in_cell(self):
+        """Run the real queue in the current notebook cell, not a keepalive."""
+        self._start(None)
 
     def _start(self, _):
         try:
@@ -252,7 +259,7 @@ class ClipwellUI:
             self._busy(False)
 
 
-def show(download):
-    ui = ClipwellUI(download)
+def show(download, start_in_cell=False):
+    ui = ClipwellUI(download, start_in_cell=start_in_cell)
     display(ui.root)
     return ui

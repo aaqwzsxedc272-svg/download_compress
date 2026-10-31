@@ -1,6 +1,7 @@
 import json
 import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -93,6 +94,36 @@ class VideoInfoTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertNotIn('secret-token', response.get_data(as_text=True))
         self.assertEqual(client.post('/api/inspect', json={'url': 'file:///tmp/video'}).status_code, 400)
+
+    def test_notebook_cell_runs_queue_until_work_is_finished(self):
+        started, release, returned = threading.Event(), threading.Event(), threading.Event()
+        def fake_run(job_id):
+            started.set()
+            if not release.wait(5):
+                app.update(job_id, stage='error', error='Timed out in test')
+                return
+            folder = app.WORK_DIR / job_id
+            folder.mkdir()
+            output = folder / 'compressed.mp4'
+            output.write_bytes(b'output')
+            app.update(job_id, stage='done', progress=100, source_size=200, output_size=6, path=str(output))
+        with tempfile.TemporaryDirectory() as directory:
+            ui = colab_ui.ClipwellUI(lambda _: None, output_dir=directory, start_in_cell=True)
+            self.assertEqual(ui.start.layout.display, 'none')
+            ui.input_urls.value = 'https://example.com/video'
+            with patch.object(app, 'validate_url'), patch.object(app, 'run_job', side_effect=fake_run):
+                thread = threading.Thread(target=lambda: (ui.run_in_cell(), returned.set()))
+                thread.start()
+                try:
+                    self.assertTrue(started.wait(3))
+                    self.assertFalse(returned.is_set())
+                finally:
+                    release.set()
+                    thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertTrue(returned.is_set())
+            self.assertEqual(len(ui.results.children), 1)
+            self.assertIn('Queue finished', ui.message.value)
 
     def test_widget_preview_and_process_multiple_files(self):
         downloads = []

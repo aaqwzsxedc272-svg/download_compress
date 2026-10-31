@@ -30,7 +30,7 @@ To run the tests: `python -m unittest discover -s tests -v`.
 
 ## Free cloud option: Google Colab (no server setup)
 
-For occasional interactive use, open [Clipwell in Google Colab](https://colab.research.google.com/github/aaqwzsxedc272-svg/download_compress/blob/arena/c1987889-download-compress/Clipwell_Colab.ipynb), sign in to Google, select the free CPU runtime, and press **▶ Open Clipwell** once. The notebook hides the code and opens an interactive workspace. Paste up to 20 links, choose quality, and optionally click **Check links** before processing. The source and encoding remain in the temporary cloud runtime; download only the completed MP4 to your computer. Disconnect and delete the runtime after the download finishes.
+For occasional interactive use, open [Clipwell in Google Colab](https://colab.research.google.com/github/aaqwzsxedc272-svg/download_compress/blob/arena/c1987889-download-compress/Clipwell_Colab.ipynb), sign in to Google, select the free CPU runtime, and press **▶ Open Clipwell** once. The notebook hides the code and opens an interactive workspace. Paste up to 20 links, choose quality, and optionally click **Check links** before processing. After entering links, run the separate **▶ Start processing** cell below the workspace. The cell performs the real queue and stays running until it finishes. This is experimental: it may help Colab see the active notebook execution, but it does not guarantee against inactivity disconnects or runtime limits. The source and encoding remain in the temporary cloud runtime; download only the completed MP4 to your computer. Disconnect and delete the runtime after the download finishes.
 
 
 ### Optional: save finished MP4s to Google Drive

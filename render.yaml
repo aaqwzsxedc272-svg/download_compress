@@ -1,17 +1,15 @@
 services:
   - type: web
     name: squeeze
-    runtime: docker
-    plan: starter # free instances spin down and have no disk
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
     healthCheckPath: /api/health
     envVars:
-      - key: DATA_DIR
-        value: /data
+      - key: NODE_VERSION
+        value: "22"
       - key: MAX_UPLOAD_MB
-        value: 2048
+        value: 700          # free plan is 512 MB RAM; bigger files will be OOM-killed
       - key: MAX_CONCURRENT
         value: 1
-    disk:
-      name: squeeze-data
-      mountPath: /data
-      sizeGB: 10

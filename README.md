@@ -23,8 +23,12 @@ HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <your-hf-username> [space-name]
 
 It prints the live URL; then `node scripts/verify-deploy.js <url>` proves the whole chain works
 from the outside — app up, presets, hosters, a real link resolved, a real video compressed, and
-the share link publicly downloadable. Other routes (Oracle Always Free, Render, a local run
-behind a free tunnel) and what each can fetch are in [DEPLOY.md](DEPLOY.md).
+the share link publicly downloadable.
+
+You never install Docker for this: the platform's builder reads the `Dockerfile`. If you would
+rather avoid containers entirely, `render.yaml` deploys the same app on Render's free plan with
+a plain `npm start` — no card either way. Every route and what each can fetch is in
+[DEPLOY.md](DEPLOY.md).
 
 ## Run it
 

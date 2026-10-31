@@ -1,5 +1,20 @@
 # Deploying Squeeze for free
 
+## "But isn't Docker paid?" — no, and you never touch it
+
+The `Dockerfile` in this repo is a plain text recipe. Deploying with it means:
+
+- **you do not install Docker**, you do not run `docker build`, you do not create a Docker Hub
+  account, and you never pay Docker Inc. anything;
+- the hosting platform's own builder reads the recipe and runs the app on *its* servers;
+- on Hugging Face, that build and the machine it runs on (CPU basic: 2 vCPU, 16 GB RAM,
+  50 GB disk) are **free and need no card** — Free accounts get free CPU Basic Spaces
+  indefinitely, they just sleep after 48 h of inactivity and wake on the next request.
+
+Nothing in the free path costs money. If you would rather not see the word "Docker" at all,
+[section 2](#2-render--free-no-card-and-no-docker) deploys the same app straight from GitHub
+with a plain `npm start`.
+
 The whole point of Squeeze is that it fetches a link, compresses the video and uploads the
 result to a free hoster by itself. That needs a machine with **real outbound internet**.
 Hugging Face Spaces gives you exactly that, free, with no credit card — and the repo ships a
@@ -81,7 +96,31 @@ owns `/data`.
 
 ---
 
-## 2. Oracle Cloud "Always Free" — a real VM, free forever
+## 2. Render — free, no card, and no Docker
+
+`render.yaml` at the repo root is already set up for Render's **free** plan on the **Node**
+runtime: `npm ci --omit=dev` then `npm start`. No container, no Dockerfile, no card.
+
+1. Free account at <https://render.com> (GitHub sign-in is easiest).
+2. **New → Blueprint**, pick this GitHub repo. Render reads `render.yaml` and creates the
+   service on the free plan.
+3. Wait for the build, then use the `https://squeeze-xxxx.onrender.com` URL it gives you.
+
+Honest limits of the free plan, and what the yaml already does about them:
+
+| Limit | Effect | Mitigation shipped |
+| --- | --- | --- |
+| 512 MB RAM, 0.1 CPU | ffmpeg can be OOM-killed on large sources; encodes are slow | `MAX_UPLOAD_MB=700`, `MAX_CONCURRENT=1` |
+| No persistent disk | working files vanish on restart (fine — files are temporary anyway) | uploads stay in the ephemeral filesystem |
+| Sleeps after 15 min without traffic | a job can be cut off if you close the tab and leave it | keep the tab open, or use Hugging Face for true set-and-forget |
+| 750 instance hours/month | plenty for personal use | — |
+
+Render does have real internet, so gofile / pixeldrain / turbo / bunkr / filester links resolve
+server-side and the finished file is uploaded to a hoster for you.
+
+---
+
+## 3. Oracle Cloud "Always Free" — a real VM, free forever
 
 24 GB RAM and a real network, free forever. A card is required for identity verification, but
 the Ampere/AMD always-free shapes are not charged.
@@ -99,19 +138,10 @@ generous means `MAX_CONCURRENT=2` or `3` is comfortable.
 
 ---
 
-## 3. Render
+## 4. Koyeb / Railway / Fly.io / Back4App
 
-`render.yaml` in this repo is ready. Free instances have **no disk** and 512 MB RAM, so:
-
-- links still work (full internet),
-- keep `MAX_UPLOAD_MB` low (e.g. `600`) and expect slow encodes on big files,
-- a Starter instance (paid) is what the repo defaults to, with a 10 GB disk.
-
----
-
-## 4. Koyeb / Railway / Fly.io
-
-All have trial or hobby tiers. Docker deploys work unchanged:
+All have trial or hobby tiers. PaaS deploys work unchanged (Koyeb now wants a card for
+verification; Railway and Back4App start without one). With Docker:
 
 ```bash
 docker build -t squeeze .

@@ -245,6 +245,27 @@ job says so instead of pretending; the file can always be dropped on the page by
 
 `npm run test:fallback` covers that path against a fake host that refuses plain requests.
 
+## Saving results, and not paying for an idle machine
+
+The app keeps a **Results** panel listing everything that finished: the share link, the sizes
+before and after, a copy button and a download button. Because the compressed file is uploaded to
+the file host, the link keeps working after the machine is stopped — that is the place to keep
+results. **Save links file** / **Copy all links** give you the whole list at once, and the server
+writes `data/results.txt` on every completion.
+
+**Stop the machine when the queue finishes.** Flip *After the queue → Stop when done*. Two
+minutes after the last job ends the server runs the stop command, so a metered host stops
+billing while you are asleep. The countdown is shown in the app and **Keep it running** cancels
+it; starting a new job cancels it too.
+
+| Environment | Stop command |
+| --- | --- |
+| Codespaces | `gh codespace stop -c $CODESPACE_NAME` (automatic) |
+| anything else | set `AUTO_STOP_COMMAND`, e.g. `sudo poweroff` |
+
+`AUTO_STOP_DELAY_SECONDS` changes the grace period (default 120, minimum 10), and
+`AUTO_STOP_WHEN_IDLE=1` turns the feature on at boot.
+
 ## Disk space
 
 A video needs roughly **three times its own size** free while it encodes: the source, the

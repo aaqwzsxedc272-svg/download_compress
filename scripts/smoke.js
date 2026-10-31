@@ -155,6 +155,8 @@ async function main() {
 
     check('server health endpoint', health.ok === true);
     check('presets exposed', Array.isArray(health.presets) && health.presets.length >= 5);
+    check('health reports disk space', Number.isFinite(health.disk?.freeBytes) && health.disk.freeBytes > 0);
+    check('health reports the auto-stop state', Boolean(health.autoStop) && 'enabled' in health.autoStop);
 
     // ---------------------------------------------------------------- sample
     const sampleJob = await createJob({ source: 'sample', presetId: 'tiny' });
@@ -163,6 +165,11 @@ async function main() {
     check('sample output is smaller', sampleDone.outputBytes > 0 && sampleDone.outputBytes < sampleDone.sourceBytes,
       `${sampleDone.sourceBytes} → ${sampleDone.outputBytes}`);
     check('sample thumbnail generated', sampleDone.hasThumb);
+
+    const results = await (await fetch(`${BASE}/api/results`)).json();
+    check('results endpoint lists the finished job', results.results.some((r) => r.id === sampleDone.id));
+    const links = await (await fetch(`${BASE}/api/results.txt`)).text();
+    check('results.txt is served as plain text', typeof links === 'string');
 
     const download = await fetchBytes(`${BASE}/api/jobs/${sampleJob.id}/download`);
     check('download returns an MP4', download.status === 200 && isMp4(download.buf), `${download.buf.length} bytes`);

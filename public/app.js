@@ -89,7 +89,7 @@ function showAlert(message, kind = 'error', { timeout = 0, href = null, hrefLabe
   const el = $('#alert');
   if (!el) return;
   el.hidden = false;
-  el.className = `alert ${kind === 'info' ? 'info' : ''}`;
+  el.className = `alert ${kind === 'info' ? 'info' : ''}${kind === 'ok' ? 'ok' : ''}`;
   el.textContent = message;
   if (href) {
     const link = document.createElement('a');
@@ -1398,6 +1398,178 @@ function bindDropzone() {
   });
 }
 
+
+/* ------------------------------------------------- disk, auto-stop, results */
+
+const STORAGE_AUTOSTOP = 'squeeze.autoStop';
+
+function formatDisk(bytes) {
+  if (!bytes && bytes !== 0) return '—';
+  const gb = bytes / 1073741824;
+  return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.max(1, Math.round(bytes / 1048576))} MB`;
+}
+
+/** Header pill: how much room the machine has left. */
+function renderDisk(disk) {
+  const pill = $('#diskPill');
+  const text = $('#diskText');
+  if (!pill || !text) return;
+  if (!disk || !disk.totalBytes) {
+    text.textContent = 'disk unknown';
+    return;
+  }
+  const free = disk.freeBytes;
+  const pct = disk.percentFree;
+  text.textContent = `${formatDisk(free)} free of ${formatDisk(disk.totalBytes)}`;
+  pill.title = `${formatDisk(disk.usedBytes)} used · ${formatDisk(free)} free (${pct}%). ` +
+    'A video needs about three times its own size while it encodes.';
+  pill.classList.toggle('is-low', pct != null && pct < 15);
+}
+
+/** Countdown banner shown when the machine is about to stop itself. */
+function renderStopBanner(autoStop) {
+  let banner = document.getElementById('stopBanner');
+  const pending = autoStop && autoStop.stopsAt;
+  if (!pending) {
+    if (banner) banner.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'stopBanner';
+    banner.className = 'stop-banner';
+    banner.innerHTML =
+      '<span>Machine stops in <b class="stop-in"></b> to save credit.</span>' +
+      '<button type="button" class="btn tiny" id="cancelStop">Keep it running</button>';
+    $('#alert').insertAdjacentElement('afterend', banner);
+  }
+  const seconds = Math.max(0, Math.round((pending - Date.now()) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  banner.querySelector('.stop-in').textContent = minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+  const cancel = banner.querySelector('#cancelStop');
+  if (cancel && !cancel.dataset.bound) {
+    cancel.dataset.bound = '1';
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      try {
+        const { autoStop: next } = await api('/api/auto-stop/cancel', { method: 'POST' });
+        renderStopBanner(next);
+        showAlert('Staying up. Nothing will stop the machine automatically.', 'ok');
+      } catch (err) {
+        showAlert(err.message, 'error');
+      } finally {
+        cancel.disabled = false;
+      }
+    });
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const health = await api('/api/health');
+    state.health = health;
+    renderDisk(health.disk);
+    renderStopBanner(health.autoStop);
+    if (health.autoStop) syncAutoStopToggle(health.autoStop);
+  } catch {
+    /* the server may be busy encoding; try again on the next tick */
+  }
+}
+
+function syncAutoStopToggle(autoStop) {
+  const toggle = $('#autoStop');
+  if (!toggle) return;
+  toggle.disabled = !autoStop.supported;
+  if (document.activeElement !== toggle) toggle.checked = Boolean(autoStop.enabled);
+  toggle.title = autoStop.supported
+    ? `Runs: ${autoStop.command}`
+    : 'No stop command on this machine (set AUTO_STOP_COMMAND or run in Codespaces).';
+  $('.switch-text').textContent = autoStop.supported ? 'Stop when done' : 'Stop unavailable';
+}
+
+/* ---------------------------------------------------------------- results */
+
+async function loadResults() {
+  const section = $('#resultsSection');
+  if (!section) return;
+  let results = [];
+  try {
+    ({ results } = await api('/api/results'));
+  } catch {
+    return;
+  }
+  const list = $('#resultsList');
+  const visible = localStorage.getItem('squeeze.resultsHidden') === '1';
+  section.hidden = !results.length || visible;
+  list.textContent = '';
+  $('#resultsHint').textContent = results.length
+    ? `${results.length} finished · share links live on the file host and keep working after this machine stops.`
+    : '';
+
+  for (const result of results) {
+    const row = document.createElement('div');
+    row.className = 'result-row';
+
+    const main = document.createElement('div');
+    main.className = 'result-main';
+    const name = document.createElement('div');
+    name.className = 'result-name';
+    name.textContent = result.name;
+    name.title = result.name;
+    const meta = document.createElement('div');
+    meta.className = 'result-meta';
+    const bits = [];
+    if (result.sourceBytes && result.outputBytes) {
+      bits.push(`${formatBytes(result.sourceBytes)} → ${formatBytes(result.outputBytes)}`);
+    }
+    if (result.shareUrl) {
+      const link = document.createElement('a');
+      link.href = result.shareUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = result.shareUrl;
+      meta.append(...(bits.length ? [bits.join(' · ') + ' · '] : []), link);
+    } else {
+      bits.push('no share link yet');
+      meta.textContent = bits.join(' · ');
+    }
+    main.append(name, meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'result-actions';
+
+    if (result.shareUrl) {
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'btn tiny';
+      copy.textContent = 'Copy link';
+      copy.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(result.shareUrl);
+          copy.textContent = 'Copied';
+          setTimeout(() => {
+            copy.textContent = 'Copy link';
+          }, 1400);
+        } catch {
+          showAlert(result.shareUrl, 'ok');
+        }
+      });
+      actions.append(copy);
+    }
+
+    if (result.downloadPath) {
+      const download = document.createElement('a');
+      download.className = 'btn tiny download';
+      download.href = result.downloadPath;
+      download.textContent = 'Download';
+      actions.append(download);
+    }
+
+    row.append(main, actions);
+    list.append(row);
+  }
+}
+
 async function boot() {
   bindDropzone();
   $('#goBtn').addEventListener('click', squeeze);
@@ -1445,6 +1617,78 @@ async function boot() {
       { id: 'original', label: 'Original res', hint: '' },
     ]);
     $('#engineText').textContent = 'engine unavailable';
+  }
+
+  // Disk meter, auto-stop countdown and the results list, refreshed gently.
+  await refreshStatus();
+  await loadResults();
+  setInterval(refreshStatus, Number(localStorage.getItem('squeeze.statusMs')) || 15000);
+  setInterval(loadResults, 30000);
+
+  const autoStopToggle = $('#autoStop');
+  if (autoStopToggle) {
+    autoStopToggle.addEventListener('change', async () => {
+      autoStopToggle.disabled = true;
+      try {
+        const { autoStop } = await api('/api/auto-stop', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: autoStopToggle.checked }),
+        });
+        localStorage.setItem(STORAGE_AUTOSTOP, autoStopToggle.checked ? '1' : '0');
+        syncAutoStopToggle(autoStop);
+        renderStopBanner(autoStop);
+        showAlert(
+          autoStop.enabled
+            ? `The machine will stop ${autoStop.delaySeconds}s after the queue finishes.`
+            : 'Auto-stop is off.',
+          'ok',
+        );
+      } catch (err) {
+        autoStopToggle.checked = !autoStopToggle.checked;
+        showAlert(err.message, 'error');
+      } finally {
+        autoStopToggle.disabled = false;
+      }
+    });
+  }
+
+  const copyAll = $('#copyAllLinks');
+  if (copyAll) {
+    copyAll.addEventListener('click', async () => {
+      try {
+        const text = await (await fetch('/api/results.txt')).text();
+        if (!text.trim()) return showAlert('No share links yet — turn on “Give me a share link”.', 'error');
+        await navigator.clipboard.writeText(text);
+        showAlert('All share links copied.', 'ok');
+      } catch (err) {
+        showAlert(err.message, 'error');
+      }
+    });
+  }
+
+  const saveLinks = $('#saveLinks');
+  if (saveLinks) {
+    saveLinks.addEventListener('click', () => {
+      const link = document.createElement('a');
+      link.href = '/api/results.txt';
+      link.download = 'squeeze-links.txt';
+      link.click();
+    });
+  }
+
+  const toggleResults = $('#toggleResults');
+  if (toggleResults) {
+    toggleResults.addEventListener('click', () => {
+      const hidden = localStorage.getItem('squeeze.resultsHidden') === '1';
+      localStorage.setItem('squeeze.resultsHidden', hidden ? '0' : '1');
+      loadResults();
+      if (!$('#resultsSection').hidden) $('#resultsSection').scrollIntoView({ behavior: 'smooth' });
+    });
+  }
+
+  if (localStorage.getItem(STORAGE_AUTOSTOP) === '1' && $('#autoStop') && !$('#autoStop').disabled) {
+    $('#autoStop').checked = true;
   }
 
   restoreJobs();

@@ -10,6 +10,7 @@ const express = require('express');
 const jobsStore = require('./jobs');
 const { probe, thumbnail, transcode } = require('./ffmpeg');
 const { downloadWithFallback } = require('./fallback');
+const autoStop = require('./autostop');
 const {
   PRESET_LIST,
   DEFAULT_PRESET,
@@ -227,6 +228,7 @@ async function compressJob(job) {
     scaledTo: plan.scaleNote,
     saved,
   });
+  writeResultsFile();
 
   // The point of the app is the link, not the local file: hand it to a host now.
   if (AUTO_HOST) {
@@ -277,6 +279,7 @@ async function hostJob(job, { order } = {}) {
       hostError: null,
       hostedAt: Date.now(),
     });
+    writeResultsFile();
     persistHostedLink(job, result.url, result.provider);
     return job;
   } catch (err) {
@@ -334,6 +337,23 @@ const FRIENDLY = {
 const OUT_OF_SPACE = /ENOSPC|No space left on device/i;
 
 const formatGb = (bytes) => `${(bytes / 1073741824).toFixed(1)} GB`;
+
+/** Total/used/free for the volume that holds the working files. */
+async function diskUsage(dir) {
+  try {
+    const stats = await fsp.statfs(dir);
+    const totalBytes = stats.blocks * stats.bsize;
+    const freeBytes = stats.bavail * stats.bsize;
+    return {
+      totalBytes,
+      freeBytes,
+      usedBytes: totalBytes - freeBytes,
+      percentFree: totalBytes ? Math.round((freeBytes / totalBytes) * 100) : null,
+    };
+  } catch {
+    return { totalBytes: null, freeBytes: null, usedBytes: null, percentFree: null };
+  }
+}
 
 function reportJobError(job, err) {
   const outOfSpace = err.code === 'NO_DISK' || OUT_OF_SPACE.test(String(err.message || ''));
@@ -428,6 +448,7 @@ async function fetchThenCompress(job, ref) {
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 1;
 const queue = [];
 let activeCount = 0;
+let finishedThisSession = 0;
 
 function updateQueuePositions() {
   queue.forEach((job, index) => {
@@ -473,12 +494,16 @@ function pumpQueue() {
     if (!jobsStore.getJob(job.id)) continue; // removed while waiting
     activeCount += 1;
     startHeartbeat();
+    autoStop.cancel('a job started');
     compressJob(job)
       .catch((err) => reportJobError(job, err))
       .finally(() => {
         activeCount -= 1;
+        finishedThisSession += 1;
         updateQueuePositions();
         pumpQueue();
+        // Nothing left to do: let the machine go if the user asked for that.
+        if (!queue.length && activeCount === 0) autoStop.schedule('queue finished');
       });
   }
   updateQueuePositions();
@@ -563,11 +588,13 @@ async function adoptUpload(tmpPath, fields) {
 
 app.get('/api/health', async (req, res) => {
   const ytdlp = await sources.hasYtdlp();
-  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  const disk = await diskUsage(jobsStore.DATA_DIR);
   res.json({
     ok: true,
-    freeBytes: free,
-    freeGb: Math.round((free / 1073741824) * 10) / 10,
+    freeBytes: disk.freeBytes,
+    freeGb: Math.round((disk.freeBytes / 1073741824) * 10) / 10,
+    disk,
+    autoStop: autoStop.status(),
     maxUploadMb: MAX_UPLOAD_MB,
     presets: PRESET_LIST,
     defaultPreset: DEFAULT_PRESET,
@@ -580,6 +607,30 @@ app.get('/api/health', async (req, res) => {
 });
 
 app.get('/api/presets', (req, res) => res.json({ presets: PRESET_LIST }));
+
+/* Stop the machine when the queue drains — for metered hosts. */
+app.get('/api/auto-stop', (req, res) => res.json({ autoStop: autoStop.status() }));
+
+app.post('/api/auto-stop', (req, res) => {
+  const wants = Boolean(req.body && req.body.enabled);
+  if (wants && !autoStop.configured()) {
+    return fail(
+      res,
+      400,
+      'AUTOSTOP_UNAVAILABLE',
+      'This machine has no stop command configured (set AUTO_STOP_COMMAND, or run inside Codespaces).',
+    );
+  }
+  const enabled = autoStop.enable(wants);
+  if (!enabled) autoStop.cancel('switched off');
+  else if (!queue.length && activeCount === 0 && finishedThisSession) autoStop.schedule('already idle');
+  return res.json({ autoStop: autoStop.status() });
+});
+
+app.post('/api/auto-stop/cancel', (req, res) => {
+  autoStop.cancel('cancelled by the user');
+  return res.json({ autoStop: autoStop.status() });
+});
 
 app.post('/api/relay-token', (req, res) => {
   res.json({ token: newRelayToken(), maxUploadMb: MAX_UPLOAD_MB });
@@ -1136,6 +1187,7 @@ app.post('/api/jobs/:id/hosted', (req, res) => {
     hostedAt: Date.now(),
     progress: 1,
   });
+  writeResultsFile();
   persistHostedLink(job, url, provider).catch(() => {});
   res.json({ job: jobsStore.publicView(job) });
 });
@@ -1210,6 +1262,59 @@ function serveOutput(req, res, disposition) {
     },
   );
 }
+
+/* ------------------------------------------------------------------ results */
+/* Everything that finished, in one place, so the links survive the machine:
+   they are also written to data/results.txt on every completion. */
+
+/** Best-effort finish time: jobs carry createdAt, and the ledger keeps the rest. */
+function jobFinishedAt(view) {
+  return view.createdAt || null;
+}
+
+/** Keep a copy of the share links on disk, so they survive a stopped machine. */
+async function writeResultsFile() {
+  try {
+    const lines = finishedJobs()
+      .filter((view) => view.hostedUrl)
+      .map((view) => `${view.hostedUrl}\t${view.outputName || view.name || view.id}`);
+    await fsp.writeFile(path.join(jobsStore.DATA_DIR, 'results.txt'), lines.length ? `${lines.join('\n')}\n` : '');
+  } catch {
+    /* the results endpoint still works without the file */
+  }
+}
+
+function finishedJobs() {
+  return jobsStore
+    .listJobs()
+    .filter((job) => job.status === 'done' || job.status === 'hosted' || job.error)
+    .map((job) => jobsStore.publicView(job))
+    .filter((view) => view.status === 'done' || view.status === 'hosted');
+}
+
+app.get('/api/results', (req, res) => {
+  res.json({
+    results: finishedJobs().map((view) => ({
+      id: view.id,
+      name: view.outputName || view.name || `video-${view.id}.mp4`,
+      shareUrl: view.hostedUrl || null,
+      provider: view.hostProvider || null,
+      downloadPath: view.hasFile ? `/api/jobs/${view.id}/download` : null,
+      previewPath: view.hasFile ? `/api/jobs/${view.id}/preview` : null,
+      sourceBytes: view.sourceBytes,
+      outputBytes: view.outputBytes,
+      saved: view.saved,
+      finishedAt: jobFinishedAt(view),
+    })),
+  });
+});
+
+app.get('/api/results.txt', (req, res) => {
+  const lines = finishedJobs()
+    .filter((view) => view.hostedUrl)
+    .map((view) => `${view.hostedUrl}\t${view.outputName || view.name || view.id}`);
+  res.type('text/plain').send(lines.length ? `${lines.join('\n')}\n` : '');
+});
 
 app.get('/api/jobs/:id/preview', (req, res) => serveOutput(req, res, 'inline'));
 app.get('/api/jobs/:id/download', (req, res) => serveOutput(req, res, 'attachment'));

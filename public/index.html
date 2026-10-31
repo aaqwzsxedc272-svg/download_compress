@@ -19,6 +19,9 @@
     <span class="brand-name">Squeeze</span>
   </a>
   <div class="header-meta">
+    <span class="pill" id="diskPill" title="Free space on the machine doing the work">
+      <span class="dot"></span><span id="diskText">disk …</span>
+    </span>
     <span class="pill" id="enginePill"><span class="dot"></span><span id="engineText">checking engine…</span></span>
   </div>
 </header>
@@ -78,6 +81,14 @@
       </div>
 
     <div class="action-row">
+      <div class="control-group control-autostop" id="autoStopGroup">
+        <label class="control-label" for="autoStop">After the queue</label>
+        <label class="switch">
+          <input type="checkbox" id="autoStop" />
+          <span class="switch-track" aria-hidden="true"></span>
+          <span class="switch-text">Stop the machine</span>
+        </label>
+      </div>
       <button class="primary" id="goBtn" type="button">
         <span>Squeeze</span>
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -98,6 +109,20 @@
       <button class="ghost" id="clearDone" type="button">Clear finished</button>
     </div>
     <div class="job-list" id="jobList"></div>
+  </section>
+  <section class="results card" id="resultsSection" hidden>
+    <div class="results-head">
+      <h2 class="results-title">Results</h2>
+      <div class="results-tools">
+        <button class="ghost" id="copyAllLinks" type="button">Copy all links</button>
+        <button class="ghost" id="saveLinks" type="button">Save links file</button>
+        <button class="ghost" id="toggleResults" type="button">Hide</button>
+      </div>
+    </div>
+    <p class="results-hint" id="resultsHint">
+      Share links live on the file host, so they keep working after this machine is stopped.
+    </p>
+    <div class="results-list" id="resultsList"></div>
   </section>
 </main>
 

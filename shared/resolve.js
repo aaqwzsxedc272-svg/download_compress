@@ -78,6 +78,49 @@
   /* --------------------------------------------------------------- gofile.io */
 
   let gofileToken = { value: null, at: 0 };
+  /* gofile keeps a short-lived "wt" website token next to the guest account.
+     It used to be a constant, but a stale one makes every folder look premium,
+     so it is read from gofile.io itself and cached for half an hour. */
+  let gofileWt = { value: GOFILE_WT, at: 0 };
+
+  async function gofileWebToken(force = false) {
+    if (!force && gofileWt.at && Date.now() - gofileWt.at < 30 * 60 * 1000) return gofileWt.value;
+    const lookForToken = (text) => {
+      const m = String(text || '').match(/\bwt\b\s*[:=]\s*["']([A-Za-z0-9]{8,64})["']/);
+      return m ? m[1] : null;
+    };
+    try {
+      const res = await fetch('https://gofile.io/', { headers: { 'user-agent': UA, accept: 'text/html' } });
+      if (res.ok) {
+        const html = await res.text();
+        let found = lookForToken(html);
+        if (!found) {
+          const sources = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)]
+            .map((m) => m[1])
+            .slice(0, 6);
+          for (const src of sources) {
+            try {
+              const jsUrl = new URL(src, 'https://gofile.io/').href;
+              const jsRes = await fetch(jsUrl, { headers: { 'user-agent': UA } });
+              if (!jsRes.ok) continue;
+              found = lookForToken(await jsRes.text());
+              if (found) break;
+            } catch {
+              /* try the next bundle */
+            }
+          }
+        }
+        if (found) {
+          gofileWt = { value: found, at: Date.now() };
+          return found;
+        }
+      }
+    } catch {
+      /* offline or blocked: keep whatever token we have */
+    }
+    gofileWt = { value: gofileWt.value || GOFILE_WT, at: Date.now() - 25 * 60 * 1000 };
+    return gofileWt.value;
+  }
 
   async function gofileGuestToken(force = false) {
     if (!force && gofileToken.value && Date.now() - gofileToken.at < 45 * 60 * 1000) {
@@ -108,12 +151,28 @@
     match: (url) => hostPath(url, /(^|\.)gofile\.io$/i, /\/d\/([A-Za-z0-9_-]+)/i),
     async list(url) {
       const code = gofile.match(url);
-      const endpoint = `https://api.gofile.io/contents/${code}?wt=${GOFILE_WT}&cache=true`;
+      const wt = await gofileWebToken();
+      const endpoint = `https://api.gofile.io/contents/${code}?wt=${wt}&cache=true`;
 
       let data = null;
       let lastError = null;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
         const token = await gofileGuestToken(attempt > 0);
+        if (attempt === 2) {
+          // Both the account and the folder call refused: refresh the website
+          // token too, then give up.
+          const fresh = await gofileWebToken(true);
+          if (fresh && fresh !== wt) {
+            try {
+              data = await getJson(`https://api.gofile.io/contents/${code}?wt=${fresh}&cache=true`, {
+                headers: { authorization: `Bearer ${token}` },
+              });
+            } catch (err) {
+              lastError = err;
+            }
+            if (data && data.status === 'ok') break;
+          }
+        }
         try {
           data = await getJson(endpoint, { headers: { authorization: `Bearer ${token}` } });
         } catch (err) {
@@ -172,7 +231,7 @@
       // Links are signed per session, so ask again instead of trusting a stale one.
       try {
         const token = await gofileGuestToken();
-        const data = await getJson(`https://api.gofile.io/contents/${ref.id}?wt=${GOFILE_WT}&cache=true`, {
+        const data = await getJson(`https://api.gofile.io/contents/${ref.id}?wt=${await gofileWebToken()}&cache=true`, {
           headers: { authorization: `Bearer ${token}` },
         });
         const child = data?.data?.children?.[ref.id] || data?.data?.contents?.[ref.id];

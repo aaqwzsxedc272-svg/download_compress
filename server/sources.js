@@ -232,13 +232,38 @@ async function downloadHttp(
     idle = setTimeout(() => controller.abort(), idleTimeoutMs);
   };
 
+  /* Some CDNs (fileditch among them) 403 a bare request but answer a browser:
+     same-origin Referer, an Accept-Language and the usual fetch hints. */
+  const origin = (() => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return null;
+    }
+  })();
+  const browserHeaders = (withReferer) => ({
+    'user-agent': UA,
+    accept: '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    ...(withReferer && origin ? { referer: `${origin}/`, origin } : {}),
+  });
+
   let res;
   try {
     res = await fetch(url, {
-      headers: { 'user-agent': UA, accept: '*/*' },
+      headers: browserHeaders(false),
       redirect: 'follow',
       signal: controller.signal,
     });
+    if ((res.status === 403 || res.status === 401) && origin) {
+      res.body?.cancel().catch(() => {});
+      const retry = await fetch(url, {
+        headers: browserHeaders(true),
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+      res = retry;
+    }
   } catch (err) {
     clearTimeout(idle);
     if (outerSignal && outerSignal.aborted) {

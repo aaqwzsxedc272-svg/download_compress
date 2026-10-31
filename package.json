@@ -8,7 +8,9 @@
     "start": "node server/server.js",
     "dev": "node --watch server/server.js",
     "smoke": "node scripts/smoke.js",
-    "test:resolve": "node scripts/resolve.test.js"
+    "test:resolve": "node scripts/resolve.test.js",
+    "test:hosters": "node scripts/hosters.test.js",
+    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js"
   },
   "engines": {
     "node": ">=18"

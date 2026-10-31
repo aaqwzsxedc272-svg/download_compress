@@ -15,6 +15,7 @@ const os = require('node:os');
 
 const PORT = 3199;
 const MEDIA_PORT = 3198; // stands in for an external host that serves video
+const HOSTER_PORT = 3197; // stands in for pixeldrain's upload API
 const ROOT = path.join(__dirname, '..');
 const DATA_DIR = path.join(os.tmpdir(), `squeeze-smoke-${Date.now()}`);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -50,10 +51,23 @@ async function waitForJob(id, timeoutMs = 180000) {
     const res = await fetch(`${BASE}/api/jobs/${id}`);
     const { job } = await res.json();
     last = job;
-    if (job.status === 'done' || job.status === 'error') return job;
+    if (['done', 'hosted', 'error'].includes(job.status)) return job;
     await sleep(500);
   }
   throw new Error(`job ${id} timed out in state ${last?.status}`);
+}
+
+async function waitForStatus(id, statuses, timeoutMs = 180000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    const res = await fetch(`${BASE}/api/jobs/${id}`);
+    const { job } = await res.json();
+    last = job;
+    if (statuses.includes(job.status)) return job;
+    await sleep(500);
+  }
+  return last;
 }
 
 async function createJob(body) {
@@ -80,36 +94,72 @@ function isMp4(buf) {
 async function main() {
   await fs.rm(DATA_DIR, { recursive: true, force: true });
 
-  const server = spawn(process.execPath, [path.join(ROOT, 'server', 'server.js')], {
-    env: {
-      ...process.env,
-      PORT: String(PORT),
-      DATA_DIR,
-      MAX_CONCURRENT: '2',
-      ALLOW_PRIVATE_HOSTS: '1', // the fake "external host" is on 127.0.0.1
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const serverEnv = {
+    ...process.env,
+    PORT: String(PORT),
+    DATA_DIR,
+    MAX_CONCURRENT: '2',
+    ALLOW_PRIVATE_HOSTS: '1', // the fake "external host" is on 127.0.0.1
+    HOSTERS: 'pixeldrain', // keep the chain deterministic in tests
+    PIXELDRAIN_API_BASE: `http://127.0.0.1:${HOSTER_PORT}`,
+    AUTO_HOST: '1',
+  };
+
   let serverLog = '';
-  server.stdout.on('data', (d) => (serverLog += d));
-  server.stderr.on('data', (d) => (serverLog += d));
+  let server = null;
+
+  function startServer() {
+    const proc = spawn(process.execPath, [path.join(ROOT, 'server', 'server.js')], {
+      env: serverEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    proc.stdout.on('data', (d) => (serverLog += d));
+    proc.stderr.on('data', (d) => (serverLog += d));
+    return proc;
+  }
+
+  server = startServer();
 
   let mediaServer = null;
+  let hosterServer = null;
+  const hostedUploads = new Map();
+
   const cleanup = async () => {
-    server.kill('SIGKILL');
+    if (server) server.kill('SIGKILL');
     if (mediaServer) mediaServer.close();
+    if (hosterServer) hosterServer.close();
     await fs.rm(DATA_DIR, { recursive: true, force: true }).catch(() => {});
   };
 
   try {
     const health = await waitForHealth();
+
+    hosterServer = http.createServer((req, res) => {
+      if (req.method === 'POST' && req.url.startsWith('/api/file/')) {
+        const name = decodeURIComponent(req.url.slice('/api/file/'.length));
+        let bytes = 0;
+        req.on('data', (chunk) => {
+          bytes += chunk.length;
+        });
+        req.on('end', () => {
+          const id = `hosted${hostedUploads.size + 1}`;
+          hostedUploads.set(id, { name, bytes });
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ id, name }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise((resolve) => hosterServer.listen(HOSTER_PORT, '127.0.0.1', resolve));
+
     check('server health endpoint', health.ok === true);
     check('presets exposed', Array.isArray(health.presets) && health.presets.length >= 5);
 
     // ---------------------------------------------------------------- sample
     const sampleJob = await createJob({ source: 'sample', presetId: 'tiny' });
     const sampleDone = await waitForJob(sampleJob.id);
-    check('sample job completes', sampleDone.status === 'done', sampleDone.error || '');
+    check('sample job completes', ['done', 'hosted'].includes(sampleDone.status), sampleDone.error || '');
     check('sample output is smaller', sampleDone.outputBytes > 0 && sampleDone.outputBytes < sampleDone.sourceBytes,
       `${sampleDone.sourceBytes} → ${sampleDone.outputBytes}`);
     check('sample thumbnail generated', sampleDone.hasThumb);
@@ -133,7 +183,7 @@ async function main() {
     const uploadData = await uploadRes.json();
     check('direct upload accepted', uploadRes.status === 201);
     const uploadDone = await waitForJob(uploadData.job.id);
-    check('upload job completes', uploadDone.status === 'done', uploadDone.error || '');
+    check('upload job completes', ['done', 'hosted'].includes(uploadDone.status), uploadDone.error || '');
     check('upload output named from source', /smoke-upload.*\.mp4$/.test(uploadDone.outputName || ''), uploadDone.outputName);
 
     // ----------------------------------------------------------------- relay
@@ -145,7 +195,7 @@ async function main() {
     const relayData = await relayRes.json();
     check('relay upload accepted', relayRes.status === 201);
     const relayDone = await waitForJob(relayData.job.id);
-    check('relay job completes', relayDone.status === 'done', relayDone.error || '');
+    check('relay job completes', ['done', 'hosted'].includes(relayDone.status), relayDone.error || '');
     check('target size respected (±20%)',
       relayDone.outputBytes > 0 && Math.abs(relayDone.outputBytes - 3 * 1024 * 1024) < 0.6 * 1024 * 1024,
       `${(relayDone.outputBytes / 1048576).toFixed(2)} MB`);
@@ -171,7 +221,7 @@ async function main() {
 
     const urlJob = await createJob({ source: 'url', url: selfUrl, presetId: 'tiny' });
     const urlDone = await waitForJob(urlJob.id);
-    check('url job completes', urlDone.status === 'done', urlDone.error || '');
+    check('url job completes', ['done', 'hosted'].includes(urlDone.status), urlDone.error || '');
     check('url job recorded its source', urlDone.source === 'url');
 
     // ---------------------------------------------------- share-page resolving
@@ -216,7 +266,11 @@ async function main() {
       presetId: 'tiny',
     });
     const refDone = await waitForJob(refJob.id);
-    check('a resolved reference downloads and compresses', refDone.status === 'done', refDone.error || '');
+    check(
+      'a resolved reference downloads and compresses',
+      ['done', 'hosted'].includes(refDone.status),
+      refDone.error || '',
+    );
     check('reference job reports its resolver', refDone.resolver !== null, String(refDone.resolver));
 
     const badRef = await fetch(`${BASE}/api/jobs`, {
@@ -234,6 +288,58 @@ async function main() {
       })
     ).json();
     check('resolve rejects junk input', badResolve.code === 'BAD_URL');
+
+    // ------------------------------------------------------ hosting the result
+    // (fake hoster is started further up, before jobs begin)
+
+    // The first sample job finishes, then auto-hosts itself on the fake host.
+    const hostedSample = await waitForStatus(sampleJob.id, ['hosted', 'error'], 120000);
+    check('finished jobs are auto-hosted', hostedSample.status === 'hosted', hostedSample.hostError || hostedSample.error || '');
+    check(
+      'share link points at the host',
+      /^http:\/\/127\.0\.0\.1:3197\/u\/hosted\d+$/.test(hostedSample.hostedUrl || ''),
+      hostedSample.hostedUrl,
+    );
+    check('hoster recorded the upload', hostedUploads.size >= 1, `${hostedUploads.size} file(s)`);
+
+    const uploadedBytes = [...hostedUploads.values()][0]?.bytes || 0;
+    check(
+      'the whole compressed file was uploaded',
+      uploadedBytes === hostedSample.outputBytes,
+      `${uploadedBytes} vs ${hostedSample.outputBytes}`,
+    );
+    check('hosted provider is reported', hostedSample.hostProvider === 'pixeldrain', hostedSample.hostProvider);
+    check('hosted file stays downloadable locally', hostedSample.hasFile === true);
+
+    const jobList = await (await fetch(`${BASE}/api/jobs`)).json();
+    check('job list exposes recent jobs', Array.isArray(jobList.jobs) && jobList.jobs.length >= 1);
+    check(
+      'job list carries the share link',
+      jobList.jobs.some((j) => j.hostedUrl),
+      `${jobList.jobs.length} jobs`,
+    );
+
+    // A link obtained elsewhere (e.g. uploaded from the browser) can be attached.
+    const manual = await createJob({ source: 'sample', presetId: 'tiny' });
+    await waitForStatus(manual.id, ['done', 'hosted', 'error'], 120000);
+    const attach = await fetch(`${BASE}/api/jobs/${manual.id}/hosted`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://gofile.io/d/BrowserMade', provider: 'gofile' }),
+    });
+    const attached = await attach.json();
+    check('a browser-made link can be attached', attach.status === 200 && attached.job.hostedUrl.endsWith('BrowserMade'));
+    check('attached link records who made it', attached.job.hostedBy === 'browser', attached.job.hostedBy);
+
+    const badLink = await fetch(`${BASE}/api/jobs/${manual.id}/hosted`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'javascript:alert(1)' }),
+    });
+    check('a non-http link is refused', badLink.status === 400);
+
+    const ghostHost = await fetch(`${BASE}/api/jobs/nope/host`, { method: 'POST' });
+    check('hosting an unknown job 404s', ghostHost.status === 404);
 
     // --------------------------------------------------- chunked/resumable upload
     const chunkInit = await (
@@ -279,7 +385,7 @@ async function main() {
     check('chunked upload produces a job', Boolean(chunkDone.job?.id));
 
     const chunkedJob = await waitForJob(chunkDone.job.id);
-    check('chunked upload results in a video', chunkedJob.status === 'done', chunkedJob.error || '');
+    check('chunked upload results in a video', ['done', 'hosted'].includes(chunkedJob.status), chunkedJob.error || '');
     check(
       'chunked upload kept every byte',
       chunkedJob.sourceBytes === fileBytes.length,
@@ -309,6 +415,31 @@ async function main() {
 
     const ghost = await fetch(`${BASE}/api/jobs/does-not-exist`);
     check('unknown job returns 404', ghost.status === 404);
+
+    // ------------------------------------------------ survives a server restart
+    await sleep(600);
+    const beforeRestart = await (await fetch(`${BASE}/api/jobs`)).json();
+    const hostedBefore = beforeRestart.jobs.find((j) => j.id === sampleJob.id);
+    check('the sample job is the one under test', Boolean(hostedBefore?.hostedUrl), hostedBefore?.hostedUrl);
+    server.kill('SIGKILL');
+    await sleep(700);
+    server = startServer();
+    await waitForHealth();
+    const afterRestart = await (await fetch(`${BASE}/api/jobs`)).json();
+    const restored = afterRestart.jobs.find((j) => j.id === hostedBefore?.id);
+    check('job history survives a restart', Boolean(restored), `${afterRestart.jobs.length} jobs`);
+    check(
+      'share links survive a restart',
+      restored?.hostedUrl === hostedBefore?.hostedUrl,
+      `${restored?.hostedUrl}`,
+    );
+    check(
+      'links are also appended to a durable ledger',
+      await fs
+        .readFile(path.join(DATA_DIR, 'links.json'), 'utf8')
+        .then((text) => text.includes(hostedBefore?.hostedUrl || 'missing'))
+        .catch(() => false),
+    );
   } catch (err) {
     failures += 1;
     console.error('\nSmoke run crashed:', err.message);

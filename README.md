@@ -1,7 +1,7 @@
 # Squeeze
 
-Paste a video link (or drop a file), pick a file if the link is a folder, get a compressed
-MP4 back to download.
+Paste a video link and walk away. Squeeze downloads it, compresses it, uploads the result to
+a free file host and gives you a share link — no account, no card, nothing to watch.
 
 - **Real link resolution** — gofile folders, turbo.cr, pixeldrain, direct `.mp4`/`.webm`
   URLs, and plain pages that advertise a video (`og:video`, `<video>`, `<source>`, JSON-LD).
@@ -11,6 +11,8 @@ MP4 back to download.
 - **Three ways to fetch a video**, so a link the server can't reach still has a chance.
 - **Chunked, resumable uploads** — a 4 GB transfer goes up in 8 MB slices, so a dropped
   connection or a picky proxy doesn't lose the whole file.
+- **Automatic re-hosting** to gofile, pixeldrain or catbox (anonymous), with a fallback
+  chain, and share links that survive a server restart.
 
 **Want it online for free?** See [DEPLOY.md](DEPLOY.md) for four free routes (Oracle Always
 Free, Hugging Face Spaces, Render, or a local run behind a free tunnel) and what each can fetch.
@@ -71,7 +73,38 @@ real end-to-end encode, then explains what that combination means.
    - the server downloads it itself (fastest),
    - `yt-dlp` extracts it for the platforms it supports,
    - or **your browser** fetches the bytes and streams them to the encoder.
-3. **Encode it** with libx264 and hand back a download.
+3. **Encode it** with libx264 (quality-first: slow-ish preset, low CRF, audio stream-copied
+   when it is already AAC, never upscaled). A re-encode that would be bigger than the
+   original is discarded and the original is shared instead.
+4. **Upload it** to the first file host that accepts it and show the share link. If the
+   server has no internet, your browser does the upload instead — gofile and pixeldrain both
+   allow cross-origin requests, so this works even behind a locked-down network.
+
+Everything runs in the background: create jobs, close the tab, come back for the link.
+
+## Quality and size
+
+| Preset | Resolution | CRF | x264 preset | Typical saving |
+| --- | --- | --- | --- | --- |
+| Max quality | native | 19 | slow | small, near-lossless |
+| High quality *(default)* | native | 22 | medium | 60–85% |
+| Balanced | up to 1080p | 24 | fast | 70–90% |
+| Small | up to 720p | 27 | fast | 80–95% |
+| Tiny | up to 480p | 31 | veryfast | 90–97% |
+
+Fixed *and* fixed-quality requests are both supported: with "fit in N MB" the encoder runs
+two passes so the bits land where the detail is (measured: a 6 MB target produced 5.66 MB, an
+8 MB target produced 7.69 MB on a 39.8 MB 1080p source). Audio is copied untouched whenever
+the source is already AAC under 192 kbps, so quality there is unchanged and nothing is
+spent re-encoding it.
+
+## Hosts used for the output
+
+| Provider | Anonymous | Size | Notes |
+| --- | --- | --- | --- |
+| gofile.io | yes | ~20 GB | guest token minted automatically |
+| pixeldrain.com | yes | ~20 GB | raw body upload, open CORS |
+| catbox.moe | yes | 200 MB | plain-text link response |
 
 If a link is a folder with several videos, the UI lists them so you pick one instead of
 guessing which file you meant.
@@ -114,6 +147,10 @@ fly deploy
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT` | `3000` | HTTP port |
+| `HOSTERS` | `gofile,pixeldrain,catbox` | Which output hosts to try, in order |
+| `AUTO_HOST` | on | Set `0` to stop automatic re-hosting |
+| `GOFILE_TOKEN` | — | Optional gofile account token (keeps files in one account) |
+| `PIXELDRAIN_KEY` | — | Optional pixeldrain account key |
 | `DATA_DIR` | `./data` | Working files, deleted automatically |
 | `MAX_UPLOAD_MB` | `6144` | Largest accepted video, in megabytes |
 | `MAX_CONCURRENT` | `1` | Simultaneous encodes (one per CPU core is a good rule) |
@@ -148,6 +185,9 @@ app cannot be used to probe the box it runs on.
 | `PUT` | `/api/relay/:token` | Stream bytes fetched by the browser |
 | `GET` | `/api/jobs/:id` | Job state |
 | `GET` | `/api/jobs/:id/events` | Server-sent progress stream |
+| `GET` | `/api/jobs` | Recent jobs, newest first |
+| `POST` | `/api/jobs/:id/host` | Upload the result to a free host |
+| `POST` | `/api/jobs/:id/hosted` | Attach a link obtained elsewhere (browser upload) |
 | `GET` | `/api/jobs/:id/download` | The compressed MP4 |
 | `DELETE` | `/api/jobs/:id` | Cancel / delete a job |
 
@@ -158,7 +198,9 @@ re-resolved at download time, so they never go stale.
 ## Testing
 
 - `npm run test:resolve` — 19 resolver tests against stubbed APIs (real response shapes).
-- `npm run smoke` — 36 end-to-end checks: sample, upload, browser relay, target size, range
+- `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
+  declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
+- `npm run smoke` — 50 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
   chunk and an out-of-order chunk), and every rejection path. Starts its own
   server and a fake external host on a spare port.

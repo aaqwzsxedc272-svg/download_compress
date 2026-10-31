@@ -217,7 +217,19 @@ a { color: inherit; text-decoration: none; }
   flex-wrap: wrap;
 }
 
+
+
 .control-group { min-width: 0; }
+
+/* The controls row aligns on its bottom edge; the button has no label above it,
+   so match the label's height (12px text + 9px margin + line-height) to line up. */
+.action-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.action-row .primary { height: 44px; }
 
 .segmented {
   display: inline-flex;
@@ -272,7 +284,6 @@ a { color: inherit; text-decoration: none; }
 .size-input input::placeholder { color: #4d5854; }
 
 .primary {
-  margin-left: auto;
   display: inline-flex;
   align-items: center;
   gap: 9px;
@@ -307,6 +318,100 @@ a { color: inherit; text-decoration: none; }
 }
 
 .sep { opacity: 0.45; }
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13.5px;
+  color: var(--muted);
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(0, 0, 0, 0.34);
+  white-space: nowrap;
+}
+
+.toggle:hover { border-color: var(--line-strong); }
+
+.toggle input { position: absolute; opacity: 0; pointer-events: none; }
+
+.toggle-track {
+  width: 36px; height: 21px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--line);
+  position: relative;
+  transition: background 0.16s ease, border-color 0.16s ease;
+  flex: none;
+}
+
+.toggle-thumb {
+  position: absolute; top: 2px; left: 2px;
+  width: 15px; height: 15px;
+  border-radius: 50%;
+  background: #8b968f;
+  transition: transform 0.16s ease, background 0.16s ease;
+}
+
+.toggle input:checked + .toggle-track {
+  background: rgba(200, 245, 96, 0.28);
+  border-color: rgba(200, 245, 96, 0.55);
+}
+.toggle input:checked + .toggle-track .toggle-thumb {
+  transform: translateX(15px);
+  background: var(--accent);
+}
+.toggle input:focus-visible + .toggle-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* hosted link block on a job card */
+.hosted {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  background: rgba(200, 245, 96, 0.08);
+  border: 1px solid rgba(200, 245, 96, 0.22);
+}
+
+.hosted-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--dim);
+  font-weight: 600;
+}
+
+.hosted-url {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--accent);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.hosted-url:hover { text-decoration: underline; }
+
+.copy-btn {
+  border: 1px solid rgba(200, 245, 96, 0.35);
+  background: rgba(200, 245, 96, 0.12);
+  color: var(--accent);
+  border-radius: 7px;
+  padding: 3px 9px;
+  font-size: 11.5px;
+  cursor: pointer;
+  flex: none;
+}
+.copy-btn:hover { background: rgba(200, 245, 96, 0.2); }
 
 /* ------------------------------------------------------------------ picker */
 
@@ -627,7 +732,10 @@ a { color: inherit; text-decoration: none; }
 
 @media (max-width: 640px) {
   .controls { align-items: stretch; }
-  .primary { margin-left: 0; width: 100%; justify-content: center; }
+  .action-row { margin-top: 14px; }
+  .action-row .primary { width: 100%; justify-content: center; }
+  .toggle { width: 100%; justify-content: center; }
+  .control-host { width: 100%; }
   .segmented { display: flex; width: 100%; overflow-x: auto; }
   .segmented button { flex: 1; padding: 8px 6px; font-size: 12.5px; }
   .job { grid-template-columns: 1fr; }

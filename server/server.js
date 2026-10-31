@@ -9,7 +9,14 @@ const express = require('express');
 
 const jobsStore = require('./jobs');
 const { probe, thumbnail, transcode } = require('./ffmpeg');
-const { PRESET_LIST, getPreset, buildArgs, targetTooSmall } = require('./compress');
+const {
+  PRESET_LIST,
+  DEFAULT_PRESET,
+  getPreset,
+  buildPlan,
+  targetTooSmall,
+} = require('./compress');
+const hosters = require('./hosters');
 const sources = require('./sources');
 const { resolve, directUrl } = require('../shared/resolve');
 const { ensureSample } = require('./sample');
@@ -69,10 +76,14 @@ function safeNameFromUrl(raw) {
 function makeController(job) {
   const controller = new AbortController();
   job.abort = () => controller.abort();
+  job.abortSignal = controller.signal;
   return controller;
 }
 
 /* ------------------------------------------------------- the actual work */
+
+/** Auto-host finished files when a hoster is configured. */
+const AUTO_HOST = process.env.AUTO_HOST !== '0';
 
 async function compressJob(job) {
   const paths = jobsStore.jobPaths(job);
@@ -96,6 +107,7 @@ async function compressJob(job) {
       height: meta.height,
       fps: meta.fps,
       videoCodec: meta.videoCodec,
+      audioCodec: meta.audioCodec,
       hasAudio: meta.hasAudio,
     },
     stage: 'Compressing',
@@ -108,38 +120,63 @@ async function compressJob(job) {
     notes.push(`A ${job.targetMb} MB target is very tight for a clip this long — quality may suffer.`);
   }
 
-  const { args, videoKbps } = buildArgs({
+  const plan = buildPlan({
     input: paths.source,
     output: paths.output,
     meta,
     preset,
     targetMb: job.targetMb,
+    passlogBase: path.join(job.dir, 'x264pass'),
   });
 
+  // Progress is spread across passes so a two-pass encode still reads 0-100%.
+  const passCount = plan.passes.length;
   let lastEmit = 0;
-  await transcode(paths.source, paths.output, args, {
-    signal: controller.signal,
-    duration: meta.duration,
-    onProgress: ({ seconds, speed }) => {
-      const now = Date.now();
-      if (seconds != null && meta.duration > 0) job.progress = Math.min(1, seconds / meta.duration);
-      if (speed != null && speed > 0) {
-        job.speed = speed;
-        const remaining = Math.max(0, meta.duration - (seconds || 0));
-        job.etaSeconds = Math.round(remaining / speed);
-      }
-      if (now - lastEmit > 400) {
-        lastEmit = now;
-        jobsStore.updateJob(job, { stage: 'Compressing' });
-      }
-    },
-  });
 
-  const outStat = await fsp.stat(paths.output);
+  for (let index = 0; index < passCount; index += 1) {
+    const pass = plan.passes[index];
+    const slice = 1 / passCount;
+
+    await transcode(paths.source, paths.output, pass.args, {
+      signal: controller.signal,
+      duration: meta.duration,
+      onProgress: ({ seconds, speed }) => {
+        const now = Date.now();
+        if (seconds != null && meta.duration > 0) {
+          const within = Math.min(1, seconds / meta.duration);
+          job.progress = Math.min(1, index * slice + within * slice);
+        }
+        if (speed != null && speed > 0) {
+          job.speed = speed;
+          const remaining = Math.max(0, meta.duration - (seconds || 0));
+          job.etaSeconds = Math.round(remaining / speed);
+        }
+        if (now - lastEmit > 400) {
+          lastEmit = now;
+          jobsStore.updateJob(job, { stage: passCount > 1 ? `${pass.label} (${index + 1}/${passCount})` : 'Compressing' });
+        }
+      },
+    });
+  }
+
+  await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+  await fsp.rm(`${path.join(job.dir, 'x264pass')}.log.mbtree`, { force: true }).catch(() => {});
+
+  let outStat = await fsp.stat(paths.output);
   if (!outStat.size) throw Object.assign(new Error('Compression produced an empty file.'), { code: 'EMPTY_OUTPUT' });
 
+  // Never hand back a file that is bigger AND no better: if the re-encode did
+  // not pay off, deliver the original bytes instead.
+  let usedOriginal = false;
+  if (!job.targetMb && outStat.size >= job.sourceBytes) {
+    await fsp.copyFile(paths.source, paths.output);
+    outStat = await fsp.stat(paths.output);
+    usedOriginal = true;
+    notes.push('Re-encoding would have made this bigger, so the original file is what gets shared.');
+  }
+
   const saved = job.sourceBytes ? Math.max(0, 1 - outStat.size / job.sourceBytes) : 0;
-  if (saved < 0.05 && !job.targetMb) {
+  if (!usedOriginal && saved < 0.05 && !job.targetMb) {
     notes.push('This one was already small — the compressed copy is about the same size.');
   }
 
@@ -152,9 +189,92 @@ async function compressJob(job) {
     outputBytes: outStat.size,
     outputName: outputNameFor(job),
     note: notes.join(' ') || null,
-    videoKbps,
+    videoKbps: plan.videoKbps,
+    usedOriginal,
+    audioMode: plan.audio.mode,
+    twoPass: plan.twoPass,
+    scaledTo: plan.scaleNote,
     saved,
   });
+
+  // The point of the app is the link, not the local file: hand it to a host now.
+  if (AUTO_HOST) {
+    const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+    if (free > outStat.size * 3) hostJob(job).catch(() => {});
+  }
+}
+
+/** Upload a finished job's file to a free host and record the share link. */
+async function hostJob(job, { order } = {}) {
+  if (job.status !== 'done') {
+    throw Object.assign(new Error('That file is not ready yet.'), { code: 'NOT_READY' });
+  }
+  if (job.hosting) return job;
+
+  const paths = jobsStore.jobPaths(job);
+  if (!fs.existsSync(paths.output)) {
+    throw Object.assign(new Error('The local copy of this file is gone, so it cannot be re-hosted.'), {
+      code: 'NO_FILE',
+    });
+  }
+
+  job.hosting = true;
+  jobsStore.updateJob(job, { status: 'hosting', stage: 'Uploading to a file host', hostError: null, progress: 0 });
+
+  try {
+    const result = await hosters.uploadToHoster(
+      paths.output,
+      { name: job.outputName || 'video.mp4' },
+      {
+        order,
+        signal: job.abortSignal,
+        onProgress: ({ sent, total, provider }) => {
+          job.progress = total ? sent / total : 0;
+          job.stage = `Uploading to ${hosters.PROVIDERS[provider]?.label || provider} · ${Math.round(job.progress * 100)}%`;
+          jobsStore.updateJob(job, {});
+        },
+      },
+    );
+
+    jobsStore.updateJob(job, {
+      status: 'hosted',
+      stage: 'Link ready',
+      progress: 1,
+      hostedUrl: result.url,
+      hostProvider: result.provider,
+      hostedBy: 'server',
+      hostError: null,
+      hostedAt: Date.now(),
+    });
+    persistHostedLink(job, result.url, result.provider);
+    return job;
+  } catch (err) {
+    jobsStore.updateJob(job, {
+      status: 'done',
+      progress: 1,
+      stage: 'Ready (no share link yet)',
+      hostError: err.message,
+    });
+    throw err;
+  } finally {
+    job.hosting = false;
+  }
+}
+
+/** Keep a small append-only ledger of share links, independent of job cleanup. */
+async function persistHostedLink(job, url, provider) {
+  const file = path.join(jobsStore.DATA_DIR, 'links.json');
+  const line = JSON.stringify({
+    jobId: job.id,
+    url,
+    provider,
+    name: job.outputName,
+    sourceBytes: job.sourceBytes,
+    outputBytes: job.outputBytes,
+    createdAt: job.createdAt,
+    at: Date.now(),
+  });
+  await fsp.appendFile(file, `${line}\n`).catch(() => {});
 }
 
 const FRIENDLY = {
@@ -351,8 +471,12 @@ app.get('/api/health', async (req, res) => {
     ok: true,
     maxUploadMb: MAX_UPLOAD_MB,
     presets: PRESET_LIST,
+    defaultPreset: DEFAULT_PRESET,
     platformDownloads: Boolean(ytdlp),
     ytdlpVersion: ytdlp?.version || null,
+    hosters: hosters.describeProviders(),
+    autoHost: AUTO_HOST,
+    browserHosters: ['gofile', 'pixeldrain'],
   });
 });
 
@@ -768,6 +892,67 @@ app.put('/api/relay/:token', async (req, res) => {
   }
 });
 
+/** Recent jobs, newest first — the "start it and walk away" list. */
+app.get('/api/jobs', (req, res) => {
+  const jobs = jobsStore.listJobs().slice(0, 50).map((job) => jobsStore.publicView(job));
+  res.json({ jobs });
+});
+
+app.get('/api/hosters', (req, res) => {
+  res.json({
+    server: hosters.describeProviders(),
+    browser: ['gofile', 'pixeldrain'],
+    autoHost: AUTO_HOST,
+  });
+});
+
+/** Upload the finished file to a free host and return the share link. */
+app.post('/api/jobs/:id/host', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  if (!['done', 'hosted'].includes(job.status)) {
+    return fail(res, 409, 'NOT_READY', 'That file is not ready yet.');
+  }
+  if (job.status === 'hosted' && job.hostedUrl && !req.body?.force) {
+    return res.json({ job: jobsStore.publicView(job) });
+  }
+
+  const order = Array.isArray(req.body?.order)
+    ? req.body.order.filter((id) => hosters.PROVIDERS[id])
+    : undefined;
+
+  // Run in the background so a slow upload cannot hold the request open; the
+  // UI follows /api/jobs/:id/events for progress.
+  res.status(202).json({ job: jobsStore.publicView(job) });
+  hostJob(job, { order }).catch(() => {});
+  return undefined;
+});
+
+/** Record a link the browser obtained itself (used when the server has no network). */
+app.post('/api/jobs/:id/hosted', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+
+  const url = String(req.body?.url || '').trim();
+  const provider = String(req.body?.provider || 'browser').slice(0, 40);
+  if (!/^https?:\/\/[^\s]+$/i.test(url) || url.length > 2000) {
+    return fail(res, 400, 'BAD_URL', 'That share link is not valid.');
+  }
+
+  jobsStore.updateJob(job, {
+    status: 'hosted',
+    stage: 'Link ready',
+    hostedUrl: url,
+    hostProvider: provider,
+    hostedBy: 'browser',
+    hostError: null,
+    hostedAt: Date.now(),
+    progress: 1,
+  });
+  persistHostedLink(job, url, provider).catch(() => {});
+  res.json({ job: jobsStore.publicView(job) });
+});
+
 app.get('/api/jobs/:id', (req, res) => {
   const job = jobsStore.getJob(req.params.id);
   if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
@@ -822,7 +1007,7 @@ function serveOutput(req, res, disposition) {
   const job = jobsStore.getJob(req.params.id);
   if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
   const { output } = jobsStore.jobPaths(job);
-  if (job.status !== 'done' || !fs.existsSync(output)) {
+  if (!['done', 'hosting', 'hosted'].includes(job.status) || !fs.existsSync(output)) {
     return fail(res, 409, 'NOT_READY', 'This file is not ready yet.');
   }
   res.sendFile(

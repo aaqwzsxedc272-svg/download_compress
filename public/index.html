@@ -67,6 +67,17 @@
           <span>MB</span>
         </div>
       </div>
+      <div class="control-group control-host">
+        <span class="field-label">Delivery</span>
+        <label class="toggle" for="autoHost">
+          <input type="checkbox" id="autoHost" checked />
+          <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+          <span class="toggle-text">Give me a share link</span>
+        </label>
+      </div>
+      </div>
+
+    <div class="action-row">
       <button class="primary" id="goBtn" type="button">
         <span>Squeeze</span>
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -117,6 +128,7 @@
 </template>
 
 <script src="/shared/resolve.js" defer></script>
+<script src="/shared/hosters.js" defer></script>
 <script src="/app.js" defer></script>
 </body>
 </html>

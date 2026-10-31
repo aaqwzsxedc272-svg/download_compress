@@ -73,6 +73,7 @@ async function probe(file) {
     fps: Number.isFinite(fps) ? Math.round(fps * 100) / 100 : 0,
     videoCodec: video.codec_name || null,
     audioCodec: audio?.codec_name || null,
+    audioBitrate: audio ? Number(audio.bit_rate) || null : null,
     hasAudio: Boolean(audio),
     bitrate: Number(info.format?.bit_rate) || null,
   };

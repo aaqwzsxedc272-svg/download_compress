@@ -41,11 +41,11 @@ function stat(label, value, good = false) {
 }
 
 function render(job) {
-  const done = job.status === 'done';
+  const done = ['done', 'hosted', 'hosting'].includes(job.status);
   const failed = job.status === 'error';
   const pct = Math.round((job.progress || 0) * 100);
 
-  document.title = job.status === 'done'
+  document.title = job.hostedUrl || done
     ? `${job.outputName || 'Video'} — Squeeze`
     : 'Squeezing… — Squeeze';
 
@@ -98,7 +98,9 @@ function render(job) {
   } else {
     const label = job.status === 'compressing'
       ? `Compressing · ${pct}%${job.speed ? ` · ${job.speed.toFixed(1)}×` : ''}`
-      : job.stage || 'Working…';
+      : job.status === 'hosting'
+        ? job.stage || 'Uploading to a file host…'
+        : job.stage || 'Working…';
     const statusEl = $('#playerStatus');
     if (statusEl) statusEl.textContent = label;
     if (!slot.querySelector('.spinner')) {
@@ -126,12 +128,75 @@ function render(job) {
     }
   }
 
+  // hosted link block
+  const oldHosted = document.querySelector('.hosted');
+  if (oldHosted) oldHosted.remove();
+  if (job.hostedUrl) {
+    const wrap = document.createElement('div');
+    wrap.className = 'hosted';
+    wrap.style.marginTop = '12px';
+
+    const label = document.createElement('span');
+    label.className = 'hosted-label';
+    label.textContent = job.hostProvider ? `on ${job.hostProvider}` : 'link';
+
+    const link = document.createElement('a');
+    link.className = 'hosted-url';
+    link.href = job.hostedUrl;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = job.hostedUrl;
+
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'copy-btn';
+    copy.textContent = 'Copy link';
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(job.hostedUrl);
+        copy.textContent = 'Copied';
+      } catch {
+        copy.textContent = 'Select it above';
+      }
+      setTimeout(() => {
+        copy.textContent = 'Copy link';
+      }, 1500);
+    });
+
+    wrap.append(label, link, copy);
+    $('#statRow').insertAdjacentElement('afterend', wrap);
+  }
+
   // actions
   const actions = $('#detailActions');
   actions.innerHTML = '';
+  if (done && job.hasFile && !job.hostedUrl) {
+    const share = document.createElement('button');
+    share.type = 'button';
+    share.className = 'btn download';
+    share.textContent = job.status === 'hosting' ? 'Uploading…' : 'Get a share link';
+    share.disabled = job.status === 'hosting';
+    share.addEventListener('click', async () => {
+      share.disabled = true;
+      share.textContent = 'Uploading…';
+      try {
+        await fetch(`/api/jobs/${job.id}/host`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        start();
+      } catch {
+        share.textContent = 'Try again';
+        share.disabled = false;
+      }
+    });
+    actions.append(share);
+  }
+
   if (done && job.hasFile) {
     const dl = document.createElement('a');
-    dl.className = 'btn download';
+    dl.className = 'btn';
     dl.href = `/api/jobs/${job.id}/download`;
     dl.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> Download ${job.outputName ? '' : 'video'}`;
     actions.append(dl);
@@ -158,7 +223,7 @@ async function poll() {
     if (!res.ok) throw new Error('gone');
     const { job } = await res.json();
     render(job);
-    return job.status === 'done' || job.status === 'error';
+    return job.status === 'hosted' || job.status === 'error';
   } catch {
     $('#playerSlot').innerHTML = `<div style="text-align:center;padding:24px">
       <div style="font-size:15px;margin-bottom:6px">This video isn't here anymore</div>
@@ -177,7 +242,7 @@ async function start() {
     try {
       const job = JSON.parse(event.data);
       render(job);
-      if (job.status === 'done' || job.status === 'error') es.close();
+      if (job.status === 'hosted' || job.status === 'error') es.close();
     } catch {
       /* ignore */
     }

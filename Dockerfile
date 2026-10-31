@@ -20,8 +20,13 @@ ENV NODE_ENV=production \
     MAX_UPLOAD_MB=6144 \
     MAX_CONCURRENT=1
 
-RUN mkdir -p /data
-VOLUME ["/data"]
+# Platforms such as Hugging Face Spaces run containers as an unprivileged user
+# (uid 1000, which is the image's `node` user). The data directory has to belong
+# to that user or the app cannot write its working files.
+RUN mkdir -p /data && chown -R node:node /data /app
+
+USER node
+WORKDIR /app
 
 EXPOSE 3000
 CMD ["node", "server/server.js"]

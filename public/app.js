@@ -15,7 +15,8 @@ const state = {
   presets: [],
   presetId: localStorage.getItem(STORAGE.preset) || 'high',
   autoHost: localStorage.getItem(STORAGE.autoHost) !== '0',
-  hostedAttempts: new Set(),
+  serverHostTried: new Set(),
+  browserHostTried: new Set(),
   jobs: new Map(), // id -> { el, data, es }
   busy: 0,
 };
@@ -301,13 +302,17 @@ function updateCard(entry, job) {
       share.disabled = true;
       share.textContent = 'Uploading…';
       try {
-        await hostOnServer(job);
-      } catch {
-        try {
+        if (job.hostError) {
           await hostFromBrowser(job);
-        } catch (err) {
-          showAlert(err.message, 'error');
+        } else {
+          try {
+            await hostOnServer(job);
+          } catch {
+            await hostFromBrowser(job);
+          }
         }
+      } catch (err) {
+        showAlert(`Share link failed: ${err.message}`, 'error');
       } finally {
         hideTransfer();
         share.disabled = false;
@@ -815,23 +820,31 @@ async function hostFromBrowser(job) {
 
 /** Make sure a finished job ends up with a share link, whichever route works. */
 async function ensureHosted(job) {
-  if (!state.autoHost || job.hostedUrl || state.hostedAttempts.has(job.id)) return;
+  if (!state.autoHost || job.hostedUrl) return;
   if (job.status !== 'done' || !job.hasFile) return;
 
-  state.hostedAttempts.add(job.id);
-  try {
-    // The server may already be able to do it itself.
-    if (state.health?.autoHost && !job.hostError) {
-      await hostOnServer(job);
-      return;
-    }
-    if (job.hostError || state.health?.autoHost === false) {
+  // If the server already gave up (no outbound route to the hosts), fall back to
+  // uploading from this browser, which usually does have a route.
+  if (job.hostError) {
+    if (state.browserHostTried.has(job.id)) return;
+    state.browserHostTried.add(job.id);
+    try {
       await hostFromBrowser(job);
-    } else {
-      await hostOnServer(job);
+    } catch (err) {
+      showAlert(`Share link failed: ${err.message}`, 'error');
+    } finally {
+      hideTransfer();
     }
+    return;
+  }
+
+  if (state.serverHostTried.has(job.id)) return;
+  state.serverHostTried.add(job.id);
+  try {
+    await hostOnServer(job);
   } catch (err) {
-    state.hostedAttempts.delete(job.id);
+    // The request itself failed; let the next poll try the browser route.
+    state.serverHostTried.delete(job.id);
     showAlert(`Share link failed: ${err.message}`, 'error');
   } finally {
     hideTransfer();

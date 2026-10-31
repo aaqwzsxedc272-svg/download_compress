@@ -10,7 +10,10 @@
     "smoke": "node scripts/smoke.js",
     "test:resolve": "node scripts/resolve.test.js",
     "test:hosters": "node scripts/hosters.test.js",
-    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js"
+    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js",
+    "deploy:hf": "scripts/deploy-space.sh",
+    "package:hf": "node scripts/package-space.js",
+    "verify": "node scripts/verify-deploy.js"
   },
   "engines": {
     "node": ">=18"

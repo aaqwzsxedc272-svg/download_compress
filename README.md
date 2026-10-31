@@ -14,15 +14,24 @@ a free file host and gives you a share link — no account, no card, nothing to 
 - **Automatic re-hosting** to gofile, pixeldrain or catbox (anonymous), with a fallback
   chain, and share links that survive a server restart.
 
-**Want it online for free?** See [DEPLOY.md](DEPLOY.md) for four free routes (Oracle Always
-Free, Hugging Face Spaces, Render, or a local run behind a free tunnel) and what each can fetch.
+**Want it online for free?** One command puts it on a Hugging Face Space — free, no card,
+full internet:
+
+```bash
+HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <your-hf-username> [space-name]
+```
+
+It prints the live URL; then `node scripts/verify-deploy.js <url>` proves the whole chain works
+from the outside — app up, presets, hosters, a real link resolved, a real video compressed, and
+the share link publicly downloadable. Other routes (Oracle Always Free, Render, a local run
+behind a free tunnel) and what each can fetch are in [DEPLOY.md](DEPLOY.md).
 
 ## Run it
 
 ```bash
 npm install
 npm start          # http://localhost:3000
-npm run smoke      # 28 end-to-end checks
+npm run smoke      # 54 end-to-end checks
 npm run test:resolve
 ```
 
@@ -200,10 +209,14 @@ re-resolved at download time, so they never go stale.
 - `npm run test:resolve` — 19 resolver tests against stubbed APIs (real response shapes).
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
-- `npm run smoke` — 50 end-to-end checks: sample, upload, browser relay, target size, range
+- `npm run smoke` — 54 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
   chunk and an out-of-order chunk), and every rejection path. Starts its own
   server and a fake external host on a spare port.
+- `node scripts/verify-deploy.js <url> [--preset tiny] [--keep]` — verifies a real deployment
+  end to end from the outside: health, presets, hosters, yt-dlp and outbound access
+  (advisory), link resolution, a real compress, a created share link, and a public download
+  of that link. Exits non-zero only on genuine failures.
 
 ## Housekeeping
 

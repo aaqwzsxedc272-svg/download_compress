@@ -41,9 +41,9 @@ function run(bin, args) {
 }
 
 /**
- * Encode one short slice and return the bytes per second of video it produced.
- * Two slices (a quarter in and three quarters in) keep the guess honest, because
- * a quiet scene early on is a poor predictor of a busy one later.
+ * Encode a short slice and return the bytes per second of video it produced.
+ * Two slices (a fifth in and seven tenths in) keep the guess honest, because a
+ * quiet scene early on is a poor predictor of a busy one later.
  */
 async function measureAt(input, { crf, preset, seconds, duration, workDir, meta = {} }) {
   const sliceSeconds = Math.max(4, Math.min(seconds, Math.floor(duration / 3) || seconds));
@@ -147,8 +147,13 @@ async function chooseCrf({ input, meta, preset, sourceBytes, workDir, onProbe = 
   const first = await probe(base);
   if (!first) return nope; // ffmpeg could not cut a slice: fall back to the preset
 
+  // `probes` on the result is for logs and tests: how many slices were weighed.
+  const finish = () => {
+    if (best) best.probes = probed.size;
+    return best;
+  };
   const good = () => best && best.saving >= MIN_SAVING;
-  if (good()) return best;
+  if (good()) return finish();
 
   // A re-encode that only just beats the original is not worth the quality cost,
   // so aim a little past the threshold.
@@ -157,13 +162,13 @@ async function chooseCrf({ input, meta, preset, sourceBytes, workDir, onProbe = 
   const wanted = perSecond > 0 ? first.crf + CRF_PER_HALVING * Math.log2(perSecond / ((targetBytes - audioBytes) / duration)) : ceiling;
 
   const second = await probe(Math.min(ceiling, Math.ceil(wanted)));
-  if (second && (good() || second.crf >= ceiling)) return best;
-  if (!second && best) return best;
+  if (second && (good() || second.crf >= ceiling)) return finish();
+  if (!second && best) return finish();
 
   // The interpolation missed: one last try at the ceiling (CRF 34 is as flat as
   // this encoder goes).
   await probe(ceiling);
-  return best || nope;
+  return finish() || nope;
 }
 
 module.exports = { chooseCrf, measureAt, MIN_SAVING, PROBE_SECONDS };

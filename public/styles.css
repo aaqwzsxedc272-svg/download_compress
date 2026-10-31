@@ -373,6 +373,42 @@ a { color: inherit; text-decoration: none; }
 
 .picker-row .btn { flex: none; }
 
+.picker-actions { display: flex; gap: 8px; flex: none; }
+.picker-actions .btn { white-space: nowrap; }
+
+/* the drop zone pulses once a file has been saved to the device */
+.dropzone.wants-drop {
+  outline: 2px dashed rgba(200, 245, 96, 0.55);
+  outline-offset: 6px;
+  border-radius: 14px;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% { outline-color: rgba(200, 245, 96, 0.2); }
+}
+
+.await {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-color: rgba(200, 245, 96, 0.3);
+  background: rgba(200, 245, 96, 0.06);
+  animation: rise 0.24s ease both;
+}
+
+.await-head { display: flex; align-items: center; gap: 9px; font-size: 14px; }
+.await-head b, .await-body b { font-weight: 620; }
+
+.await-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(200, 245, 96, 0.8);
+  animation: blink 1.4s ease-in-out infinite;
+  flex: none;
+}
+@keyframes blink { 50% { opacity: 0.25; } }
+
+.await-body { margin-top: 7px; padding-left: 17px; font-size: 13.3px; color: var(--muted); }
+
 .dz-hosts {
   font-size: 11.5px;
   color: #55605c;
@@ -534,6 +570,9 @@ a { color: inherit; text-decoration: none; }
 
 /* ------------------------------------------------------------------ footer */
 
+.footer-link { color: var(--muted); border-bottom: 1px solid rgba(255,255,255,0.15); }
+.footer-link:hover { color: var(--accent); border-bottom-color: var(--accent); }
+
 .site-footer {
   position: relative;
   z-index: 1;
@@ -595,8 +634,45 @@ a { color: inherit; text-decoration: none; }
   .job-thumb { min-height: 0; aspect-ratio: 16 / 9; }
   .composer { padding: 14px; }
   .composer-note .sep { display: none; }
-  .dz-hosts { border-left: 0; padding-left: 0; width: 100%; }
-  .picker-row { gap: 10px; }
+  .picker-actions { display: flex; gap: 8px; flex: none; }
+.picker-actions .btn { white-space: nowrap; }
+
+/* the drop zone pulses once a file has been saved to the device */
+.dropzone.wants-drop {
+  outline: 2px dashed rgba(200, 245, 96, 0.55);
+  outline-offset: 6px;
+  border-radius: 14px;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% { outline-color: rgba(200, 245, 96, 0.2); }
+}
+
+.await {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-color: rgba(200, 245, 96, 0.3);
+  background: rgba(200, 245, 96, 0.06);
+  animation: rise 0.24s ease both;
+}
+
+.await-head { display: flex; align-items: center; gap: 9px; font-size: 14px; }
+.await-head b, .await-body b { font-weight: 620; }
+
+.await-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(200, 245, 96, 0.8);
+  animation: blink 1.4s ease-in-out infinite;
+  flex: none;
+}
+@keyframes blink { 50% { opacity: 0.25; } }
+
+.await-body { margin-top: 7px; padding-left: 17px; font-size: 13.3px; color: var(--muted); }
+
+.dz-hosts { border-left: 0; padding-left: 0; width: 100%; }
+  .picker-row { gap: 10px; flex-wrap: wrap; }
+  .picker-actions { width: 100%; }
   .picker-name { white-space: normal; }
   .composer-note { row-gap: 4px; }
   .hero-sub { max-width: none; }

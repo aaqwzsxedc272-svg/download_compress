@@ -174,6 +174,63 @@ const GOFILE_FOLDER = {
     await assert.rejects(resolve('https://turbo.cr/d/xyz'), (err) => err.code === 'TURBO_FAILED');
   });
 
+  console.log('bunkr');
+
+  await test('extracts the signed CDN flow from an item page', async () => {
+    const html = `<html><body>
+      <h1>My Clip.mp4</h1>
+      <script>
+        var jsCDN = "https:\/\/cdn.cr\/data\/abc123.mp4";
+        var signUrl = "https:\/\/cdn.cr\/sign";
+      </script></body></html>`;
+    stubFetch((url) => {
+      if (url.includes('/sign')) return { body: { token: 'tok123', ex: 1793426301 } };
+      return { raw: html, type: 'text/html' };
+    });
+    const result = await resolve('https://bunkr.cr/f/abc123');
+    assert.equal(result.resolver, 'bunkr');
+    assert.equal(result.files[0].name, 'My Clip.mp4');
+    const url = await directUrl(result.files[0].ref);
+    assert.ok(url.includes('token=tok123'), url);
+    assert.ok(url.includes('ex=1793426301'), url);
+  });
+
+  await test('a bot-check page is reported, not silently empty', async () => {
+    stubFetch(() => ({ raw: '<html><body>Checking your browser…</body></html>', type: 'text/html' }));
+    await assert.rejects(resolve('https://bunkr.su/f/abc123'), (err) => err.code === 'BUNKR_BLOCKED');
+  });
+
+  await test('albums expand into their files', async () => {
+    const album = '<a href="/f/one111">1</a><a href="/f/two222">2</a>';
+    const item = (name) => `<h1>${name}</h1><script>var jsCDN="https://cdn.cr/${name}.mp4";var signUrl="https://cdn.cr/sign";</script>`;
+    stubFetch((url) => {
+      if (url.includes('/a/')) return { raw: album, type: 'text/html' };
+      if (url.includes('/sign')) return { body: { token: 't', ex: 1 } };
+      return { raw: item(url.includes('one111') ? 'first' : 'second'), type: 'text/html' };
+    });
+    const result = await resolve('https://bunkr.ph/a/album99');
+    assert.equal(result.files.length, 2, JSON.stringify(result.files.map((f) => f.name)));
+  });
+
+  console.log('filester');
+
+  await test('uses public file metadata when available', async () => {
+    stubFetch(() => ({ body: { success: true, data: { name: 'holiday.mp4', size: 900, type: 'video/mp4' } } }));
+    const result = await resolve('https://filester.me/d/aBcDeFg');
+    assert.equal(result.resolver, 'filester');
+    assert.equal(result.files[0].name, 'holiday.mp4');
+    assert.equal(result.files[0].size, 900);
+  });
+
+  await test('falls back to the share page for the direct link', async () => {
+    stubFetch((url) => {
+      if (url.includes('u1.filester.me')) return { status: 401, body: { success: false } };
+      return { raw: '<video src="https://dl.filester.me/x/clip.mp4"></video>', type: 'text/html' };
+    });
+    const result = await resolve('https://filester.me/d/aBcDeFg');
+    assert.equal(result.files[0].ref.url, 'https://dl.filester.me/x/clip.mp4');
+  });
+
   console.log('pixeldrain');
 
   await test('single file info includes name and size', async () => {

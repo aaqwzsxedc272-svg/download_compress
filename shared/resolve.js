@@ -219,6 +219,172 @@
     },
   };
 
+
+  /* ------------------------------------------------------------------ bunkr */
+
+  // bunkr rotates domains constantly, so match the whole family.
+  const BUNKR_HOST = /(^|\.)bunkr(\.[a-z]{2,})+$/i;
+
+  function bunkrExtractSigned(html) {
+    // Item pages declare the CDN path and a signing endpoint as plain vars.
+    const cdn = /(?:jsCDN|cdnUrl)\s*=\s*['"]([^'"]+)['"]/i.exec(html);
+    const sign = /(?:signUrl|sign)\s*=\s*['"]([^'"]+)['"]/i.exec(html);
+    return {
+      cdn: cdn ? cdn[1].replace(/\\\//g, '/') : null,
+      sign: sign ? sign[1].replace(/\\\//g, '/') : null,
+    };
+  }
+
+  const bunkr = {
+    id: 'bunkr',
+    match: (url) => {
+      const parsed = safeUrl(url);
+      if (!parsed || !BUNKR_HOST.test(parsed.hostname)) return null;
+      return /\/(?:f|v|i|d)\/([A-Za-z0-9]+)/i.exec(parsed.pathname)?.[1]
+        || /\/a\/([A-Za-z0-9]+)/i.exec(parsed.pathname)?.[1]
+        || null;
+    },
+    async list(url) {
+      const parsed = safeUrl(url);
+      const isAlbum = /\/a\//i.test(parsed.pathname);
+
+      if (isAlbum) {
+        const res = await fetchWithTimeout(url, { headers: { 'user-agent': UA } });
+        if (!res.ok) throw new ResolveError(`bunkr answered HTTP ${res.status} (it is often bot-protected).`, 'BUNKR_FAILED');
+        const html = await res.text();
+        const found = new Set();
+        const re = /href=["'](\/[fv]\/[A-Za-z0-9]+)["']/gi;
+        let m;
+        while ((m = re.exec(html))) {
+          found.add(new URL(m[1], parsed.origin).toString());
+        }
+        if (!found.size) {
+          throw new ResolveError('bunkr returned a bot-check page instead of the album.', 'BUNKR_BLOCKED');
+        }
+        const files = [];
+        for (const itemUrl of [...found].slice(0, 25)) {
+          try {
+            const single = await bunkr.list(itemUrl);
+            files.push(...single.files);
+          } catch {
+            /* skip items that fail */
+          }
+        }
+        if (!files.length) throw new ResolveError('No downloadable files in that bunkr album.', 'EMPTY');
+        return { resolver: 'bunkr', title: 'bunkr album', files };
+      }
+
+      const res = await fetchWithTimeout(url, { headers: { 'user-agent': UA } });
+      if (!res.ok) {
+        throw new ResolveError(`bunkr answered HTTP ${res.status} (it is often bot-protected).`, 'BUNKR_FAILED');
+      }
+      const html = await res.text();
+      const { cdn, sign } = bunkrExtractSigned(html);
+      if (!cdn) {
+        throw new ResolveError(
+          'bunkr served a bot-check page, so the file link could not be read. Open the link and drop the file here.',
+          'BUNKR_BLOCKED',
+        );
+      }
+      const title = /<h1[^>]*>([^<]{1,200})<\/h1>/i.exec(html)?.[1]?.trim();
+      return {
+        resolver: 'bunkr',
+        title: null,
+        files: [
+          {
+            id: bunkr.match(url),
+            name: title || `${bunkr.match(url)}.mp4`,
+            size: 0,
+            mime: 'video/mp4',
+            kind: 'video',
+            ref: { resolver: 'bunkr', cdn, sign, name: title || null },
+          },
+        ],
+      };
+    },
+    async direct(ref) {
+      if (!ref.sign) return ref.cdn;
+      // Signed URLs are short lived: mint a token right before downloading.
+      const base = safeUrl(ref.cdn);
+      const path = base ? base.pathname : ref.cdn;
+      const signed = await getJson(`${ref.sign}?path=${encodeURIComponent(path)}`);
+      const token = signed.token || signed.t;
+      const expires = signed.ex || signed.exp;
+      if (!token) return ref.cdn;
+      const separator = ref.cdn.includes('?') ? '&' : '?';
+      return `${ref.cdn}${separator}token=${encodeURIComponent(token)}&ex=${encodeURIComponent(expires ?? '')}`;
+    },
+  };
+
+  /* ---------------------------------------------------------------- filester */
+
+  const filester = {
+    id: 'filester',
+    match: (url) => hostPath(url, /(^|\.)filester\.me$/i, /\/(?:d|f)\/([A-Za-z0-9_-]+)/i),
+    async list(url) {
+      const slug = filester.match(url);
+      // Public metadata first; fall back to scraping the share page.
+      try {
+        const meta = await getJson(`https://u1.filester.me/api/v1/file/${encodeURIComponent(slug)}`);
+        const data = meta && (meta.data || meta);
+        if (data && (data.name || data.url)) {
+          return {
+            resolver: 'filester',
+            title: null,
+            files: [
+              {
+                id: slug,
+                name: data.name || `${slug}.mp4`,
+                size: Number(data.size) || 0,
+                mime: data.type || '',
+                kind: isVideo(data.name, data.type) ? 'video' : 'other',
+                ref: { resolver: 'filester', slug, page: url },
+              },
+            ],
+          };
+        }
+      } catch {
+        /* needs auth or blocked; fall through to the page */
+      }
+      const res = await fetchWithTimeout(url, { headers: { 'user-agent': UA } });
+      if (!res.ok) throw new ResolveError(`filester answered HTTP ${res.status}.`, 'FILESTER_FAILED');
+      const html = await res.text();
+      const urls = extractVideoUrls(html, url);
+      if (!urls.length) {
+        throw new ResolveError(
+          'filester is bot-protected, so the file link could not be read. Open the link and drop the file here.',
+          'FILESTER_BLOCKED',
+        );
+      }
+      return {
+        resolver: 'filester',
+        title: null,
+        files: urls.map((videoUrl) => ({
+          id: videoUrl,
+          name: (() => {
+            try {
+              return decodeURIComponent(new URL(videoUrl).pathname.split('/').pop() || 'video.mp4');
+            } catch {
+              return 'video.mp4';
+            }
+          })(),
+          size: 0,
+          mime: '',
+          kind: 'video',
+          ref: { resolver: 'direct', url: videoUrl },
+        })),
+      };
+    },
+    async direct(ref) {
+      if (ref.url) return ref.url;
+      const res = await fetchWithTimeout(ref.page, { headers: { 'user-agent': UA } });
+      const html = await res.text();
+      const urls = extractVideoUrls(html, ref.page);
+      if (!urls.length) throw new ResolveError('filester did not expose a download link.', 'FILESTER_BLOCKED');
+      return urls[0];
+    },
+  };
+
   /* --------------------------------------------------------------- pixeldrain */
 
   const pixeldrain = {
@@ -402,7 +568,7 @@
 
   /* ----------------------------------------------------------------- registry */
 
-  const RESOLVERS = [gofile, turbo, pixeldrain, direct, page];
+  const RESOLVERS = [gofile, turbo, pixeldrain, bunkr, filester, direct, page];
 
   /** Videos first, biggest first — the file people usually want. */
   function orderFiles(files) {

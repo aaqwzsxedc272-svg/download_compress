@@ -714,6 +714,8 @@ app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['htm
 
 app.get('/j/:id', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'job.html')));
 
+app.get('/diagnostics', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'diagnostics.html')));
+
 app.use((req, res) => {
   if (req.path.startsWith('/api/')) return fail(res, 404, 'NOT_FOUND', 'Unknown endpoint.');
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));

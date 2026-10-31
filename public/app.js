@@ -432,8 +432,8 @@ async function relayBytes(directUrl, { pageUrl, filename } = {}) {
   if (opts.targetMb) qs.set('targetMb', String(opts.targetMb));
   const endpoint = `/api/relay/${token}?${qs.toString()}`;
 
-  let sent = 0;
-  const progress = () => {
+  const sentRef = { value: 0 };
+  const progress = (sent) => {
     showTransfer(
       'Sending to the compressor…',
       total ? sent / total : null,
@@ -441,28 +441,70 @@ async function relayBytes(directUrl, { pageUrl, filename } = {}) {
     );
   };
 
-  if (response.body && supportsStreamingUpload()) {
-    const counter = new TransformStream({
-      transform(chunk, controller) {
-        sent += chunk.length;
-        progress();
-        controller.enqueue(chunk);
-      },
-    });
-    const res = await fetch(endpoint, {
+  const canStream = response.body && supportsStreamingUpload();
+
+  if (canStream) {
+    try {
+      const job = await streamPut(response, endpoint, contentType, progress, sentRef);
+      return job;
+    } catch (err) {
+      // Some proxies drop chunked uploads; fall back to a buffered send.
+      if (err.code !== 'TRANSPORT') throw err;
+      showTransfer('Retrying with a buffered upload…', null, '');
+    }
+  }
+
+  // No streaming uploads (older Safari, or a proxy that refuses chunked bodies):
+  // buffer, then send with progress events. The original body may already be
+  // half-consumed by the failed stream, so pull a fresh copy.
+  let blob;
+  try {
+    blob = await response.clone().blob();
+  } catch {
+    showTransfer('Re-reading the file…', null, '');
+    const again = await fetch(directUrl, { mode: 'cors', credentials: 'omit' });
+    if (!again.ok) throw Object.assign(new Error(`The host answered HTTP ${again.status} on retry.`), { code: 'BAD_STATUS' });
+    blob = await again.blob();
+  }
+  if (blob.size > RELAY_BUFFER_LIMIT) {
+    throw Object.assign(
+      new Error(
+        `This file is ${formatBytes(blob.size)}, which is too large to push through this preview in one piece. ` +
+          'Download it and drop the file instead.',
+      ),
+      { code: 'TOO_LARGE' },
+    );
+  }
+  return uploadBlob(blob, { endpoint, name: label });
+}
+
+const RELAY_BUFFER_LIMIT = 512 * 1024 * 1024;
+
+async function streamPut(response, endpoint, contentType, progress, sentRef) {
+  const counter = new TransformStream({
+    transform(chunk, controller) {
+      sentRef.value += chunk.length;
+      progress(sentRef.value);
+      controller.enqueue(chunk);
+    },
+  });
+
+  let res;
+  try {
+    res = await fetch(endpoint, {
       method: 'PUT',
       body: response.body.pipeThrough(counter),
       duplex: 'half',
       headers: { 'content-type': contentType || 'application/octet-stream' },
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw Object.assign(new Error(data.error || `Upload failed (${res.status})`), { code: data.code });
-    return data.job;
+  } catch {
+    throw Object.assign(new Error('The upload stream was cut off.'), { code: 'TRANSPORT' });
   }
 
-  // No streaming uploads (older Safari): buffer, then send with progress events.
-  const blob = await response.blob();
-  return uploadBlob(blob, { endpoint, name: label });
+  const data = await res.json().catch(() => ({}));
+  if (res.status >= 500) throw Object.assign(new Error(data.error || 'Server error'), { code: 'TRANSPORT' });
+  if (!res.ok) throw Object.assign(new Error(data.error || `Upload failed (${res.status})`), { code: data.code });
+  return data.job;
 }
 
 function uploadBlob(blob, { endpoint, name, url, method = 'PUT' }) {
@@ -551,6 +593,9 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
     meta.textContent = bits.join(' · ');
     info.append(name, meta);
 
+    const actions = document.createElement('div');
+    actions.className = 'picker-actions';
+
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'btn download';
@@ -592,13 +637,77 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
       }
     });
 
-    row.append(info, button);
+    // Hosts that forbid cross-origin reads can still be fetched by the browser
+    // as a normal download. Offer that as a one-click shortcut, then ask for the
+    // file back via drag & drop.
+    const saveFirst = document.createElement('button');
+    saveFirst.type = 'button';
+    saveFirst.className = 'btn';
+    saveFirst.title = 'Save the original to your device, then drop it on this page';
+    saveFirst.textContent = 'Save file';
+    saveFirst.addEventListener('click', async () => {
+      saveFirst.disabled = true;
+      try {
+        const direct = await window.SqueezeResolve.directUrl(file.ref);
+        const link = document.createElement('a');
+        link.href = direct;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.download = file.name || '';
+        link.click();
+        awaitAfterDownload(file, pageUrl);
+      } catch (err) {
+        showAlert(err.message, 'error');
+      } finally {
+        saveFirst.disabled = false;
+      }
+    });
+
+    actions.append(button, saveFirst);
+    row.append(info, actions);
     list.append(row);
   }
 
   panel.append(list);
   $('#alert').insertAdjacentElement('beforebegin', panel);
   panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/**
+ * After the original starts downloading to the device, keep a drop target ready
+ * so the user can hand it straight back for compression.
+ */
+function awaitAfterDownload(file, pageUrl) {
+  const existing = document.getElementById('awaitPanel');
+  if (existing) existing.remove();
+
+  const panel = document.createElement('section');
+  panel.id = 'awaitPanel';
+  panel.className = 'card await';
+  panel.innerHTML = `
+    <div class="await-head">
+      <span class="await-dot"></span>
+      <span class="await-title">Saving <b></b> to your device…</span>
+    </div>
+    <div class="await-body">
+      When it finishes, drag the file anywhere on this page (or
+      <button type="button" class="linkish await-browse">browse</button>) and it will be
+      compressed with <b class="await-preset"></b>.
+    </div>`;
+  panel.querySelector('b').textContent = file.name || 'the video';
+  panel.querySelector('.await-preset').textContent = presetOf(currentOptions().presetId).label;
+  panel.querySelector('.await-browse').addEventListener('click', () => $('#fileInput').click());
+  $('#alert').insertAdjacentElement('beforebegin', panel);
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  // Highlight the drop zone so the next step is obvious.
+  $('#dropzone').classList.add('wants-drop');
+}
+
+function clearAwait() {
+  const panel = document.getElementById('awaitPanel');
+  if (panel) panel.remove();
+  $('#dropzone')?.classList.remove('wants-drop');
 }
 
 /* ------------------------------------------------------------------ actions */
@@ -711,6 +820,7 @@ async function handleLink(raw) {
 }
 
 async function handleFile(file) {
+  clearAwait();
   const opts = currentOptions();
   const qs = new URLSearchParams({ name: file.name, presetId: opts.presetId });
   if (opts.targetMb) qs.set('targetMb', String(opts.targetMb));
@@ -735,6 +845,7 @@ async function squeeze() {
 
   hideAlert();
   clearPicker();
+  clearAwait();
   setBusy(1);
   const failures = [];
 

@@ -31,12 +31,35 @@ pip install -U yt-dlp
 
 Squeeze detects it at startup and reports it on `/api/health`.
 
+## Supported hosts
+
+| Host | Automatic? | Notes |
+| --- | --- | --- |
+| **gofile.io** | yes if the server has internet; otherwise in-browser | folders expand into a file picker; guest accounts minted automatically |
+| **pixeldrain.com** | yes | serves its API with open CORS, so the browser can read files directly |
+| **turbo.cr** | server only | share pages are signed via `api/sign`; the CDN allows no cross-origin reads |
+| **bunkr** | server only | follows the signed-CDN flow; rotates domains, often bot-protected |
+| **filester.me** | server only | public metadata + share-page scrape; behind DDoS-Guard |
+| direct `.mp4` / `.webm` | yes | no resolution needed |
+| any page with a video | yes | `og:video`, `<video>`, `<source>`, JSON-LD |
+
+"Server only" means the *server* must be able to reach the host — so hosts that forbid
+cross-origin reads (turbo, bunkr, filester) cannot work in a sandbox whose network blocks them.
+For those links Squeeze offers **Save file** (one click, saved to your device) and then asks
+you to drop it on the page; the compression is identical.
+
+Open **`/diagnostics`** in the running app to see, from your own machine, which of these hops
+work. It reports the server's outbound access, each host's CORS posture, the upload path and a
+real end-to-end encode, then explains what that combination means.
+
 ## How a link is processed
 
 1. **Resolve it.** `shared/resolve.js` turns a share page into real file URLs:
    - `gofile.io/d/{code}` → guest account → folder listing (choose which file)
    - `turbo.cr/d|v|embed/{id}` → `api/sign` → signed CDN URL
    - `pixeldrain.com/u|l/{id}` → file info / list
+   - `bunkr.*` `/f|v|i|d|a/{id}` → signed CDN URL (albums expand to files)
+   - `filester.me/d/{slug}` → public metadata, then share-page scrape
    - a URL that ends in a video extension → used directly
    - anything else → the page is fetched and scanned for a video URL
 2. **Fetch it**, in whichever of these can reach the file:
@@ -125,7 +148,7 @@ re-resolved at download time, so they never go stale.
 
 ## Testing
 
-- `npm run test:resolve` — 14 resolver tests against stubbed APIs (real response shapes).
+- `npm run test:resolve` — 19 resolver tests against stubbed APIs (real response shapes).
 - `npm run smoke` — 28 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, and every rejection path. Starts its own
   server and a fake external host on a spare port.

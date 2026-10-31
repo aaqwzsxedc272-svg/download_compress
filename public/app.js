@@ -865,6 +865,31 @@ function clearPicker() {
  * mode 'server'  -> the server downloads it itself
  * mode 'browser' -> your browser fetches the bytes and streams them over
  */
+async function startPickerFile(file, { pageUrl, mode }) {
+  if (mode === 'server') {
+    const opts = currentOptions();
+    const { job } = await api('/api/jobs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'ref',
+        ref: file.ref,
+        name: file.name,
+        pageUrl,
+        ...opts,
+      }),
+    });
+    return job;
+  }
+  const direct = await window.SqueezeResolve.directUrl(file.ref);
+  return relayBytes(direct, { pageUrl, filename: file.name });
+}
+
+/**
+ * Show the files found behind a link so any number of them can be chosen.
+ * mode 'server'  -> the server downloads them itself
+ * mode 'browser' -> your browser fetches the bytes and streams them over
+ */
 function showPicker({ pageUrl, resolver, title, files, mode }) {
   clearPicker();
   const panel = document.createElement('section');
@@ -882,20 +907,40 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
     (mode === 'browser' ? ' · fetched through your browser' : '');
   head.append(heading);
 
+  const tools = document.createElement('div');
+  tools.className = 'picker-tools';
+  const selectAll = document.createElement('button');
+  selectAll.type = 'button';
+  selectAll.className = 'btn tiny';
+  selectAll.textContent = 'Select all';
+  tools.append(selectAll);
+
   const close = document.createElement('button');
   close.type = 'button';
   close.className = 'btn tiny';
   close.textContent = 'Dismiss';
   close.addEventListener('click', clearPicker);
-  head.append(close);
+  tools.append(close);
+  head.append(tools);
   panel.append(head);
 
   const list = document.createElement('div');
   list.className = 'picker-list';
+  const boxes = [];
 
   for (const file of files) {
     const row = document.createElement('div');
     row.className = 'picker-row';
+
+    const pick = document.createElement('input');
+    pick.type = 'checkbox';
+    pick.className = 'picker-check';
+    pick.setAttribute('aria-label', `Select ${file.name}`);
+    pick.addEventListener('change', () => {
+      row.classList.toggle('is-picked', pick.checked);
+      updateFooter();
+    });
+    boxes.push({ pick, file, row });
 
     const info = document.createElement('div');
     info.className = 'picker-file';
@@ -928,24 +973,7 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
       button.textContent = 'Starting…';
       setBusy(1);
       try {
-        let job;
-        if (mode === 'server') {
-          const opts = currentOptions();
-          ({ job } = await api('/api/jobs', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              source: 'ref',
-              ref: file.ref,
-              name: file.name,
-              pageUrl,
-              ...opts,
-            }),
-          }));
-        } else {
-          const direct = await window.SqueezeResolve.directUrl(file.ref);
-          job = await relayBytes(direct, { pageUrl, filename: file.name });
-        }
+        const job = await startPickerFile(file, { pageUrl, mode });
         trackJob(job);
         clearPicker();
       } catch (err) {
@@ -985,11 +1013,68 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
     });
 
     actions.append(button, saveFirst);
-    row.append(info, actions);
+    row.append(pick, info, actions);
     list.append(row);
   }
 
-  panel.append(list);
+  const footer = document.createElement('div');
+  footer.className = 'picker-foot';
+  const summary = document.createElement('span');
+  summary.className = 'picker-count';
+  const queueSelected = document.createElement('button');
+  queueSelected.type = 'button';
+  queueSelected.className = 'btn primary';
+  queueSelected.disabled = true;
+
+  function updateFooter() {
+    const picked = boxes.filter((b) => b.pick.checked);
+    summary.textContent = picked.length
+      ? `${picked.length} selected${picked.length > 1 ? ' · they queue one after another' : ''}`
+      : 'Tick the files you want';
+    queueSelected.textContent = picked.length ? `Compress ${picked.length}` : 'Compress selected';
+    queueSelected.disabled = !picked.length;
+    selectAll.textContent = picked.length === boxes.length ? 'Select none' : 'Select all';
+  }
+
+  selectAll.addEventListener('click', () => {
+    const turnOn = boxes.some((b) => !b.pick.checked);
+    boxes.forEach((b) => {
+      b.pick.checked = turnOn;
+      b.row.classList.toggle('is-picked', turnOn);
+    });
+    updateFooter();
+  });
+
+  queueSelected.addEventListener('click', async () => {
+    const picked = boxes.filter((b) => b.pick.checked).map((b) => b.file);
+    if (!picked.length) return;
+    queueSelected.disabled = true;
+    selectAll.disabled = true;
+    setBusy(1);
+    let started = 0;
+    for (const file of picked) {
+      queueSelected.textContent = `Starting ${started + 1}/${picked.length}…`;
+      try {
+        const job = await startPickerFile(file, { pageUrl, mode });
+        trackJob(job);
+        started += 1;
+      } catch (err) {
+        showAlert(`${file.name}: ${err.message}`, 'error');
+      }
+    }
+    setBusy(-1);
+    hideTransfer();
+    if (started) clearPicker();
+    else {
+      queueSelected.disabled = false;
+      selectAll.disabled = false;
+      updateFooter();
+    }
+  });
+
+  footer.append(summary, queueSelected);
+  panel.append(list, footer);
+  updateFooter();
   $('#alert').insertAdjacentElement('beforebegin', panel);
   panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }

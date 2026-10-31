@@ -56,8 +56,12 @@ Requires Node 18+ (uses the built-in `fetch`). ffmpeg and ffprobe come bundled a
 binaries through `@ffmpeg-installer/ffmpeg` and `@ffprobe-installer/ffprobe` — nothing to
 install system-wide.
 
-gofile now mints its API token inside an obfuscated browser script, so a plain HTTP client
-cannot list a folder any more. Install the optional headless browser where you need it:
+**Optional headless browser.** Several hosts only answer a real browser: gofile mints its API
+token inside an obfuscated script, filester sits behind DDoS-Guard, and hotlink-protected CDNs
+answer a bare request with a challenge page. With Chromium installed the server solves all three
+by opening the page for real — it lists gofile folders, watches which media a page actually
+plays, and downloads with the same session cookie. Without it the app falls back to your
+browser. Install it where you need it:
 
 ```bash
 npm run browser:install      # playwright + chromium, ~120 MB, skipped by a normal install
@@ -230,6 +234,17 @@ app cannot be used to probe the box it runs on.
 `POST /api/resolve` returns `{ resolver, title, files: [{ name, size, mime, kind, ref }] }`.
 Pass a file's `ref` back as `source: "ref"` to compress exactly that file — signed links are
 re-resolved at download time, so they never go stale.
+
+## Long jobs and idle hosts
+
+Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Two defences:
+
+- The server prints a `[keep-alive] <job> 42% · 12m left` line to its terminal every 45 seconds
+  while anything is fetching, encoding or uploading. GitHub Codespaces counts terminal output as
+  activity, so the machine stays awake on its own. Turn it down or off with
+  `HEARTBEAT_SECONDS=0`.
+- `./scripts/keepalive.sh` does the same from a second terminal, for any host that measures
+  activity differently.
 
 ## Testing
 

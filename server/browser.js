@@ -157,4 +157,99 @@ async function gofileFolder(code, { timeoutMs = 60_000 } = {}) {
   }
 }
 
-module.exports = { available, gofileFolder, UA };
+/**
+ * Load any page in Chromium and catch whatever video it plays.
+ *
+ * Bot-protected hosts (filester behind DDoS-Guard, fileditch behind hotlink
+ * rules) answer a plain fetch with a challenge page and refuse cross-origin
+ * reads from your browser. A real browser solves the challenge and its own
+ * player requests the media, so the URL can simply be observed.
+ */
+async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000 } = {}) {
+  const pw = load();
+  if (!pw || !pw.chromium) {
+    throw Object.assign(new Error('The headless browser is not installed on this machine.'), {
+      code: 'BROWSER_UNAVAILABLE',
+    });
+  }
+
+  const MEDIA = /\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|3gp|ogv)(\?|#|$)/i;
+  const seen = new Map();
+
+  const browser = await pw.chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  try {
+    const context = await browser.newContext({
+      userAgent: UA,
+      locale: 'en-US',
+      viewport: { width: 1280, height: 800 },
+      extraHTTPHeaders: { 'accept-language': 'en-US,en;q=0.9' },
+    });
+    const page = await context.newPage();
+
+    const remember = (rawUrl, meta = {}) => {
+      if (!rawUrl || !/^https?:/i.test(rawUrl)) return;
+      const clean = rawUrl.split('#')[0];
+      if (!MEDIA.test(clean) && !meta.force) return;
+      if (seen.has(clean)) return;
+      seen.set(clean, {
+        url: clean,
+        contentType: meta.contentType || '',
+        size: Number(meta.size) || 0,
+      });
+    };
+
+    page.on('request', (request) => {
+      if (request.resourceType() === 'media') remember(request.url(), { force: true });
+      else remember(request.url());
+    });
+    page.on('response', async (response) => {
+      const type = (response.headers()['content-type'] || '').toLowerCase();
+      if (type.startsWith('video/') || type === 'application/octet-stream') {
+        remember(response.url(), {
+          force: type.startsWith('video/'),
+          contentType: type,
+          size: response.headers()['content-length'],
+        });
+      }
+    });
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
+    await page.waitForTimeout(settleMs);
+
+    // Some players only start on a click; try the usual suspects once.
+    for (const selector of ['video', 'button[class*="play" i]', '[class*="player" i]']) {
+      const target = page.locator(selector).first();
+      if (await target.count().catch(() => 0)) {
+        await target.click({ timeout: 1500, force: true }).catch(() => {});
+      }
+    }
+    await page.waitForTimeout(3000);
+
+    // Read what the DOM advertises too: <video src>, <source>, og:video.
+    const dom = await page
+      .evaluate(() => {
+        const out = [];
+        const push = (value) => {
+          if (value) out.push(new URL(value, location.href).href);
+        };
+        document.querySelectorAll('video').forEach((v) => push(v.currentSrc || v.src));
+        document.querySelectorAll('video source, source').forEach((s) => push(s.src));
+        const og = document.querySelector('meta[property="og:video"], meta[property="og:video:url"]');
+        if (og) push(og.getAttribute('content'));
+        return out;
+      })
+      .catch(() => []);
+    dom.forEach((u) => remember(u, { force: true }));
+
+    const cookies = await context.cookies().catch(() => []);
+    return {
+      media: [...seen.values()],
+      cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
+    };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+module.exports = { available, gofileFolder, captureMedia, UA };
+

@@ -89,6 +89,9 @@
   /* The accountToken of the browser session that listed the folder. gofile ties
      a download to the account that opened it, so this is reused verbatim. */
   let gofileSessionCookie = null;
+  /* Set by the server when a headless browser is available: bot-protected pages
+     are opened for real, and whatever video the page play()s is observed. */
+  let pageBrowserHook = null;
 
   async function gofileWebToken(force = false) {
     if (!force && gofileWt.at && Date.now() - gofileWt.at < 30 * 60 * 1000) return gofileWt.value;
@@ -645,9 +648,14 @@
       const res = await fetchWithTimeout(url, {
         headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml' },
         redirect: 'follow',
-      });
-      if (!res.ok) {
-        throw new ResolveError(`That page answered HTTP ${res.status}.`, 'BAD_STATUS');
+      }).catch(() => null);
+      if (!res || !res.ok) {
+        const viaBrowser = await pageBrowserFiles(url);
+        if (viaBrowser && viaBrowser.length) return { resolver: 'browser', title: null, files: viaBrowser };
+        throw new ResolveError(
+          res ? `That page answered HTTP ${res.status}.` : 'That page could not be reached.',
+          'BAD_STATUS',
+        );
       }
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
       if (contentType && !/(text\/html|application\/xhtml|text\/plain)/.test(contentType)) {
@@ -658,6 +666,8 @@
       const urls = extractVideoUrls(html, base).filter((u) => !PLAYLIST_EXT.test(new URL(u).pathname));
 
       if (!urls.length) {
+        const viaBrowser = await pageBrowserFiles(base);
+        if (viaBrowser && viaBrowser.length) return { resolver: 'browser', title: null, files: viaBrowser };
         const hasPlayer = /\.(m3u8|mpd)/i.test(html) || /jwplayer|videojs|hls/i.test(html);
         throw new ResolveError(
           hasPlayer
@@ -760,6 +770,42 @@
     return headers;
   }
 
+  /** Ask the headless browser what media a page actually plays, if it is there. */
+  async function pageBrowserFiles(url) {
+    if (!pageBrowserHook) return null;
+    try {
+      const result = await pageBrowserHook(url);
+      const media = Array.isArray(result) ? result : (result && result.media) || [];
+      const files = media
+        .filter((item) => item && item.url)
+        .slice(0, 12)
+        .map((item, index) => {
+          let name = `video-${index + 1}.mp4`;
+          try {
+            const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
+            if (last && VIDEO_EXT.test(last)) name = last;
+          } catch {
+            /* keep default */
+          }
+          return {
+            id: item.url,
+            name,
+            size: Number(item.size) || 0,
+            mime: item.contentType || '',
+            kind: 'video',
+            ref: { resolver: 'direct', url: item.url, name },
+          };
+        });
+      return files.length ? files : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function setPageBrowser(hook) {
+    pageBrowserHook = typeof hook === 'function' ? hook : null;
+  }
+
   function setGofileBrowser(hook) {
     gofileBrowserHook = typeof hook === 'function' ? hook : null;
   }
@@ -772,6 +818,7 @@
     ResolveError,
     isVideo,
     setGofileBrowser,
+    setPageBrowser,
     gofileDownloadHeaders,
   };
 });

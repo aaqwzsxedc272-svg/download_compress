@@ -18,7 +18,7 @@ const {
 } = require('./compress');
 const hosters = require('./hosters');
 const sources = require('./sources');
-const { resolve, directUrl, setGofileBrowser } = require('../shared/resolve');
+const { resolve, directUrl, setGofileBrowser, setPageBrowser } = require('../shared/resolve');
 
 /* gofile mints its API token in an obfuscated browser script, so a headless
    browser is the only way to list a folder once the plain API says no. It is an
@@ -27,6 +27,7 @@ try {
   const browser = require('./browser');
   if (browser.available()) {
     setGofileBrowser((code) => browser.gofileFolder(code));
+    setPageBrowser((url) => browser.captureMedia(url));
   }
 } catch {
   /* no browser helper on this deployment */
@@ -384,11 +385,41 @@ function updateQueuePositions() {
   });
 }
 
+/* GitHub Codespaces (and similar hosts) stop an idle machine, but "terminal
+   output is counted as activity". So while any job is running, print a line
+   every 45 seconds: the machine stays awake through a multi-hour encode even if
+   nobody is looking at the tab. */
+let heartbeatTimer = null;
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_SECONDS || 45) * 1000;
+
+function startHeartbeat() {
+  if (heartbeatTimer || !HEARTBEAT_MS) return;
+  heartbeatTimer = setInterval(() => {
+    const busy = jobsStore.listJobs ? jobsStore.listJobs() : [];
+    const running = (busy || []).filter((job) =>
+      ['fetching', 'queued', 'compressing', 'hosting'].includes(job.status),
+    );
+    if (!running.length) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+      return;
+    }
+    const parts = running.map((job) => {
+      const pct = Math.round((Number(job.progress) || 0) * 100);
+      const eta = job.etaSeconds ? ` · ${Math.max(1, Math.round(job.etaSeconds / 60))}m left` : '';
+      return `${job.id} ${pct}%${eta}`;
+    });
+    console.log(`[keep-alive] ${new Date().toISOString()} · ${parts.join(' · ')}`);
+  }, HEARTBEAT_MS);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
+}
+
 function pumpQueue() {
   while (activeCount < MAX_CONCURRENT && queue.length) {
     const job = queue.shift();
     if (!jobsStore.getJob(job.id)) continue; // removed while waiting
     activeCount += 1;
+    startHeartbeat();
     compressJob(job)
       .catch((err) => reportJobError(job, err))
       .finally(() => {
@@ -529,7 +560,7 @@ app.post('/api/resolve', async (req, res) => {
   if (!url) return fail(res, 400, 'BAD_URL', 'That does not look like a valid link.');
   if (sources.isBlockedHost(url)) return fail(res, 400, 'BLOCKED_HOST', 'That address is not allowed.');
   try {
-    const result = await resolve(url);
+    const result = await fileBehindUrl(url, await resolve(url));
     return res.json({
       resolver: result.resolver,
       title: result.title || null,
@@ -645,6 +676,7 @@ app.post('/api/jobs', async (req, res) => {
   let resolved = null;
   try {
     resolved = await resolve(url, { allowPage: false });
+    resolved = await fileBehindUrl(url, resolved);
   } catch (err) {
     return fail(res, 422, err.code || 'RESOLVE_FAILED', err.message);
   }
@@ -683,8 +715,42 @@ app.post('/api/jobs', async (req, res) => {
         return fail(res, 422, err.code || 'RESOLVE_FAILED', err.message);
       }
     } else {
-      // Nothing from here: the browser may still have a route to it.
-      return fail(res, 409, 'NEED_BROWSER', 'This server cannot reach that host. Retrying through your browser instead.');
+      // The server cannot even reach it: a real browser may still be able to.
+      try {
+        const browser = require('./browser');
+        if (browser.available()) {
+          const captured = await browser.captureMedia(url);
+          const media = (captured && captured.media) || [];
+          if (media.length) {
+            resolved = {
+              resolver: 'browser',
+              title: null,
+              files: media.slice(0, 12).map((item, index) => {
+                let name = `video-${index + 1}.mp4`;
+                try {
+                  const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
+                  if (last) name = last;
+                } catch {
+                  /* keep default */
+                }
+                return {
+                  id: item.url,
+                  name,
+                  size: Number(item.size) || 0,
+                  mime: item.contentType || '',
+                  kind: 'video',
+                  ref: { resolver: 'direct', url: item.url, name },
+                };
+              }),
+            };
+          }
+        }
+      } catch {
+        /* fall through to the browser relay */
+      }
+      if (!resolved) {
+        return fail(res, 409, 'NEED_BROWSER', 'This server cannot reach that host. Retrying through your browser instead.');
+      }
     }
   }
 
@@ -704,6 +770,59 @@ app.post('/api/jobs', async (req, res) => {
   return undefined;
 });
 
+
+
+/**
+ * A ".mp4" URL is only a file if it answers like one. Hotlink-protected hosts
+ * (fileditch among them) answer with an HTML challenge, which used to fail the
+ * job after the download had already started. Try the page path instead, then a
+ * real browser, before giving up.
+ */
+async function fileBehindUrl(url, resolved) {
+  if (!resolved || !resolved.files || !resolved.files.length) return resolved;
+  if (resolved.resolver !== 'direct') return resolved;
+  const remote = await sources.probeRemote(url);
+  if (!remote.reachable || !remote.isHtml) return resolved;
+  try {
+    const viaPage = await resolve(url);
+    if (viaPage && viaPage.files && viaPage.files.length) return viaPage;
+  } catch {
+    /* fall through to the browser */
+  }
+  try {
+    const browser = require('./browser');
+    if (browser.available()) {
+      const captured = await browser.captureMedia(url);
+      const media = (captured && captured.media) || [];
+      if (media.length) {
+        return {
+          resolver: 'browser',
+          title: null,
+          files: media.slice(0, 12).map((item, index) => {
+            let name = `video-${index + 1}.mp4`;
+            try {
+              const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
+              if (last) name = last;
+            } catch {
+              /* keep default */
+            }
+            return {
+              id: item.url,
+              name,
+              size: Number(item.size) || 0,
+              mime: item.contentType || '',
+              kind: 'video',
+              ref: { resolver: 'direct', url: item.url, name },
+            };
+          }),
+        };
+      }
+    }
+  } catch {
+    /* nothing more to try */
+  }
+  return resolved;
+}
 
 /* ------------------------------------------------- chunked / resumable upload */
 

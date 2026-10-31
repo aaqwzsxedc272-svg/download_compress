@@ -14,20 +14,30 @@ a free file host and gives you a share link — no account, no card, nothing to 
 - **Automatic re-hosting** to gofile, pixeldrain or catbox (anonymous), with a fallback
   chain, and share links that survive a server restart.
 
-**Want it online for free?** Card-free routes that keep it in the cloud:
+**Want it online for free?** The route that needs no card, no Docker and no host that can
+disappear is **GitHub Actions** — it runs on GitHub's own machines, which have full internet,
+so gofile, filester, turbo, bunkr and YouTube links all work:
 
-- **SnapDeploy** — free, no card, 512 MB / 0.25 vCPU, 100 running hours a month. Builds the
-  `Dockerfile` unchanged: new container → GitHub repo → this repo → deploy.
+1. Open the repo → **Issues → New issue → "Compress a video"**.
+2. Paste the link, choose a quality, submit.
+3. A runner downloads, compresses and uploads it, then replies on the issue with the **share
+   link** plus a downloadable file. You can close the tab.
+
+The engine is `scripts/action-compress.js` — the same resolver, presets and uploader as the web
+app, minus the server. Manual runs: **Actions → compress-video → Run workflow**.
+
+Other card-free routes, and their honest limits:
+
+- **SnapDeploy** — a real website, 512 MB, no card, but its free tier has **no outbound
+  internet**, so only pixeldrain and direct links work (your browser fetches them).
 - **GitHub Codespaces** — 2 vCPU, 8 GB, no card; the `.devcontainer` starts the server and
-  exposes port 3000. Best CPU of any free option.
+  exposes port 3000. Best for a burst of big files.
 - **Back4App Containers** — free forever, no card, but 256 MB: `tiny`/`small` only.
 - **Your own computer + a free tunnel** — `npm start` then
   `npx cloudflared tunnel --url http://localhost:3000`.
 
-The obvious names stopped being free: Hugging Face requires PRO for any Space that runs compute,
-Render asks new accounts for a card, and Zeabur is shutting down in December 2026. `render.yaml`
-and `scripts/deploy-space.sh` stay in the repo for anyone who already has those accounts. Exact
-steps and limits are in [DEPLOY.md](DEPLOY.md).
+Hugging Face needs PRO for any Space that runs compute, Render asks new accounts for a card, and
+Zeabur is shutting down in December 2026. Details in [DEPLOY.md](DEPLOY.md).
 
 Whichever route you pick, `node scripts/verify-deploy.js <url>` proves the whole chain works
 from the outside: app up, presets, hosters, a real link resolved, a real video compressed, and

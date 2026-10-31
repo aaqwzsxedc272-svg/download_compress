@@ -16,16 +16,54 @@ what is actually true right now and what to press.
 
 ## Card-free routes that still exist
 
-| Route | CPU / RAM | Card | Shape |
-| --- | --- | --- | --- |
-| **SnapDeploy** | 0.25 vCPU / 512 MB | no | real website, sleeps when idle, 100 h/month |
-| **GitHub Codespaces** | 2 vCPU / 8 GB | no | a session you open; best CPU by far |
-| **Back4App Containers** | 0.25 vCPU / 256 MB | no | permanent, but a demo-sized box |
-| Your own machine + tunnel | all of it | no | fastest, but the PC must stay on |
+| Route | Internet | CPU / RAM | Card | Shape |
+| --- | --- | --- | --- | --- |
+| **GitHub Actions** | **full** | 2 vCPU / 7 GB | no | a form; replies with the link |
+| **SnapDeploy** | **none** | 0.25 vCPU / 512 MB | no | real website, browser must fetch |
+| **GitHub Codespaces** | full | 2 vCPU / 8 GB | no | a session you open |
+| **Back4App Containers** | full | 0.25 vCPU / 256 MB | no | permanent, demo-sized |
+| Your own machine + tunnel | full | all of it | no | fastest, PC must stay on |
+
+**If you want gofile, filester, turbo, bunkr or YouTube links to work, the server must have
+outbound internet.** SnapDeploy's free tier has none (its firewall drops outbound connections),
+so there only pixeldrain and direct links can be fetched — by your browser.
 
 ---
 
-## 1. SnapDeploy — free, no card, a real website
+## 1. GitHub Actions — free, no card, full internet, nothing can shut it down
+
+This is the only route where every host works (gofile, filester, turbo, bunkr, YouTube) because
+the job runs on GitHub's runners: real internet, two cores, ffmpeg through npm, 6-hour limit.
+No card, no credit card screen, no vendor that can disappear — it is your own repository.
+
+**How you use it:** repo → **Issues → New issue → "Compress a video"** → paste the link, pick a
+quality, submit. A runner picks it up, and a few minutes later the issue gets a reply with the
+**share link** and a downloadable file attached to the run. You can close the tab and come back.
+
+**Manual runs:** **Actions → compress-video → Run workflow**, with any URL.
+
+What is behind it:
+
+| File | Role |
+| --- | --- |
+| `.github/ISSUE_TEMPLATE/compress.yml` | the form: link, quality, optional "fit in N MB" |
+| `.github/workflows/compress.yml` | resolves, downloads, encodes, uploads, replies, closes the issue |
+| `scripts/action-compress.js` | the engine — same resolver, presets and uploader as the web app |
+
+Notes:
+
+- Only the **repository owner** can trigger it, and only issues labelled `compress` are picked
+  up, so nobody else can spend your minutes.
+- Public repos get **unlimited** Actions minutes; private repos draw on 2,000 free minutes a
+  month. A typical 5-minute video is a few minutes of runner time.
+- The finished file is attached to the run as an artifact (7 days) even if the uploader fails.
+- `pip install yt-dlp` on the runner means YouTube/TikTok/Instagram links work too.
+
+---
+
+---
+
+## 2. SnapDeploy — free, no card, a real website
 
 <https://snapdeploy.dev> runs Docker containers on AWS Fargate. Free tier: **4 containers,
 512 MB / 0.25 vCPU, 100 running hours a month, 10 deploys a day, no card, no expiry.** It sleeps
@@ -42,7 +80,7 @@ long; `balanced` for short clips.
 
 ---
 
-## 2. GitHub Codespaces — 2 vCPU, 8 GB, no card, works today
+## 3. GitHub Codespaces — 2 vCPU, 8 GB, no card, works today
 
 The most capable free option, and the one thing that cannot be shut down under you, because you
 already own the account. It is a session rather than a permanent site: you open it when you need
@@ -58,7 +96,7 @@ Free personal accounts get a monthly quota (60 hours on the 2-core machine). At 
 
 ---
 
-## 3. Back4App Containers — free forever, but only 256 MB
+## 4. Back4App Containers — free forever, but only 256 MB
 
 <https://www.back4app.com/containers> gives one container, 0.25 CPU, 256 MB RAM and 100 GB of
 transfer, free forever, no card (their signup page says so).
@@ -71,7 +109,7 @@ transfer, free forever, no card (their signup page says so).
 
 ---
 
-## 4. Your own computer + a free tunnel
+## 5. Your own computer + a free tunnel
 
 ```bash
 npm install && npm start          # http://localhost:3000

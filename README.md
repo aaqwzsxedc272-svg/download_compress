@@ -235,6 +235,20 @@ app cannot be used to probe the box it runs on.
 Pass a file's `ref` back as `source: "ref"` to compress exactly that file — signed links are
 re-resolved at download time, so they never go stale.
 
+## Share links vs local files
+
+Two different things come out of a job, and they live differently:
+
+| | Where it lives | Survives the machine stopping? |
+| --- | --- | --- |
+| **Share link** (pixeldrain/gofile/catbox) | on the file host | **yes** — the machine is not involved any more |
+| **Download button** | on this machine's disk | no — gone when the session ends |
+
+So the durable result is the share link. Keep *Delivery → Give me a share link* on and the
+**Results** panel holds every link; `data/results.txt` is written on each completion, and
+**Save links file** downloads the list. Pick the host in *Upload to* (Auto, or a specific one);
+the choice is remembered and sent with every job.
+
 ## When a host refuses
 
 Some hosts answer a plain request with a challenge page instead of bytes — fileditch 403s,

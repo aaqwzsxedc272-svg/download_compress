@@ -233,7 +233,7 @@ async function compressJob(job) {
   // The point of the app is the link, not the local file: hand it to a host now.
   if (AUTO_HOST) {
     const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
-    if (free > outStat.size * 3) hostJob(job).catch(() => {});
+    if (free > outStat.size * 3) hostJob(job, { order: job.hostOrder }).catch(() => {});
   }
 }
 
@@ -404,8 +404,20 @@ async function fetchThenCompress(job, ref) {
     jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading video', progress: 0 });
 
     const capture = browserCapture();
+    /* Signed links from fileditch and friends expect the page that issued them
+       as the referer; resolvers put it on the ref. */
+    const refHeaders = {};
+    if (ref && ref.referer) {
+      refHeaders.referer = ref.referer;
+      try {
+        refHeaders.origin = new URL(ref.referer).origin;
+      } catch {
+        /* keep referer only */
+      }
+    }
     const downloadOptions = {
       maxBytes: MAX_UPLOAD_BYTES,
+      extraHeaders: refHeaders,
       signal: controller.signal,
       onProgress: (received, total) => {
         const p = total ? received / total : 0;
@@ -685,7 +697,18 @@ app.post('/api/resolve', async (req, res) => {
   }
 });
 
-const ALLOWED_REF_RESOLVERS = new Set(['gofile', 'turbo', 'pixeldrain', 'direct']);
+/* Every resolver that can turn a reference back into a URL. bunkr and filester
+   were missing here, so picking a file from either sent a valid ref and got
+   "That file reference is not valid." */
+const ALLOWED_REF_RESOLVERS = new Set([
+  'gofile',
+  'turbo',
+  'pixeldrain',
+  'bunkr',
+  'filester',
+  'fileditch',
+  'direct',
+]);
 
 /**
  * Create a job.
@@ -696,6 +719,9 @@ app.post('/api/jobs', async (req, res) => {
   const source = body.source || 'url';
   const presetId = String(body.presetId || 'balanced');
   const targetMb = Number(body.targetMb) > 0 ? Number(body.targetMb) : null;
+  const hostOrder = Array.isArray(body.hostOrder)
+    ? body.hostOrder.map((id) => String(id).toLowerCase()).filter((id) => hosters.PROVIDERS[id])
+    : [];
 
   if (source === 'ref') {
     const ref = body.ref;
@@ -709,6 +735,7 @@ app.post('/api/jobs', async (req, res) => {
       targetMb,
       name: body.name,
       ref,
+      hostOrder,
     });
     res.status(201).json({ job: jobsStore.publicView(job) });
     fetchThenCompress(job, ref);
@@ -760,7 +787,7 @@ app.post('/api/jobs', async (req, res) => {
         'This server cannot extract platform links. Retrying through your browser instead.',
       );
     }
-    const job = jobsStore.createJob({ source: 'ytdlp', url, presetId, targetMb, name: body.name });
+    const job = jobsStore.createJob({ source: 'ytdlp', url, presetId, targetMb, name: body.name, hostOrder });
     jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading from the platform' });
     sources
       .downloadPlatform(url, job.dir, {
@@ -867,10 +894,12 @@ app.post('/api/jobs', async (req, res) => {
   const job = jobsStore.createJob({
     source: 'url',
     url,
+    hostOrder,
     presetId,
     targetMb,
     name: body.name || file.name,
     ref: file.ref,
+    hostOrder,
   });
   res.status(201).json({ job: jobsStore.publicView(job) });
   fetchThenCompress(job, file.ref);

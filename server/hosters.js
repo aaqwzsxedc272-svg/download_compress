@@ -272,7 +272,9 @@ function describeProviders() {
  */
 async function uploadToHoster(filePath, meta, { order, onProgress, signal, timeoutMs = 30 * 60 * 1000 } = {}) {
   const size = fs.statSync(filePath).size;
-  const candidates = (order || providerOrder())
+  /* An empty list means "no preference": fall back to the server's chain. */
+  const chain = Array.isArray(order) && order.length ? order : providerOrder();
+  const candidates = chain
     .map((id) => PROVIDERS[id])
     .filter(Boolean)
     .filter((provider) => size <= provider.maxBytes);

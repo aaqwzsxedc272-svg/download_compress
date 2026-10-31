@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+/**
+ * Regression tests for the bugs that came back from real use:
+ *   - a bunkr/fileditch ref was rejected with "That file reference is not valid"
+ *   - a fileditch share page is HTML, and its real file sits behind a
+ *     "Download" anchor on a rotating hostname.
+ */
+'use strict';
+
+process.env.ALLOW_PRIVATE_HOSTS = '1';
+/* The test host stands in for fileditchfiles.me, which the resolver only treats
+   as a share page because of its hostname. */
+process.env.FILEDITCH_HOSTS = '127.0.0.1';
+
+const assert = require('node:assert');
+const http = require('node:http');
+
+const { resolve, directUrl } = require('../shared/resolve');
+
+let passed = 0;
+let failed = 0;
+function check(name, fn) {
+  return Promise.resolve()
+    .then(fn)
+    .then(() => {
+      passed += 1;
+      console.log(`  ok   ${name}`);
+    })
+    .catch((err) => {
+      failed += 1;
+      console.log(`  FAIL ${name}\n       ${err.message}`);
+    });
+}
+
+const PLAYER = `<!doctype html><html><head><title>WlVHBYDPhhHcSTmGUcvy.mp4</title></head>
+<body><div>WlVHBYDPhhHcSTmGUcvy.mp4</div><div>1.76 GB</div>
+<a class="dl" href="/signed/abc123">⬇ Download</a>
+<a href="https://abuse.fileditch.com/b78/x.mp4">🚨 Report</a></body></html>`;
+
+(async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/b78/file.mp4') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(PLAYER);
+      return;
+    }
+    if (req.url === '/signed/abc123') {
+      res.writeHead(200, { 'content-type': 'video/mp4', 'content-length': '8' });
+      res.end(Buffer.alloc(8, 1));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  await check('a fileditch player page resolves to its signed download link', async () => {
+    const result = await resolve(`${base}/b78/file.mp4`);
+    assert.equal(result.resolver, 'fileditch');
+    assert.equal(result.files.length, 1);
+    assert.match(result.files[0].ref.url, /\/signed\/abc123$/);
+  });
+
+  await check('the file name and size are read from the page', async () => {
+    const result = await resolve(`${base}/b78/file.mp4`);
+    assert.equal(result.files[0].name, 'WlVHBYDPhhHcSTmGUcvy.mp4');
+    assert.equal(result.files[0].size, Math.round(1.76 * 1024 ** 3));
+  });
+
+  await check('the ref remembers the page as its referer', async () => {
+    const result = await resolve(`${base}/b78/file.mp4`);
+    assert.equal(result.files[0].ref.referer, `${base}/b78/file.mp4`);
+  });
+
+  await check('directUrl turns that ref back into the signed link', async () => {
+    const result = await resolve(`${base}/b78/file.mp4`);
+    const url = await directUrl(result.files[0].ref);
+    assert.match(url, /\/signed\/abc123$/);
+  });
+
+  await check('every resolver that can produce a ref has a direct()', () => {
+    const { RESOLVERS } = require('../shared/resolve');
+    for (const id of ['gofile', 'turbo', 'pixeldrain', 'bunkr', 'filester', 'fileditch', 'direct']) {
+      const resolver = RESOLVERS.find((r) => r.id === id);
+      assert.ok(resolver, `${id} is not registered`);
+      assert.equal(typeof resolver.direct, 'function', `${id} has no direct()`);
+    }
+  });
+
+  await check('the server accepts refs from every one of them', async () => {
+    const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'server.js'), 'utf8');
+    const block = /ALLOWED_REF_RESOLVERS = new Set\(\[([\s\S]*?)\]\)/.exec(source);
+    assert.ok(block, 'allow-list not found');
+    for (const id of ['gofile', 'turbo', 'pixeldrain', 'bunkr', 'filester', 'fileditch', 'direct']) {
+      assert.ok(block[1].includes(`'${id}'`), `${id} is missing from ALLOWED_REF_RESOLVERS`);
+    }
+  });
+
+  server.close();
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed ? 1 : 0);
+})();

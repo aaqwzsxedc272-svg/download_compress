@@ -438,10 +438,18 @@ function setBusy(delta) {
   $('span', btn).textContent = state.busy > 0 ? 'Working…' : 'Squeeze';
 }
 
+const STORAGE_HOST = 'squeeze.host';
+
+/** The upload-host preference, as a chain the server understands. */
+function hostOrderChoice() {
+  const value = localStorage.getItem(STORAGE_HOST) || 'auto';
+  return value && value !== 'auto' ? [value] : [];
+}
+
 function currentOptions() {
   const targetRaw = $('#targetMb')?.value;
   const targetMb = Number(targetRaw) > 0 ? Math.round(Number(targetRaw)) : null;
-  return { presetId: state.presetId, targetMb };
+  return { presetId: state.presetId, targetMb, hostOrder: hostOrderChoice() };
 }
 
 
@@ -1403,6 +1411,27 @@ function bindDropzone() {
 
 const STORAGE_AUTOSTOP = 'squeeze.autoStop';
 
+/** Fill the "Upload to" dropdown with the file hosts this server can reach. */
+function renderHostChoices(providers) {
+  const pick = $('#hostPick');
+  if (!pick) return;
+  const saved = localStorage.getItem(STORAGE_HOST) || 'auto';
+  const list = Array.isArray(providers) ? providers : [];
+  pick.textContent = '';
+  const auto = document.createElement('option');
+  auto.value = 'auto';
+  auto.textContent = 'Auto (first that works)';
+  pick.append(auto);
+  for (const provider of list) {
+    const option = document.createElement('option');
+    option.value = provider.id;
+    option.textContent = provider.label;
+    pick.append(option);
+  }
+  pick.value = [...pick.options].some((o) => o.value === saved) ? saved : 'auto';
+  if (!list.length) pick.disabled = true;
+}
+
 function formatDisk(bytes) {
   if (!bytes && bytes !== 0) return '—';
   const gb = bytes / 1073741824;
@@ -1421,6 +1450,13 @@ function renderDisk(disk) {
   const free = disk.freeBytes;
   const pct = disk.percentFree;
   text.textContent = `${formatDisk(free)} free of ${formatDisk(disk.totalBytes)}`;
+  const fill = $('#diskBarFill');
+  if (fill) {
+    const usedPct = pct == null ? 0 : Math.max(0, Math.min(100, 100 - pct));
+    fill.style.width = `${usedPct}%`;
+    fill.classList.toggle('is-low', pct != null && pct < 15);
+    fill.classList.toggle('is-critical', pct != null && pct < 7);
+  }
   pill.title = `${formatDisk(disk.usedBytes)} used · ${formatDisk(free)} free (${pct}%). ` +
     'A video needs about three times its own size while it encodes.';
   pill.classList.toggle('is-low', pct != null && pct < 15);
@@ -1570,8 +1606,17 @@ async function loadResults() {
   }
 }
 
+function bindStickyHeader() {
+  const header = $('#siteHeader');
+  if (!header) return;
+  const onScroll = () => header.classList.toggle('is-compact', window.scrollY > 24);
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+}
+
 async function boot() {
   bindDropzone();
+  bindStickyHeader();
   $('#goBtn').addEventListener('click', squeeze);
   $('#sampleBtn').addEventListener('click', squeezeSample);
   $('#clearDone').addEventListener('click', () => {
@@ -1608,6 +1653,7 @@ async function boot() {
       ? 'yt-dlp is installed, so YouTube / TikTok / Instagram links work too.'
       : 'No yt-dlp on this server: direct video links and file uploads work. Platform links fall back to your browser.';
     $('#limitNote').textContent = `uploads up to ${health.maxUploadMb >= 1024 ? `${Math.round(health.maxUploadMb / 1024)} GB` : `${health.maxUploadMb} MB`}`;
+    renderHostChoices(health.hosters);
   } catch {
     renderPresets([
       { id: 'tiny', label: 'Tiny', hint: '' },
@@ -1624,6 +1670,19 @@ async function boot() {
   await loadResults();
   setInterval(refreshStatus, Number(localStorage.getItem('squeeze.statusMs')) || 15000);
   setInterval(loadResults, 30000);
+
+  const hostPick = $('#hostPick');
+  if (hostPick) {
+    hostPick.addEventListener('change', () => {
+      localStorage.setItem(STORAGE_HOST, hostPick.value);
+      showAlert(
+        hostPick.value === 'auto'
+          ? 'Finished files go to the first host that accepts them.'
+          : `Finished files go to ${hostPick.options[hostPick.selectedIndex].textContent}.`,
+        'ok',
+      );
+    });
+  }
 
   const autoStopToggle = $('#autoStop');
   if (autoStopToggle) {

@@ -649,6 +649,118 @@
     });
   }
 
+  /* ------------------------------------------------- fileditch / theditch */
+  /* These share hosts serve an HTML player at the file's own URL and hide the
+     real file behind a signed link on a rotating hostname, e.g.
+       fileditchfiles.me/b78/x.mp4  ->  lumistretcheseverymorning.xyz/MTc5...
+     The only reliable way in is to read the page's "Download" anchor. */
+  /* The share hosts move between domains, and the signed links live on random
+     ones, so the list can be extended without a code change:
+       FILEDITCH_HOSTS=fileditchfiles.me,theirdomain.example */
+  const fileditchHosts = (process.env.FILEDITCH_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+  const FILEDITCH_HOST = new RegExp(
+    `(^|\\.)(${[
+      'fileditch\\.com',
+      'fileditchfiles\\.me',
+      'fileditchvids\\.st',
+      'theditch\\.st',
+      'deltabit\\.co',
+      'new\\.fileditch\\.com',
+      ...fileditchHosts.map((host) => host.replace(/\./g, '\\.')),
+    ].join('|')})$`,
+    'i',
+  );
+
+  function fileditchLinks(html, pageUrl) {
+    const out = [];
+    const push = (raw) => {
+      if (!raw) return;
+      let absolute;
+      try {
+        absolute = new URL(raw.replace(/&amp;/g, '&'), pageUrl).href;
+      } catch {
+        return;
+      }
+      if (!/^https?:/i.test(absolute)) return;
+      if (/abuse\.fileditch\.com|new\.fileditch\.com\/faq|\/report/i.test(absolute)) return;
+      if (!out.includes(absolute)) out.push(absolute);
+    };
+
+    // The download anchor, whatever its classes look like.
+    const anchorRe = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,160}?)<\/a>/gi;
+    let m;
+    while ((m = anchorRe.exec(html))) {
+      const [, href, text] = m;
+      if (/download|⬇|save file/i.test(text) && !/report/i.test(text)) push(href);
+    }
+    // Player sources, in case the page streams the file directly.
+    const srcRe = /<(?:video|source)\b[^>]*src=["']([^"']+)["']/gi;
+    while ((m = srcRe.exec(html))) push(m[1]);
+    const og = /<meta[^>]+property=["']og:video(?::url)?["'][^>]+content=["']([^"']+)["']/i.exec(html);
+    if (og) push(og[1]);
+
+    return out;
+  }
+
+  function fileditchMeta(html) {
+    const name = (/<title>\s*([^<]{1,180}?)\s*<\/title>/i.exec(html) || [])[1] || null;
+    const size = /(\d+(?:\.\d+)?)\s*(GB|MB|TB)\b/i.exec(html);
+    const toBytes = { TB: 1024 ** 4, GB: 1024 ** 3, MB: 1024 ** 2 };
+    return {
+      name: name && /\.(mp4|mkv|webm|mov|avi)$/i.test(name) ? name : null,
+      size: size ? Math.round(Number(size[1]) * toBytes[size[2].toUpperCase()]) : 0,
+    };
+  }
+
+  const fileditch = {
+    id: 'fileditch',
+    match: (url) => {
+      const parsed = safeUrl(url);
+      if (!parsed || !FILEDITCH_HOST.test(parsed.hostname)) return null;
+      return 'page';
+    },
+    async list(url) {
+      const res = await fetchWithTimeout(url, {
+        headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml' },
+      }).catch(() => null);
+      if (!res || !res.ok) {
+        const viaBrowser = await pageBrowserFiles(url);
+        if (viaBrowser && viaBrowser.length) return { resolver: 'fileditch', title: null, files: viaBrowser };
+        throw new ResolveError(`fileditch answered HTTP ${res ? res.status : 'nothing'}.`, 'FILEDITCH_FAILED');
+      }
+      const html = await res.text();
+      const links = fileditchLinks(html, url);
+      if (!links.length) {
+        const viaBrowser = await pageBrowserFiles(url);
+        if (viaBrowser && viaBrowser.length) return { resolver: 'fileditch', title: null, files: viaBrowser };
+        throw new ResolveError('fileditch did not expose a download link on that page.', 'FILEDITCH_NO_LINK');
+      }
+      const meta = fileditchMeta(html);
+      return {
+        resolver: 'fileditch',
+        title: null,
+        files: links.slice(0, 10).map((link, index) => {
+          let name = meta.name || `video-${index + 1}.mp4`;
+          if (index > 0) name = name.replace(/(\.\w+)$/, `-${index + 1}$1`);
+          return {
+            id: link,
+            name,
+            size: index === 0 ? meta.size : 0,
+            mime: 'video/mp4',
+            kind: 'video',
+            ref: { resolver: 'fileditch', url: link, page: url, referer: url, name },
+          };
+        }),
+      };
+    },
+    async direct(ref) {
+      return ref.url;
+    },
+  };
+
   const page = {
     id: 'page',
     match: (url) => {
@@ -717,7 +829,7 @@
 
   /* ----------------------------------------------------------------- registry */
 
-  const RESOLVERS = [gofile, turbo, pixeldrain, bunkr, filester, direct, page];
+  const RESOLVERS = [gofile, turbo, pixeldrain, bunkr, filester, fileditch, direct, page];
 
   /** Videos first, biggest first — the file people usually want. */
   function orderFiles(files) {

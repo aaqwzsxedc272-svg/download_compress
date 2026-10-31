@@ -111,6 +111,9 @@ function createJob(fields = {}) {
     presetId: fields.presetId || 'balanced',
     targetMb: fields.targetMb || null,
     ref: fields.ref || null,
+    /* Preferred upload hosts for this job, in order; empty means the server's
+       default chain. */
+    hostOrder: Array.isArray(fields.hostOrder) ? fields.hostOrder.slice(0, 6) : [],
     sourceBytes: 0,
     outputBytes: 0,
     meta: null,

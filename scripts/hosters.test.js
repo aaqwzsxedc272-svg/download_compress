@@ -193,6 +193,12 @@ async function readStreamLength(body) {
     delete process.env.HOSTERS;
   });
 
+  await test('an empty order list means "no preference", not "no hosts"', async () => {
+    stubFetch(() => ({ status: 200, body: { id: 'abc' } }));
+    const result = await hosters.uploadToHoster(filePath, { name: 'x.mp4' }, { order: [] });
+    assert.ok(result.url, 'upload should have used the default chain');
+  });
+
   await fsp.rm(tmpDir, { recursive: true, force: true });
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

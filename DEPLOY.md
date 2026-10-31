@@ -1,99 +1,73 @@
 # Deploying Squeeze for free, in the cloud, without a card
 
 Squeeze needs three things from a host: **outbound internet** (to fetch your links and upload
-the result), **CPU to encode video**, and **staying up when you are not watching**. In 2026 the
-free-without-a-card tier gives you the first two and only partly the third. This page is honest
-about that and tells you which button to press.
+the result), **CPU to encode video**, and **staying up when you are not watching**. In late 2026
+the free-without-a-card tier gives you the first two and only partly the third. This page says
+what is actually true right now and what to press.
 
-> **Hugging Face is out.** Since July 2026 the Hub requires a paid plan to *create* anything
-> that runs compute: _"Static Spaces are free for everyone. Gradio and Docker Spaces run on
-> compute and require a paid plan to create: PRO for personal accounts, Team or Enterprise for
-> organizations."_ ([spaces-overview](https://huggingface.co/docs/hub/spaces-overview)).
->
-> **Render is out too, in practice.** Its docs still say the free plan needs no card, but new
-> accounts are stopped by a payment step when creating a web service (October 2026).
+## What died, so nobody wastes another evening
 
----
+| Host | Status |
+| --- | --- |
+| **Hugging Face Spaces** | since July 2026 creating *any* Space that runs compute (Gradio or Docker) needs a paid plan — [docs](https://huggingface.co/docs/hub/spaces-overview): *"Static Spaces are free for everyone… requires a paid plan to create: PRO"* |
+| **Render** | its docs still say no card, but new accounts are stopped at a payment step when creating a web service |
+| **Zeabur** | shutting down — no new sign-ups; everything stops Dec 31, 2026 ([announcement](https://zeabur.com/blogs/zeabur-is-shutting-down)) |
+| **Koyeb / Fly.io / Cloud Run / Oracle** | card required (Koyeb asks for a $29 hold) |
 
-## Card-free routes, best first
+## Card-free routes that still exist
 
-| Route | CPU / RAM | Card | Notes |
+| Route | CPU / RAM | Card | Shape |
 | --- | --- | --- | --- |
-| **Zeabur free trial** | up to 1 vCPU / 2 GB | no | $5/month credit, auto-sleep, GitHub login |
-| **Back4App Containers** (<https://www.back4app.com/containers>) is the other card-free option:
-one container, 0.25 CPU, 256 MB RAM, 100 GB transfer, free forever, and their own signup page
-says *no credit card required*.
-
-1. Sign up with GitHub, then **New container → GitHub repo → this repo**; it builds from the
-   `Dockerfile` unchanged.
-2. Set `MAX_UPLOAD_MB=250` and stick to `tiny`/`small` — 256 MB will not survive a 1080p encode.
-3. Their free container stops after 60 minutes per deploy, so treat it as a demo host.
-
-**SnapDeploy** | 0.25 vCPU / 512 MB | no | 100 running hours a month |
-| **GitHub Codespaces** | 2 vCPU / 8 GB | no | only while the session is open |
+| **SnapDeploy** | 0.25 vCPU / 512 MB | no | real website, sleeps when idle, 100 h/month |
+| **GitHub Codespaces** | 2 vCPU / 8 GB | no | a session you open; best CPU by far |
+| **Back4App Containers** | 0.25 vCPU / 256 MB | no | permanent, but a demo-sized box |
 | Your own machine + tunnel | all of it | no | fastest, but the PC must stay on |
 
-Zeabur is the only one that gives a real vCPU and a real 2 GB of RAM without a card, so it is
-the recommendation for "best quality while keeping quality".
-
 ---
 
-## 1. Zeabur — free, no card, up to 1 vCPU / 2 GB
+## 1. SnapDeploy — free, no card, a real website
 
-The repo already has a working `Dockerfile`, so there is nothing to configure.
-
-1. Merge the open PR into `main` — Zeabur deploys whatever branch you pick, `main` by default.
-2. Sign in at <https://zeabur.com> with **GitHub** (no card for the free trial plan).
-3. **Create Project** → pick a free region → **Add Service → GitHub** → choose
-   `download_compress`. Zeabur detects the `Dockerfile` and builds it.
-4. In the service's **Networking** tab, click **Generate Domain**. That URL is your app.
-5. Open it, paste a link, pick a preset, press **Compress**, close the tab.
-
-Free-trial facts that matter:
-
-| Limit | Reality |
-| --- | --- |
-| $5 credit per month | plenty if the service sleeps between jobs; heavy 24/7 use will burn it |
-| max 1 vCPU / 2 GB per service | choose 1000m CPU / 2048 MB in the service settings |
-| auto-sleep when idle | the next visit cold-starts in a few seconds; a running job keeps it awake |
-| no SLA | fine for personal use |
-
-Recommended service settings: `MAX_CONCURRENT=1`, `MAX_UPLOAD_MB=1800` (2 GB of RAM handles
-that), `DATA_DIR=/data`.
-
-At 1 vCPU the `high` preset is usable on normal clips; `balanced` is the sweet spot for long
-ones.
-
----
-
-## 2. Back4App and SnapDeploy — smaller, but card-free forever
-
-**Back4App Containers** (<https://www.back4app.com/containers>) is the other card-free
-option: one container, 0.25 CPU, 256 MB RAM, 100 GB transfer, free forever.",
-  "Sign up with GitHub — their own signup page says *no credit card required*. New container →
-  GitHub repo → this repo → build from the `Dockerfile`. Set `MAX_UPLOAD_MB=250` and keep the
-  `tiny`/`small` presets: 256 MB will not survive a 1080p encode. Their free container is also
-  capped at 60 minutes per deploy, so it is a demo host, not a home.
-
-**SnapDeploy** (<https://snapdeploy.dev>) runs Docker containers on AWS Fargate. Free tier: **4 containers,
-512 MB / 0.25 vCPU, 100 running hours a month, no card, no expiry**, sleeping after 15 minutes
-idle and waking on the next visit. The `Dockerfile` in this repo works unchanged.
+<https://snapdeploy.dev> runs Docker containers on AWS Fargate. Free tier: **4 containers,
+512 MB / 0.25 vCPU, 100 running hours a month, 10 deploys a day, no card, no expiry.** It sleeps
+after 15 minutes idle and wakes on the next visit.
 
 1. Sign up with GitHub or email (no card).
-2. **New container → GitHub repo → this repo**, small container.
-3. Set `MAX_UPLOAD_MB=700`, `MAX_CONCURRENT=1`, `DATA_DIR=/data`.
-4. Deploy; you get `https://<name>.containers.snapdeploy.app`.
+2. **New container → GitHub repo → this repo**; it builds the `Dockerfile` unchanged.
+3. Environment: `MAX_UPLOAD_MB=1600`, `MAX_CONCURRENT=1`, `DATA_DIR=/data`.
+4. **Deploy** → you get `https://<name>.containers.snapdeploy.app`. Paste, compress, close the tab.
 
-100 hours a month is roughly four hours a day of uptime — fine for occasional use, not a
-permanent link.
+100 hours a month is about three hours a day of uptime, so treat it as a personal tool, not a
+public service. With 512 MB and a quarter core, `small`/`tiny` are the sane presets for anything
+long; `balanced` for short clips.
 
 ---
 
-## 3. GitHub Codespaces — 2 vCPU, no card, no signup beyond GitHub
+## 2. GitHub Codespaces — 2 vCPU, 8 GB, no card, works today
 
-Unchanged from what ships in the repo: open the repo → **Code → Codespaces → Create**, the
-`.devcontainer` installs dependencies and starts the server, then **Ports → 3000 → Public**.
-Best for "one big file today", not for a permanent URL.
+The most capable free option, and the one thing that cannot be shut down under you, because you
+already own the account. It is a session rather than a permanent site: you open it when you need
+it, and it stops when it idles out.
+
+1. Open the repo on GitHub → **Code → Codespaces → Create codespace on main**.
+2. The `.devcontainer` here installs dependencies and starts the server on port 3000.
+3. **Ports** tab → right-click 3000 → **Port Visibility → Public** → open the forwarded URL.
+4. Settings → Codespaces → idle timeout **240 minutes**, so a long encode is not cut off.
+
+Free personal accounts get a monthly quota (60 hours on the 2-core machine). At 2 vCPU the
+`high` preset is genuinely pleasant.
+
+---
+
+## 3. Back4App Containers — free forever, but only 256 MB
+
+<https://www.back4app.com/containers> gives one container, 0.25 CPU, 256 MB RAM and 100 GB of
+transfer, free forever, no card (their signup page says so).
+
+1. Sign up with GitHub → **New container → GitHub repo → this repo**; it builds the
+   `Dockerfile` unchanged.
+2. Set `MAX_UPLOAD_MB=250`, keep `MAX_CONCURRENT=1`, use `tiny`/`small` only — 256 MB will not
+   survive a 1080p encode.
+3. Their free container stops after 60 minutes per deploy, so it is a demo host, not a home.
 
 ---
 
@@ -104,29 +78,32 @@ npm install && npm start          # http://localhost:3000
 npx cloudflared tunnel --url http://localhost:3000
 ```
 
-Free, no account, real CPU. Only route where `high` on a long video is quick.
+Free, no account, real CPU. The only route where `high` on a long video is quick. Works from a
+laptop, a home NAS or a Raspberry Pi 4/5 with Node 18+.
 
 ---
 
-## Appendix: Render, if your account is not asked for a card
+## Appendix — if you already have a paid account
 
-`render.yaml` is still in the repo (free plan, `runtime: node`, no Dockerfile) and
-`.github/workflows/keepalive.yml` keeps an idle instance from sleeping. New accounts are
-stopped by a payment step, so treat this as a fallback only.
+- **Hugging Face PRO**: `HF_TOKEN=hf_xxx ./scripts/deploy-space.sh <user> [space]` builds a
+  Space bundle (`scripts/package-space.js`), creates the Space through the API and pushes it.
+- **Render, if it does not ask you for a card**: `render.yaml` is a free-plan blueprint on the
+  Node runtime, and `.github/workflows/keepalive.yml` pings `/api/health` every 10 minutes so an
+  idle instance never sleeps.
 
 ---
 
 ## Verify any deployment in one command
 
 ```bash
-node scripts/verify-deploy.js https://squeeze-xxxx.onrender.com --preset tiny
+node scripts/verify-deploy.js https://your-app.example --preset tiny
 ```
 
-Checks the app answers, presets are served, hosters configured, yt-dlp present (advisory),
-outbound internet works (advisory), a real link resolves, a real video compresses smaller, a
-share link is created, and **that share link is publicly downloadable**. Exits non-zero only on
-real failures; `--keep` keeps the uploaded test file. Use `--preset tiny` on the free tier so
-the test finishes fast.
+Checks the app answers, presets are served, hosters are configured, yt-dlp is present
+(advisory), outbound internet works (advisory), a real link resolves, a real video compresses
+smaller, a share link is created, and **that share link is publicly downloadable**. Exits
+non-zero only on real failures; `--keep` keeps the uploaded test file. On a small free box use
+`--preset tiny` so the test finishes quickly.
 
 ---
 
@@ -140,5 +117,5 @@ the test finishes fast.
 | bunkr | yes | no — Cloudflare-protected |
 | filester.me | yes | no — DDoS-Guard protected |
 
-Render and SnapDeploy both give the server real internet, so every row works. Open
-`/diagnostics` on the deployed app to confirm which rows pass on that host.
+Every route above gives the server real internet, so all rows work. Open `/diagnostics` on the
+deployed app to confirm which rows pass on that host.

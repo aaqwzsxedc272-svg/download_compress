@@ -16,20 +16,18 @@ a free file host and gives you a share link — no account, no card, nothing to 
 
 **Want it online for free?** Card-free routes that keep it in the cloud:
 
-- **Zeabur** (recommended) — free trial plan, up to 1 vCPU / 2 GB, GitHub login, no card. The
-  `Dockerfile` is picked up automatically: create a project → *Deploy from GitHub* → this repo →
-  *Networking → Generate Domain*.
-- **Back4App Containers** — free forever, no card, but only 256 MB: `tiny`/`small` presets only.
-- **SnapDeploy** — free, no card, 512 MB / 0.25 vCPU, 100 running hours a month.
+- **SnapDeploy** — free, no card, 512 MB / 0.25 vCPU, 100 running hours a month. Builds the
+  `Dockerfile` unchanged: new container → GitHub repo → this repo → deploy.
 - **GitHub Codespaces** — 2 vCPU, 8 GB, no card; the `.devcontainer` starts the server and
-  exposes port 3000.
+  exposes port 3000. Best CPU of any free option.
+- **Back4App Containers** — free forever, no card, but 256 MB: `tiny`/`small` only.
 - **Your own computer + a free tunnel** — `npm start` then
   `npx cloudflared tunnel --url http://localhost:3000`.
 
-Render's free plan asks new accounts for a card, and Hugging Face requires PRO ($9/mo) for any
-Space that runs compute since July 2026, so neither is in the free list. `render.yaml` and
-`scripts/deploy-space.sh` remain for anyone who already has those accounts. Limits and exact
-steps are in [DEPLOY.md](DEPLOY.md).
+The obvious names stopped being free: Hugging Face requires PRO for any Space that runs compute,
+Render asks new accounts for a card, and Zeabur is shutting down in December 2026. `render.yaml`
+and `scripts/deploy-space.sh` stay in the repo for anyone who already has those accounts. Exact
+steps and limits are in [DEPLOY.md](DEPLOY.md).
 
 Whichever route you pick, `node scripts/verify-deploy.js <url>` proves the whole chain works
 from the outside: app up, presets, hosters, a real link resolved, a real video compressed, and

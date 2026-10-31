@@ -79,13 +79,22 @@ async function api(path, options = {}) {
 
 /* ------------------------------------------------------------------- alerts */
 
-function showAlert(message, kind = 'error', { html = false, timeout = 0 } = {}) {
+function showAlert(message, kind = 'error', { timeout = 0, href = null, hrefLabel = 'Open link' } = {}) {
   const el = $('#alert');
   if (!el) return;
   el.hidden = false;
   el.className = `alert ${kind === 'info' ? 'info' : ''}`;
-  if (html) el.innerHTML = message;
-  else el.textContent = message;
+  el.textContent = message;
+  if (href) {
+    const link = document.createElement('a');
+    link.className = 'btn';
+    link.style.marginLeft = '12px';
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = hrefLabel;
+    el.append(' ', link);
+  }
   clearTimeout(el._timer);
   if (timeout) el._timer = setTimeout(() => hideAlert(), timeout);
 }
@@ -377,50 +386,57 @@ function supportsStreamingUpload() {
   }
 }
 
-async function relayThroughBrowser(url, { platform } = {}) {
+/**
+ * The browser already knows (or can find) the real file URL, so it fetches the
+ * bytes and streams them to the encoder. Used whenever the server itself has
+ * no route to the host.
+ */
+async function relayBytes(directUrl, { pageUrl, filename } = {}) {
   const { token } = await api('/api/relay-token', { method: 'POST' });
   const opts = currentOptions();
+  const label = filename || basename(directUrl);
 
-  showTransfer(`Fetching video in your browser…`, null, shortHost(url));
+  showTransfer(`Fetching ${label} in your browser…`, null, '');
 
   let response;
   try {
-    response = await fetch(url, { mode: 'cors', credentials: 'omit', redirect: 'follow' });
-  } catch (err) {
+    response = await fetch(directUrl, { mode: 'cors', credentials: 'omit', redirect: 'follow' });
+  } catch {
     throw Object.assign(
       new Error(
-        platform
-          ? `This server can't extract ${platform} links (no yt-dlp installed), and your browser can't fetch the video directly. Download the video, then drop the file here.`
-          : `Your browser couldn't fetch that link (the site blocks cross-origin requests). Save the video to your device, then drag the file here — compression works exactly the same.`,
+        `${shortHost(directUrl) || 'That host'} won't let a browser read its files directly (cross-origin blocked). ` +
+          'Open the link, download the file, then drop it on this page — the compression is identical.',
       ),
-      { code: 'BROWSER_FETCH' },
+      { code: 'CORS_BLOCKED' },
     );
   }
 
   if (!response.ok) {
-    throw new Error(`The link returned HTTP ${response.status}. If it needs a login, download it first and drop the file here.`);
+    throw Object.assign(
+      new Error(`The file host answered HTTP ${response.status}. It may be rate limited or need a login.`),
+      { code: 'BAD_STATUS' },
+    );
   }
 
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('text/html')) {
-    throw new Error('That link is a web page, not a video file. Open it, save the video, then drop the file here.');
+    throw Object.assign(
+      new Error('That link returned a web page instead of a video file.'),
+      { code: 'HTML_PAGE' },
+    );
   }
 
   const total = Number(response.headers.get('content-length')) || 0;
-  const qs = new URLSearchParams({
-    url,
-    filename: basename(url),
-    presetId: opts.presetId,
-  });
+  const qs = new URLSearchParams({ filename: label, presetId: opts.presetId });
+  if (pageUrl) qs.set('url', pageUrl);
   if (opts.targetMb) qs.set('targetMb', String(opts.targetMb));
   const endpoint = `/api/relay/${token}?${qs.toString()}`;
 
   let sent = 0;
   const progress = () => {
-    const p = total ? sent / total : null;
     showTransfer(
-      total ? 'Sending to the compressor…' : 'Sending to the compressor…',
-      p,
+      'Sending to the compressor…',
+      total ? sent / total : null,
       total ? `${formatBytes(sent)} / ${formatBytes(total)}` : formatBytes(sent),
     );
   };
@@ -444,14 +460,9 @@ async function relayThroughBrowser(url, { platform } = {}) {
     return data.job;
   }
 
-  // Fallback: buffer the whole file, then upload with progress events.
+  // No streaming uploads (older Safari): buffer, then send with progress events.
   const blob = await response.blob();
-  const job = await uploadBlob(blob, {
-    endpoint,
-    name: basename(url),
-    url,
-  });
-  return job;
+  return uploadBlob(blob, { endpoint, name: label });
 }
 
 function uploadBlob(blob, { endpoint, name, url, method = 'PUT' }) {
@@ -477,32 +488,225 @@ function uploadBlob(blob, { endpoint, name, url, method = 'PUT' }) {
   });
 }
 
+/* ------------------------------------------------------------------- picker */
+
+const VIDEO_KIND_LABEL = { video: 'video', other: 'file' };
+
+function clearPicker() {
+  const existing = document.getElementById('pickerPanel');
+  if (existing) existing.remove();
+}
+
+/**
+ * Show the files found behind a link so one can be chosen.
+ * mode 'server'  -> the server downloads it itself
+ * mode 'browser' -> your browser fetches the bytes and streams them over
+ */
+function showPicker({ pageUrl, resolver, title, files, mode }) {
+  clearPicker();
+  const panel = document.createElement('section');
+  panel.id = 'pickerPanel';
+  panel.className = 'card picker';
+
+  const head = document.createElement('div');
+  head.className = 'picker-head';
+  const heading = document.createElement('div');
+  heading.innerHTML = '<div class="picker-title"></div><div class="picker-sub"></div>';
+  $('.picker-title', heading).textContent = title || shortHost(pageUrl) || 'Choose a file';
+  const count = files.length;
+  $('.picker-sub', heading).textContent =
+    `${count} file${count === 1 ? '' : 's'} found · ${resolver}` +
+    (mode === 'browser' ? ' · fetched through your browser' : '');
+  head.append(heading);
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'btn tiny';
+  close.textContent = 'Dismiss';
+  close.addEventListener('click', clearPicker);
+  head.append(close);
+  panel.append(head);
+
+  const list = document.createElement('div');
+  list.className = 'picker-list';
+
+  for (const file of files) {
+    const row = document.createElement('div');
+    row.className = 'picker-row';
+
+    const info = document.createElement('div');
+    info.className = 'picker-file';
+    const name = document.createElement('div');
+    name.className = 'picker-name';
+    name.textContent = file.name;
+    name.title = file.name;
+    const meta = document.createElement('div');
+    meta.className = 'picker-meta';
+    const bits = [];
+    if (file.size) bits.push(formatBytes(file.size));
+    bits.push(VIDEO_KIND_LABEL[file.kind] || 'file');
+    if (mode === 'browser' && file.size > 1.5 * 1024 ** 3) {
+      bits.push('large — your browser downloads it in full first');
+    }
+    meta.textContent = bits.join(' · ');
+    info.append(name, meta);
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn download';
+    button.textContent = 'Compress';
+
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      const original = button.textContent;
+      button.textContent = 'Starting…';
+      setBusy(1);
+      try {
+        let job;
+        if (mode === 'server') {
+          const opts = currentOptions();
+          ({ job } = await api('/api/jobs', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              source: 'ref',
+              ref: file.ref,
+              name: file.name,
+              pageUrl,
+              ...opts,
+            }),
+          }));
+        } else {
+          const direct = await window.SqueezeResolve.directUrl(file.ref);
+          job = await relayBytes(direct, { pageUrl, filename: file.name });
+        }
+        trackJob(job);
+        clearPicker();
+      } catch (err) {
+        showAlert(err.message, 'error');
+        button.disabled = false;
+        button.textContent = original;
+      } finally {
+        hideTransfer();
+        setBusy(-1);
+      }
+    });
+
+    row.append(info, button);
+    list.append(row);
+  }
+
+  panel.append(list);
+  $('#alert').insertAdjacentElement('beforebegin', panel);
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 /* ------------------------------------------------------------------ actions */
+
+const NETWORKISH = new Set(['BLOCKED', 'NETWORK', 'TIMEOUT', 'UNREACHABLE', 'NEED_BROWSER', 'BOTH_FAILED']);
+
+const PLATFORM_HOSTS = [
+  'youtube.com', 'youtu.be', 'tiktok.com', 'instagram.com', 'facebook.com', 'fb.watch',
+  'x.com', 'twitter.com', 'vimeo.com', 'dailymotion.com', 'reddit.com', 'twitch.tv',
+];
+
+function platformOf(url) {
+  const host = shortHost(url);
+  return PLATFORM_HOSTS.find((p) => host === p || host.endsWith(`.${p}`)) || null;
+}
+
+const firstSentence = (text) => String(text || '').split(/(?<=\.)\s/)[0].replace(/\.$/, '');
+const capitalise = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+
+/** Explain a failure using both the server's and the browser's point of view. */
+function describeFailure(url, serverErr, browserErr) {
+  const host = shortHost(url) || 'that host';
+  const parts = [];
+
+  if (serverErr) {
+    parts.push(
+      NETWORKISH.has(serverErr.code)
+        ? `this server has no internet route to ${host}`
+        : firstSentence(serverErr.message).toLowerCase(),
+    );
+  }
+  if (browserErr) {
+    parts.push(
+      NETWORKISH.has(browserErr.code)
+        ? 'your browser could not read it cross-origin either'
+        : `your browser reported: ${firstSentence(browserErr.message).toLowerCase()}`,
+    );
+  }
+
+  let sentence = parts.length === 2
+    ? `${capitalise(parts[0])}, and ${parts[1]}.`
+    : `${capitalise(parts[0] || 'That link could not be read')}.`;
+
+  const platform = platformOf(url);
+  if (platform && state.health && !state.health.platformDownloads) {
+    sentence += ` ${capitalise(platform)} links need yt-dlp on the server, which this one does not have.`;
+  }
+
+  sentence += ' Open the link, download the file, then drop it here — the compression is identical.';
+  return sentence;
+}
+
+/** Resolve with the server first, then fall back to resolving in the browser. */
+async function resolveLink(url) {
+  try {
+    const result = await api('/api/resolve', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    return { ...result, mode: 'server' };
+  } catch (serverErr) {
+    // The server often cannot reach consumer file hosts; browsers usually can.
+    if (!window.SqueezeResolve) throw serverErr;
+    try {
+      const result = await window.SqueezeResolve.resolve(url);
+      return { ...result, mode: 'browser' };
+    } catch (browserErr) {
+      throw Object.assign(new Error(describeFailure(url, serverErr, browserErr)), {
+        code: 'BOTH_FAILED',
+        href: url,
+      });
+    }
+  }
+}
 
 async function handleLink(raw) {
   const url = raw.trim();
   if (!url) return;
 
-  const probe = await api('/api/probe', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ url }),
-  });
+  showTransfer('Reading the link…', null, shortHost(url));
+  let resolved;
+  try {
+    resolved = await resolveLink(url);
+  } finally {
+    hideTransfer();
+  }
 
-  if (probe.serverCanFetch) {
-    const opts = currentOptions();
-    const { job } = await api('/api/jobs', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ source: 'url', url: probe.url, ...opts }),
-    });
-    trackJob(job);
+  const videos = resolved.files.filter((file) => file.kind === 'video');
+  const files = videos.length ? videos : resolved.files;
+
+  if (files.length > 1) {
+    showPicker({ pageUrl: url, resolver: resolved.resolver, title: resolved.title, files, mode: resolved.mode });
     return;
   }
 
-  showTransfer('Opening the link in your browser…', null, shortHost(probe.url));
-  const job = await relayThroughBrowser(probe.url, { platform: probe.platform });
-  hideTransfer();
+  const file = files[0];
+  let job;
+  if (resolved.mode === 'server') {
+    ({ job } = await api('/api/jobs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: 'ref', ref: file.ref, name: file.name, pageUrl: url, ...currentOptions() }),
+    }));
+  } else {
+    const direct = await window.SqueezeResolve.directUrl(file.ref);
+    job = await relayBytes(direct, { pageUrl: url, filename: file.name });
+  }
   trackJob(job);
 }
 
@@ -530,6 +734,7 @@ async function squeeze() {
   }
 
   hideAlert();
+  clearPicker();
   setBusy(1);
   const failures = [];
 
@@ -562,6 +767,7 @@ async function squeeze() {
     showAlert(
       `${failures.length === 1 ? '' : `${failures.length} items failed. `}${first.err.message}`,
       'error',
+      { href: first.err.href || null, hrefLabel: first.err.href ? `Open ${shortHost(first.err.href)}` : undefined },
     );
   }
 }

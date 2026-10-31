@@ -11,10 +11,11 @@ const jobsStore = require('./jobs');
 const { probe, thumbnail, transcode } = require('./ffmpeg');
 const { PRESET_LIST, getPreset, buildArgs, targetTooSmall } = require('./compress');
 const sources = require('./sources');
+const { resolve, directUrl } = require('../shared/resolve');
 const { ensureSample } = require('./sample');
 
 const PORT = Number(process.env.PORT) || 3000;
-const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 2048;
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 6144;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 
 const app = express();
@@ -170,6 +171,12 @@ const FRIENDLY = {
   DOWNLOAD_FAILED: 'The download stopped before it finished.',
   TIMEOUT: 'The download timed out.',
   NO_YTDLP: 'Platform downloads are not enabled on this server.',
+  BLOCKED_HOST: 'That address is not allowed.',
+  NO_VIDEO_FOUND: 'No video was found behind that link.',
+  GOFILE_PREMIUM: 'gofile only releases that folder to a premium account.',
+  PASSWORD: 'That link is password protected.',
+  NOT_FOUND: 'That link no longer exists.',
+  NO_VIDEO_ON_PAGE: 'That page streams its video, so there is no single file to download.',
   YTDLP_FAILED: 'The platform refused the download. It may need a login, or the link is unsupported.',
 };
 
@@ -182,6 +189,52 @@ function reportJobError(job, err) {
     speed: null,
   });
   console.error(`[job ${job.id}] ${err.code || 'ERR'}:`, err.message?.slice(0, 600));
+}
+
+/**
+ * Job whose source still has to be fetched: resolve the file reference to a
+ * fresh signed URL, download it, then hand it to the encoder.
+ */
+async function fetchThenCompress(job, ref) {
+  const paths = jobsStore.jobPaths(job);
+  const controller = makeController(job);
+
+  try {
+    jobsStore.updateJob(job, { status: 'fetching', stage: 'Finding the video file' });
+
+    const url = await directUrl(ref);
+    const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+    const expected = Number(ref.size) || 0;
+    if (expected && free < expected * 1.6) {
+      throw Object.assign(new Error('Not enough disk space on this server for that file.'), {
+        code: 'NO_DISK',
+      });
+    }
+
+    jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading video', progress: 0 });
+
+    await sources.downloadHttp(url, paths.source, {
+      maxBytes: MAX_UPLOAD_BYTES,
+      signal: controller.signal,
+      onProgress: (received, total) => {
+        const p = total ? received / total : 0;
+        job.sourceBytes = received;
+        job.progress = p;
+        job.stage = total
+          ? `Downloading video · ${Math.round(p * 100)}%`
+          : `Downloading video (${Math.round(received / 1048576)} MB)`;
+        if (Date.now() - (job._lastEmit || 0) > 500) {
+          job._lastEmit = Date.now();
+          jobsStore.updateJob(job, {});
+        }
+      },
+    });
+
+    jobsStore.updateJob(job, { progress: 0, sourceBytes: (await fsp.stat(paths.source)).size });
+    startCompression(job);
+  } catch (err) {
+    reportJobError(job, err);
+  }
 }
 
 /* Encode jobs one at a time per CPU slot: two 1080p encodes fighting over the
@@ -224,6 +277,15 @@ function startCompression(job) {
 /* --------------------------------------------------------------- raw uploads */
 
 async function saveRequestToFile(req, destPath, { maxBytes = MAX_UPLOAD_BYTES } = {}) {
+  // Leave room for the encoded output next to the source.
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared && declared * 1.5 > free) {
+    throw Object.assign(new Error('This server does not have enough free disk space for that file.'), {
+      code: 'NO_DISK',
+    });
+  }
+
   const out = fs.createWriteStream(destPath);
   let received = 0;
   let tooBig = false;
@@ -325,15 +387,59 @@ app.post('/api/probe', async (req, res) => {
   });
 });
 
+/** List the actual files behind a share link (gofile folder, turbo.cr page, …). */
+app.post('/api/resolve', async (req, res) => {
+  const url = sources.normalizeUrl(req.body?.url);
+  if (!url) return fail(res, 400, 'BAD_URL', 'That does not look like a valid link.');
+  if (sources.isBlockedHost(url)) return fail(res, 400, 'BLOCKED_HOST', 'That address is not allowed.');
+  try {
+    const result = await resolve(url);
+    return res.json({
+      resolver: result.resolver,
+      title: result.title || null,
+      files: result.files.map((file) => ({
+        name: file.name,
+        size: file.size || 0,
+        mime: file.mime || '',
+        kind: file.kind,
+        ref: file.ref,
+      })),
+    });
+  } catch (err) {
+    const status = err.code === 'BAD_URL' ? 400 : 422;
+    return fail(res, status, err.code || 'RESOLVE_FAILED', err.message || 'Could not read that link.');
+  }
+});
+
+const ALLOWED_REF_RESOLVERS = new Set(['gofile', 'turbo', 'pixeldrain', 'direct']);
+
 /**
  * Create a job.
- * body: { source: 'url'|'upload'|'sample', url?, name?, presetId?, targetMb? }
+ * body: { source: 'url'|'ref'|'upload'|'sample', url?, ref?, name?, presetId?, targetMb? }
  */
 app.post('/api/jobs', async (req, res) => {
   const body = req.body || {};
   const source = body.source || 'url';
   const presetId = String(body.presetId || 'balanced');
   const targetMb = Number(body.targetMb) > 0 ? Number(body.targetMb) : null;
+
+  if (source === 'ref') {
+    const ref = body.ref;
+    if (!ref || typeof ref !== 'object' || !ALLOWED_REF_RESOLVERS.has(String(ref.resolver))) {
+      return fail(res, 400, 'BAD_REF', 'That file reference is not valid.');
+    }
+    const job = jobsStore.createJob({
+      source: 'link',
+      url: body.pageUrl ? String(body.pageUrl) : null,
+      presetId,
+      targetMb,
+      name: body.name,
+      ref,
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+    fetchThenCompress(job, ref);
+    return undefined;
+  }
 
   if (source === 'sample') {
     const job = jobsStore.createJob({ source: 'sample', name: 'squeeze-sample', presetId, targetMb });
@@ -398,41 +504,68 @@ app.post('/api/jobs', async (req, res) => {
   }
 
   // Plain file URLs: the server downloads them when it can.
-  const remote = await sources.probeRemote(url);
-  if (!remote.reachable || remote.isHtml) {
-    return fail(
-      res,
-      409,
-      'NEED_BROWSER',
-      remote.isHtml
-        ? 'That link is a web page, not a video file. Retrying through your browser instead.'
-        : 'This server cannot reach that host directly. Retrying through your browser instead.',
-    );
+  // Work out what this link really points at, cheapest check first.
+  // 1. A known share host or an obvious file URL resolves on its own.
+  let resolved = null;
+  try {
+    resolved = await resolve(url, { allowPage: false });
+  } catch (err) {
+    return fail(res, 422, err.code || 'RESOLVE_FAILED', err.message);
   }
 
-  const job = jobsStore.createJob({ source: 'url', url, presetId, targetMb, name: body.name });
-  const paths = jobsStore.jobPaths(job);
-  jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading video' });
+  // 2. Otherwise ask the host what it is: a video file, or a page to scrape?
+  if (!resolved) {
+    if (sources.isBlockedHost(url)) {
+      return fail(res, 400, 'BLOCKED_HOST', 'That address is not allowed.');
+    }
+    const remote = await sources.probeRemote(url);
 
-  sources
-    .downloadHttp(url, paths.source, {
-      maxBytes: MAX_UPLOAD_BYTES,
-      onProgress: (received, total) => {
-        const p = total ? received / total : 0;
-        jobsStore.updateJob(job, {
-          progress: p,
-          sourceBytes: received,
-          stage: total ? 'Downloading video' : `Downloading video (${Math.round(received / 1048576)} MB)`,
-        });
-      },
-    })
-    .then(() => {
-      jobsStore.updateJob(job, { progress: 0 });
-      startCompression(job);
-    })
-    .catch((err) => reportJobError(job, err));
+    if (remote.reachable && !remote.isHtml) {
+      let name = 'video';
+      try {
+        name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'video');
+      } catch {
+        /* keep default */
+      }
+      resolved = {
+        resolver: 'direct',
+        title: null,
+        files: [
+          {
+            name,
+            size: remote.contentLength || 0,
+            mime: remote.contentType || '',
+            kind: 'video',
+            ref: { resolver: 'direct', url, name },
+          },
+        ],
+      };
+    } else if (remote.isHtml) {
+      try {
+        resolved = await resolve(url);
+      } catch (err) {
+        return fail(res, 422, err.code || 'RESOLVE_FAILED', err.message);
+      }
+    } else {
+      // Nothing from here: the browser may still have a route to it.
+      return fail(res, 409, 'NEED_BROWSER', 'This server cannot reach that host. Retrying through your browser instead.');
+    }
+  }
 
-  return res.status(201).json({ job: jobsStore.publicView(job) });
+  const file = resolved.files.find((f) => f.kind === 'video') || resolved.files[0];
+  if (!file) return fail(res, 422, 'NO_VIDEO_FOUND', 'No video was found behind that link.');
+
+  const job = jobsStore.createJob({
+    source: 'url',
+    url,
+    presetId,
+    targetMb,
+    name: body.name || file.name,
+    ref: file.ref,
+  });
+  res.status(201).json({ job: jobsStore.publicView(job) });
+  fetchThenCompress(job, file.ref);
+  return undefined;
 });
 
 /** Upload straight from the browser (drag & drop). */
@@ -576,6 +709,7 @@ app.delete('/api/jobs/:id', async (req, res) => {
 
 /* -------------------------------------------------------------------- static */
 
+app.use('/shared', express.static(path.join(__dirname, '..', 'shared')));
 app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['html'] }));
 
 app.get('/j/:id', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'job.html')));

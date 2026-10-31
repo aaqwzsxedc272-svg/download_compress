@@ -35,6 +35,8 @@ function normalizeUrl(input) {
     return null;
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  // A public link needs a dotted host; single words are typos, not domains.
+  if (!parsed.hostname.includes('.') && parsed.hostname !== 'localhost') return null;
   return parsed.toString();
 }
 
@@ -156,6 +158,7 @@ async function downloadPlatform(url, destDir, { onProgress, timeoutMs = 8 * 60 *
 
 /** Cheap reachability check from the server. Never throws. */
 async function probeRemote(url, { timeoutMs = 6000 } = {}) {
+  if (isBlockedHost(url)) return { reachable: false, status: 0, error: 'blocked-host' };
   const attempt = async (method, headers) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -187,9 +190,42 @@ async function probeRemote(url, { timeoutMs = 6000 } = {}) {
   }
 }
 
+const BLOCKED_HOSTS = /^(localhost|127\.|0\.0\.0\.0|\[?::1\]?|169\.254\.169\.254|metadata\.google\.internal)/i;
+
+/** Refuse obviously internal targets unless explicitly allowed (SSRF guard). */
+function isBlockedHost(rawUrl) {
+  if (process.env.ALLOW_PRIVATE_HOSTS === '1') return false;
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return BLOCKED_HOSTS.test(host);
+  } catch {
+    return true;
+  }
+}
+
+/** Free bytes on the volume that holds `dir`. */
+async function freeDiskBytes(dir) {
+  try {
+    const stats = await fsp.statfs(dir);
+    return stats.bavail * stats.bsize;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
 /** Stream a remote file to disk, reporting byte progress. */
-async function downloadHttp(url, destPath, { onProgress, maxBytes = 1024 ** 3, idleTimeoutMs = 45_000 } = {}) {
+async function downloadHttp(
+  url,
+  destPath,
+  { onProgress, maxBytes = 1024 ** 3, idleTimeoutMs = 45_000, signal: outerSignal } = {},
+) {
+  if (isBlockedHost(url)) {
+    throw Object.assign(new Error('That address is not allowed.'), { code: 'BLOCKED_HOST' });
+  }
+
   const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  if (outerSignal) outerSignal.addEventListener('abort', forwardAbort, { once: true });
   let idle = setTimeout(() => controller.abort(), idleTimeoutMs);
   const bump = () => {
     clearTimeout(idle);
@@ -205,6 +241,9 @@ async function downloadHttp(url, destPath, { onProgress, maxBytes = 1024 ** 3, i
     });
   } catch (err) {
     clearTimeout(idle);
+    if (outerSignal && outerSignal.aborted) {
+      throw Object.assign(new Error('Download cancelled.'), { code: 'CANCELLED' });
+    }
     throw Object.assign(new Error(`Could not reach ${new URL(url).hostname}.`), { code: 'UNREACHABLE' });
   }
 
@@ -215,6 +254,11 @@ async function downloadHttp(url, destPath, { onProgress, maxBytes = 1024 ** 3, i
 
   const total = Number(res.headers.get('content-length') || 0);
   const type = (res.headers.get('content-type') || '').toLowerCase();
+  if (total > maxBytes) {
+    clearTimeout(idle);
+    res.body.cancel().catch(() => {});
+    throw Object.assign(new Error('That file is larger than this server accepts.'), { code: 'TOO_BIG' });
+  }
   if (type.includes('text/html')) {
     clearTimeout(idle);
     res.body.cancel().catch(() => {});
@@ -241,12 +285,16 @@ async function downloadHttp(url, destPath, { onProgress, maxBytes = 1024 ** 3, i
     await pipeline(body, fs.createWriteStream(destPath));
   } catch (err) {
     await fsp.rm(destPath, { force: true }).catch(() => {});
+    if (outerSignal && outerSignal.aborted) {
+      throw Object.assign(new Error('Download cancelled.'), { code: 'CANCELLED' });
+    }
     if (received > maxBytes) {
       throw Object.assign(new Error('That file is larger than this server accepts.'), { code: 'TOO_BIG' });
     }
     throw Object.assign(new Error('The download stopped before it finished.'), { code: 'DOWNLOAD_FAILED' });
   } finally {
     clearTimeout(idle);
+    if (outerSignal) outerSignal.removeEventListener('abort', forwardAbort);
   }
 
   return { bytes: received, contentType: type };
@@ -263,4 +311,6 @@ module.exports = {
   downloadPlatform,
   probeRemote,
   downloadHttp,
+  isBlockedHost,
+  freeDiskBytes,
 };

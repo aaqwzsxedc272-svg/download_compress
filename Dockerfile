@@ -17,7 +17,7 @@ COPY . .
 ENV NODE_ENV=production \
     PORT=3000 \
     DATA_DIR=/data \
-    MAX_UPLOAD_MB=2048 \
+    MAX_UPLOAD_MB=6144 \
     MAX_CONCURRENT=1
 
 RUN mkdir -p /data

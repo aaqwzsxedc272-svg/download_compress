@@ -1,36 +1,59 @@
 # Squeeze
 
-Paste a video link (or drop a file), get a compressed MP4 back to download.
+Paste a video link (or drop a file), pick a file if the link is a folder, get a compressed
+MP4 back to download.
 
+- **Real link resolution** — gofile folders, turbo.cr, pixeldrain, direct `.mp4`/`.webm`
+  URLs, and plain pages that advertise a video (`og:video`, `<video>`, `<source>`, JSON-LD).
 - **Re-encodes with H.264 / AAC** — plays everywhere, no watermark, usually 70–95% smaller.
 - **Presets** from Tiny (360p) to Original resolution, or "fit in N MB" for a hard size target.
 - **Live progress** with speed and ETA, then one-click download.
-- **Three ways to get the video** so a stubborn link still works: the server downloads it,
-  `yt-dlp` extracts it, or your browser fetches it and streams it to the encoder.
+- **Three ways to fetch a video**, so a link the server can't reach still has a chance.
 
 ## Run it
 
 ```bash
 npm install
 npm start          # http://localhost:3000
+npm run smoke      # 28 end-to-end checks
+npm run test:resolve
 ```
 
 Requires Node 18+ (uses the built-in `fetch`). ffmpeg and ffprobe come bundled as static
 binaries through `@ffmpeg-installer/ffmpeg` and `@ffprobe-installer/ffprobe` — nothing to
 install system-wide.
 
-To get YouTube / TikTok / Instagram / X links working, install yt-dlp on the same machine:
+For YouTube / TikTok / Instagram / X links, install yt-dlp on the same machine:
 
 ```bash
 pip install -U yt-dlp
 ```
 
-Squeeze detects it at startup and reports it on `/api/health`. Without it, those links fall
-back to the browser route (which only works when the site allows cross-origin downloads).
+Squeeze detects it at startup and reports it on `/api/health`.
+
+## How a link is processed
+
+1. **Resolve it.** `shared/resolve.js` turns a share page into real file URLs:
+   - `gofile.io/d/{code}` → guest account → folder listing (choose which file)
+   - `turbo.cr/d|v|embed/{id}` → `api/sign` → signed CDN URL
+   - `pixeldrain.com/u|l/{id}` → file info / list
+   - a URL that ends in a video extension → used directly
+   - anything else → the page is fetched and scanned for a video URL
+2. **Fetch it**, in whichever of these can reach the file:
+   - the server downloads it itself (fastest),
+   - `yt-dlp` extracts it for the platforms it supports,
+   - or **your browser** fetches the bytes and streams them to the encoder.
+3. **Encode it** with libx264 and hand back a download.
+
+If a link is a folder with several videos, the UI lists them so you pick one instead of
+guessing which file you meant.
+
+If none of the three routes can reach the file, the page says so explicitly and offers to
+open the link — downloading it yourself and dragging it in gives an identical result.
 
 ## Deploy it online
 
-**Docker** (works on Fly.io, Railway, a VPS, anything):
+**Docker** (Fly.io, Railway, a VPS, anything):
 
 ```bash
 docker build -t squeeze .
@@ -48,10 +71,15 @@ disk, so compressed files would vanish between requests.
 ```bash
 fly launch --no-deploy
 fly volumes create squeeze_data --size 10
-fly secrets set DATA_DIR=/data MAX_UPLOAD_MB=2048
+fly secrets set DATA_DIR=/data MAX_UPLOAD_MB=6144
 fly deploy
 ```
 (add `[mounts]` in `fly.toml`: `source = "squeeze_data"`, `destination = "/data"`)
+
+> **A note on restricted environments.** Some sandboxes (including the preview pane this
+> was built in) can reach npm and GitHub but not consumer file hosts. There, gofile and
+> turbo.cr links fail with "this server has no internet route to …" while uploads work
+> normally. A normal deployment has full outbound access and resolves them directly.
 
 ## Configuration
 
@@ -59,20 +87,12 @@ fly deploy
 | --- | --- | --- |
 | `PORT` | `3000` | HTTP port |
 | `DATA_DIR` | `./data` | Working files, deleted automatically |
-| `MAX_UPLOAD_MB` | `2048` | Largest accepted video, in megabytes |
+| `MAX_UPLOAD_MB` | `6144` | Largest accepted video, in megabytes |
 | `MAX_CONCURRENT` | `1` | Simultaneous encodes (one per CPU core is a good rule) |
+| `ALLOW_PRIVATE_HOSTS` | off | Permit `127.0.0.1` / metadata addresses (tests only) |
 
-## How a link gets processed
-
-1. `POST /api/probe` asks the server whether it can reach the URL itself.
-2. **Direct file link + server has internet** → the server downloads it and encodes it.
-3. **YouTube / TikTok / … + yt-dlp installed** → yt-dlp pulls the best MP4 under 1080p.
-4. **Otherwise** → the browser fetches the video and streams the bytes to the server, so
-   hosts that block the server's IP (or a server with restricted egress) still work, as long
-   as the host sends CORS headers.
-
-If all three fail, Squeeze says so and suggests dropping the file in directly — dragging an
-already-downloaded video into the page gives an identical result.
+By default loopback, `169.254.169.254` and `metadata.google.internal` are refused, so the
+app cannot be used to probe the box it runs on.
 
 ## Encoding notes
 
@@ -81,16 +101,17 @@ already-downloaded video into the page gives an identical result.
 - The preset caps the **shorter** side, so portrait phone video stays portrait (`1080×1920` at
   "720p" becomes `405×720`).
 - Audio is re-encoded to AAC stereo at 64–128 kbps; silent videos skip the audio track.
-- "Fit in N MB" converts the target into a bitrate from the clip duration, with a
-  `maxrate` ceiling, and warns when the target is too tight to look good.
+- "Fit in N MB" converts the target into a bitrate from the clip duration, with a `maxrate`
+  ceiling, and warns when the target is too tight to look good.
+- One encode runs at a time by default; extra jobs queue with a position shown in the UI.
 
 ## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Version info, presets, whether yt-dlp is available |
-| `POST` | `/api/probe` | Can this server fetch the URL? |
-| `POST` | `/api/jobs` | Create a job from `{ source: "url" \| "sample", url, presetId, targetMb }` |
+| `GET` | `/api/health` | Version info, presets, upload limit, whether yt-dlp is available |
+| `POST` | `/api/resolve` | List the files behind a link |
+| `POST` | `/api/jobs` | Create a job: `{ source: "url" \| "ref" \| "sample", url?, ref?, presetId, targetMb }` |
 | `POST` | `/api/upload?name=&presetId=` | Upload a file body directly |
 | `PUT` | `/api/relay/:token` | Stream bytes fetched by the browser |
 | `GET` | `/api/jobs/:id` | Job state |
@@ -98,8 +119,19 @@ already-downloaded video into the page gives an identical result.
 | `GET` | `/api/jobs/:id/download` | The compressed MP4 |
 | `DELETE` | `/api/jobs/:id` | Cancel / delete a job |
 
+`POST /api/resolve` returns `{ resolver, title, files: [{ name, size, mime, kind, ref }] }`.
+Pass a file's `ref` back as `source: "ref"` to compress exactly that file — signed links are
+re-resolved at download time, so they never go stale.
+
+## Testing
+
+- `npm run test:resolve` — 14 resolver tests against stubbed APIs (real response shapes).
+- `npm run smoke` — 28 end-to-end checks: sample, upload, browser relay, target size, range
+  requests, share-page resolution, reference jobs, and every rejection path. Starts its own
+  server and a fake external host on a spare port.
+
 ## Housekeeping
 
-Finished files are removed from disk by a sweeper (everything older than 3 hours, finished
-jobs after 45 minutes), and all working files are wiped on restart. Nothing is shared
-between users beyond the guessable-free job IDs.
+Finished files are removed by a sweeper (everything older than 3 hours, finished jobs after
+45 minutes), and all working files are wiped on restart. Job IDs are random and unguessable;
+nothing is shared between visitors. Downloads also stop if free disk space gets tight.

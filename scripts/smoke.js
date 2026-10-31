@@ -8,11 +8,13 @@
  */
 
 const { spawn } = require('node:child_process');
+const http = require('node:http');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 
 const PORT = 3199;
+const MEDIA_PORT = 3198; // stands in for an external host that serves video
 const ROOT = path.join(__dirname, '..');
 const DATA_DIR = path.join(os.tmpdir(), `squeeze-smoke-${Date.now()}`);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -79,15 +81,23 @@ async function main() {
   await fs.rm(DATA_DIR, { recursive: true, force: true });
 
   const server = spawn(process.execPath, [path.join(ROOT, 'server', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), DATA_DIR, MAX_CONCURRENT: '2' },
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      DATA_DIR,
+      MAX_CONCURRENT: '2',
+      ALLOW_PRIVATE_HOSTS: '1', // the fake "external host" is on 127.0.0.1
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverLog = '';
   server.stdout.on('data', (d) => (serverLog += d));
   server.stderr.on('data', (d) => (serverLog += d));
 
+  let mediaServer = null;
   const cleanup = async () => {
     server.kill('SIGKILL');
+    if (mediaServer) mediaServer.close();
     await fs.rm(DATA_DIR, { recursive: true, force: true }).catch(() => {});
   };
 
@@ -163,6 +173,67 @@ async function main() {
     const urlDone = await waitForJob(urlJob.id);
     check('url job completes', urlDone.status === 'done', urlDone.error || '');
     check('url job recorded its source', urlDone.source === 'url');
+
+    // ---------------------------------------------------- share-page resolving
+    // A fake external host: an HTML page that advertises a video, plus the file.
+    const mediaDir = path.join(DATA_DIR, 'media');
+    await fs.mkdir(mediaDir, { recursive: true });
+    await fs.copyFile(samplePath, path.join(mediaDir, 'clip.mp4'));
+    await fs.writeFile(
+      path.join(mediaDir, 'watch.html'),
+      '<html><head><meta property="og:video:secure_url" content="/clip.mp4"></head>' +
+        '<body><video src="/clip.mp4"></video></body></html>',
+    );
+    mediaServer = http.createServer(async (req, res) => {
+      const name = req.url === '/watch.html' ? 'watch.html' : 'clip.mp4';
+      try {
+        const body = await fs.readFile(path.join(mediaDir, name));
+        res.writeHead(200, { 'content-type': name.endsWith('.html') ? 'text/html' : 'video/mp4' });
+        res.end(body);
+      } catch {
+        res.writeHead(404).end();
+      }
+    });
+    await new Promise((resolve) => mediaServer.listen(MEDIA_PORT, '127.0.0.1', resolve));
+
+    const pageUrl = `http://127.0.0.1:${MEDIA_PORT}/watch.html`;
+    const resolved = await (
+      await fetch(`${BASE}/api/resolve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: pageUrl }),
+      })
+    ).json();
+    check('resolves an HTML page to its video file', resolved.files?.length === 1, JSON.stringify(resolved).slice(0, 120));
+    check('resolver identified the page route', resolved.resolver === 'page');
+    check('resolved file has a usable name', /clip\.mp4$/.test(resolved.files?.[0]?.name || ''), resolved.files?.[0]?.name);
+
+    const refJob = await createJob({
+      source: 'ref',
+      ref: resolved.files[0].ref,
+      name: resolved.files[0].name,
+      pageUrl,
+      presetId: 'tiny',
+    });
+    const refDone = await waitForJob(refJob.id);
+    check('a resolved reference downloads and compresses', refDone.status === 'done', refDone.error || '');
+    check('reference job reports its resolver', refDone.resolver !== null, String(refDone.resolver));
+
+    const badRef = await fetch(`${BASE}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: 'ref', ref: { resolver: 'evil', url: 'http://x' } }),
+    });
+    check('unknown resolver rejected', badRef.status === 400);
+
+    const badResolve = await (
+      await fetch(`${BASE}/api/resolve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: 'not-a-link' }),
+      })
+    ).json();
+    check('resolve rejects junk input', badResolve.code === 'BAD_URL');
 
     // --------------------------------------------------------------- failure
     const badUpload = await fetch(`${BASE}/api/upload?name=notes.txt`, {

@@ -122,6 +122,8 @@ function createJob(fields = {}) {
     source: fields.source || 'upload', // upload | url | ytdlp | sample | relay
     url: fields.url || null,
     name: fields.name || null,
+    /* The <title> of the page the link points at: what a browser tab shows. */
+    sourceTitle: fields.sourceTitle || null,
     presetId: fields.presetId || 'balanced',
     targetMb: fields.targetMb || null,
     /* "Just download": fetch the file and hand it back untouched, no encode. */
@@ -221,6 +223,11 @@ function publicView(job) {
     hosting: Boolean(job.hosting),
     /* True once the queue picked this up after the machine stopped. */
     resumed: Boolean(job.resumed),
+    /* Resumable encodes: how many parts exist, and where a restart picked up. */
+    sourceTitle: job.sourceTitle || null,
+    segmentsDone: Number(job.segmentsDone) || 0,
+    segmentsTotal: Number(job.segmentsTotal) || 0,
+    resumeFrom: typeof job.resumeFrom === 'number' ? job.resumeFrom : null,
   };
   if (viewHook) {
     try {

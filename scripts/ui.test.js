@@ -417,6 +417,8 @@ async function boot({
       progress: 0.42,
       name: 'Holiday.mp4',
       url: 'https://theditch.st/qhygxukd',
+      /* What the linked page's own tab says — not the result file's name. */
+      sourceTitle: 'WlVHBYDPhhHcSTmGUcvy.mp4 — fileditch',
       tabTitle: 'Holiday 720p.mp4',
       downloadPath: '/api/jobs/jobRun/download/Holiday%20720p.mp4',
       source: 'url',
@@ -431,7 +433,10 @@ async function boot({
     if (link.getAttribute('href') !== 'https://theditch.st/qhygxukd') throw new Error('the link is not clickable');
     if (link.getAttribute('target') !== '_blank') throw new Error('the link would replace the app');
     const tab = card.querySelector('[data-field="tabTitle"]');
-    if (!/Holiday 720p\.mp4/.test(tab.textContent)) throw new Error(`tab title says "${tab.textContent}"`);
+    if (!/WlVHBYDPhhHcSTmGUcvy\.mp4 — fileditch/.test(tab.textContent)) {
+      throw new Error(`tab title says "${tab.textContent}"`);
+    }
+    if (/720p/.test(tab.textContent)) throw new Error('the tab line is showing the output name, not the link');
   });
 
   await test('"just download it" is offered on a running file and calls the server', async () => {
@@ -484,6 +489,28 @@ async function boot({
     const status = card.querySelector('[data-field="status"]').textContent;
     if (!/as downloaded/.test(status)) throw new Error(`status says "${status}"`);
     if (/Compressed/.test(status)) throw new Error(`a copy is reported as compressed: "${status}"`);
+  });
+
+  await test('a long encode says which part it is on', async () => {
+    const parts = await boot({ links: LINKS });
+    const { window, doc } = parts;
+    window.EventSource = class {
+      close() {}
+    };
+    window.__app.trackJob({
+      id: 'jobParts',
+      status: 'compressing',
+      progress: 0.4,
+      name: 'Long One.mp4',
+      url: 'https://pixeldrain.com/u/abc',
+      source: 'url',
+      segmentsDone: 4,
+      segmentsTotal: 12,
+      hasFile: false,
+    });
+    const card = doc.querySelector('[data-job-id="jobParts"]');
+    const meta = card.querySelector('[data-field="meta"]').textContent;
+    if (!/part 5\/12 kept/.test(meta)) throw new Error(`meta says "${meta}"`);
   });
 
   await test('a restart is announced, with what was picked up', async () => {

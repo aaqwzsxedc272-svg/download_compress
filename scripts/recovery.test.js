@@ -72,8 +72,18 @@ function startServer() {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let stderr = '';
   proc.stdout.on('data', () => {});
-  proc.stderr.on('data', () => {});
+  proc.stderr.on('data', (chunk) => (stderr += chunk));
+  proc.on('exit', (code) => {
+    /* A server that dies at once (port already taken by a previous crashed
+       run, unreadable data dir) used to make the whole test hang on a server
+       that was never there. */
+    if (code && code !== 0) {
+      console.error(`server exited with ${code}: ${stderr.slice(-800)}`);
+      process.exit(1);
+    }
+  });
   return proc;
 }
 
@@ -86,6 +96,7 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
 function slowSource(file) {
   const server = http.createServer(async (req, res) => {
     if (!req.url.startsWith('/slow.mp4')) return res.writeHead(404).end();
+    try {
     const size = (await fsp.stat(file)).size;
     res.writeHead(200, {
       'content-type': 'video/mp4',
@@ -99,6 +110,11 @@ function slowSource(file) {
       await sleep(120);
     }
     res.end();
+    } catch (err) {
+      /* A missing file must not take the whole test process down. */
+      if (!res.headersSent) res.writeHead(500);
+      res.end(String(err.message));
+    }
   });
   return server.listen(SOURCE_PORT, '127.0.0.1');
 }
@@ -139,8 +155,10 @@ function slowSource(file) {
     /* The sample clip is built by the server itself, so it is the one video
        here that is guaranteed to exist. */
     const sample = path.join(DATA_DIR, 'sample.mp4');
-    const built = await waitFor(async () => (fs.existsSync(sample) ? true : null), { timeoutMs: 60000 });
+    /* A busy machine can take a couple of minutes to build 45 s of 1080p. */
+    const built = await waitFor(async () => (fs.existsSync(sample) ? true : null), { timeoutMs: 240000 });
     check('the server built its own test clip', Boolean(built));
+    if (!built) throw new Error('the sample clip was never built, so nothing below can be honest');
 
     source = slowSource(sample);
     const sourceUrl = `http://127.0.0.1:${SOURCE_PORT}/slow.mp4`;

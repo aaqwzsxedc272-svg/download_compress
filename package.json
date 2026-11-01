@@ -30,7 +30,8 @@
     "test:publish": "node scripts/publish.test.js",
     "test:durability": "node scripts/durability.test.js",
     "test:resume": "node scripts/resume.test.js",
-    "test:recover": "node scripts/recovery.test.js"
+    "test:recover": "node scripts/recovery.test.js",
+    "test:segments": "node scripts/segments.test.js"
   },
   "engines": {
     "node": ">=18"

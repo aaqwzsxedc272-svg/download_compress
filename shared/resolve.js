@@ -65,6 +65,117 @@
     }
   }
 
+  /* ------------------------------------------------------- pages vs bot checks
+   * fileditch (and a growing number of hosts) sit behind Cloudflare. A plain
+   * request gets a 403 carrying "Just a moment…", which no amount of headers
+   * will get past: the page has to run its JavaScript and earn a clearance
+   * cookie. So a page is fetched like a browser would fetch it, and when that is
+   * still refused the headless browser is asked to do it — the cookie it earns
+   * is handed back with the file, because the CDN wants it again for the video.
+   */
+  const PAGE_HEADERS = {
+    'user-agent': UA,
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.9',
+    'cache-control': 'no-cache',
+    pragma: 'no-cache',
+    'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"macOS"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'none',
+    'upgrade-insecure-requests': '1',
+  };
+
+  /* The fingerprints of a bot check, whatever the host calls it. */
+  const CHALLENGE_HTML =
+    /just a moment|checking your browser|verify you are human|enable javascript and cookies|cf-browser-verification|challenge-platform|__cf_chl|ddos-guard|captcha/i;
+
+  function isChallenge(res, html) {
+    if (!res) return false;
+    const mitigated = String(res.headers?.get?.('cf-mitigated') || '').toLowerCase();
+    if (mitigated === 'challenge') return true;
+    const text = String(html || '');
+    if (!CHALLENGE_HTML.test(text)) return false;
+    /* A real page can mention Cloudflare in a footer; a challenge *is* the
+       page. Length is the cheapest honest discriminator. */
+    return text.length < 30000 || res.status === 403 || res.status === 503;
+  }
+
+  const CHALLENGE_HELP =
+    'That host answers with a Cloudflare browser check, which a plain request cannot pass. ' +
+    'Install the browser helper once (`npm run browser:install` in this project) and it will open ' +
+    'the page like a visitor — or use "Save file" to download it in your browser and drop it here.';
+
+  /** <title> as a browser tab would show it. */
+  function pageTitleOf(html) {
+    const match = /<title[^>]*>([\s\S]{0,300}?)<\/title>/i.exec(String(html || ''));
+    if (!match) return null;
+    const text = match[1]
+      .replace(/&amp;/g, '&')
+      .replace(/&#0?39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return text ? text.slice(0, 180) : null;
+  }
+
+  /**
+   * Fetch a page with a browser's headers, and through a real browser when the
+   * site demands one.
+   *
+   * Returns { html, title, cookie, viaBrowser } — `cookie` is what makes the
+   * download work afterwards, since the CDN checks the clearance again.
+   */
+  async function fetchPage(url, { timeoutMs = 20000, referer = null } = {}) {
+    const headers = { ...PAGE_HEADERS, ...(referer ? { referer } : {}) };
+    let res = null;
+    let html = '';
+    try {
+      res = await fetchWithTimeout(url, { headers, redirect: 'follow' }, timeoutMs);
+      html = await res.text();
+    } catch (err) {
+      // Unreachable from here is not a bot check; the browser may still manage.
+      res = null;
+    }
+
+    if (!isChallenge(res, html) && res && res.ok) {
+      return {
+        html,
+        title: pageTitleOf(html),
+        cookie: null,
+        viaBrowser: false,
+        url: res.url || url,
+        status: res.status,
+      };
+    }
+
+    const viaBrowser = await pageHtmlViaBrowser(url);
+    if (viaBrowser && viaBrowser.html) {
+      return {
+        html: viaBrowser.html,
+        title: viaBrowser.title || pageTitleOf(viaBrowser.html),
+        cookie: viaBrowser.cookie || null,
+        viaBrowser: true,
+        url: viaBrowser.url || url,
+        status: 200,
+      };
+    }
+
+    if (isChallenge(res, html)) throw new ResolveError(CHALLENGE_HELP, 'CLOUDFLARE');
+    return {
+      html,
+      title: pageTitleOf(html),
+      cookie: null,
+      viaBrowser: false,
+      url: (res && res.url) || url,
+      status: res ? res.status : 0,
+    };
+  }
+
   async function getJson(url, init, timeoutMs) {
     const res = await fetchWithTimeout(url, init, timeoutMs);
     const text = await res.text();
@@ -92,6 +203,9 @@
   /* Set by the server when a headless browser is available: bot-protected pages
      are opened for real, and whatever video the page play()s is observed. */
   let pageBrowserHook = null;
+  /* Set by the server when Chromium is installed: returns the DOM of a page
+     after its bot check has run, plus the cookies the browser earned. */
+  let pageHtmlHook = null;
 
   async function gofileWebToken(force = false) {
     if (!force && gofileWt.at && Date.now() - gofileWt.at < 30 * 60 * 1000) return gofileWt.value;
@@ -857,13 +971,12 @@ function preferPageName(urlName, pageName) {
    * before giving up and opening a browser.
    */
   async function fileditchMint(pageUrl, wantPath) {
-    const res = await fetchWithTimeout(pageUrl, {
-      headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml' },
-      redirect: 'follow',
-    });
-    if (!res.ok) throw new ResolveError(`fileditch answered HTTP ${res.status}.`, 'FILEDITCH_FAILED');
-    const html = await res.text();
-    const base = res.url || pageUrl;
+    /* Their pages are behind Cloudflare, so this goes through fetchPage():
+       plain request first, headless browser when the challenge comes back. */
+    const fetched = await fetchPage(pageUrl);
+    if (!fetched.html) throw new ResolveError(`fileditch answered HTTP ${fetched.status || 'nothing'}.`, 'FILEDITCH_FAILED');
+    const html = fetched.html;
+    const base = fetched.url || pageUrl;
     const { download, players } = fileditchLinks(html, base);
 
     /* The signed link is the intended route; the player URL that carries the
@@ -909,14 +1022,16 @@ function preferPageName(urlName, pageName) {
     }
     if (baseIsFile && !ranked.includes(base)) ranked.push(base);
 
-    if (ranked.length) return { url: ranked[0], links: ranked, html, base };
+    if (ranked.length) {
+      return { url: ranked[0], links: ranked, html, base, cookie: fetched.cookie || null, title: fetched.title || null };
+    }
 
     // No link at all: the page might itself be a player whose media URL is only
     // visible to a real browser.
     const viaBrowser = await pageBrowserFiles(base);
     if (viaBrowser && viaBrowser.length) {
       const links = viaBrowser.map((file) => file.ref.url).filter(Boolean);
-      return { url: links[0], links, html, base, viaBrowser: true };
+      return { url: links[0], links, html, base, viaBrowser: true, cookie: fetched.cookie || null };
     }
     throw new ResolveError('fileditch did not expose a download link on that page.', 'FILEDITCH_NO_LINK');
   }
@@ -961,7 +1076,8 @@ function preferPageName(urlName, pageName) {
         const name = signed.path.split('/').pop();
         return {
           resolver: 'fileditch',
-          title: name,
+          title: fresh.title || name,
+          pageTitle: fresh.title || null,
           files: [
             {
               id: fresh.url,
@@ -969,7 +1085,15 @@ function preferPageName(urlName, pageName) {
               size: 0,
               mime: 'video/mp4',
               kind: 'video',
-              ref: { resolver: 'fileditch', url: fresh.url, page, referer: page, name, path: signed.path },
+              ref: {
+                resolver: 'fileditch',
+                url: fresh.url,
+                page,
+                referer: page,
+                name,
+                path: signed.path,
+                cookie: fresh.cookie || null,
+              },
             },
           ],
         };
@@ -990,7 +1114,8 @@ function preferPageName(urlName, pageName) {
           const name = meta.name || decodeURIComponent(filePath.split('/').pop());
           return {
             resolver: 'fileditch',
-            title: name,
+            title: fresh.title || name,
+            pageTitle: fresh.title || null,
             files: [
               {
                 id: fresh.url,
@@ -998,7 +1123,15 @@ function preferPageName(urlName, pageName) {
                 size: meta.size || 0,
                 mime: 'video/mp4',
                 kind: 'video',
-                ref: { resolver: 'fileditch', url: fresh.url, page, referer: page, name, path: filePath },
+                ref: {
+                  resolver: 'fileditch',
+                  url: fresh.url,
+                  page,
+                  referer: page,
+                  name,
+                  path: filePath,
+                  cookie: fresh.cookie || null,
+                },
               },
             ],
           };
@@ -1009,17 +1142,21 @@ function preferPageName(urlName, pageName) {
         }
       }
 
-      const res = await fetchWithTimeout(url, {
-        headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml' },
-        redirect: 'follow',
-      }).catch(() => null);
-      if (!res || !res.ok) {
+      let fetched;
+      try {
+        fetched = await fetchPage(url);
+      } catch (err) {
+        /* A Cloudflare block is not fixed by a browser element capture. */
+        if (err.code === 'CLOUDFLARE') throw err;
+        fetched = { html: '', status: 0, url };
+      }
+      if (!fetched.html) {
         const viaBrowser = await pageBrowserFiles(url);
         if (viaBrowser && viaBrowser.length) return { resolver: 'fileditch', title: null, files: viaBrowser };
-        throw new ResolveError(`fileditch answered HTTP ${res ? res.status : 'nothing'}.`, 'FILEDITCH_FAILED');
+        throw new ResolveError(`fileditch answered HTTP ${fetched.status || 'nothing'}.`, 'FILEDITCH_FAILED');
       }
-      const html = await res.text();
-      const base = res.url || url;
+      const html = fetched.html;
+      const base = fetched.url || url;
       const { download, players } = fileditchLinks(html, base);
       const candidates = download.length ? download : players;
       if (!candidates.length) {
@@ -1064,10 +1201,16 @@ function preferPageName(urlName, pageName) {
             referer: base,
             name,
             path: payload ? payload.path : null,
+            cookie: fetched.cookie || null,
           },
         });
       }
-      return { resolver: 'fileditch', title: meta.name, files };
+      return {
+        resolver: 'fileditch',
+        title: fetched.title || meta.name,
+        pageTitle: fetched.title || meta.name,
+        files,
+      };
     },
     /**
      * Every URL worth trying, best first, freshly minted.
@@ -1082,18 +1225,21 @@ function preferPageName(urlName, pageName) {
       const page = ref.page && !signedPayload(ref.page) ? ref.page : null;
       const out = [];
 
+      const keep = (fresh) => {
+        out.push(...fresh.links);
+        /* The clearance cookie belongs to this minting; the CDN wants it back. */
+        if (fresh.cookie) ref.cookie = fresh.cookie;
+      };
       if (page) {
         try {
-          const fresh = await fileditchMint(page, filePath || null);
-          out.push(...fresh.links);
+          keep(await fileditchMint(page, filePath || null));
         } catch {
           /* page gone: fall back to what we stored */
         }
       }
       if (!out.length && filePath) {
         try {
-          const fresh = await fileditchMint(pageForPath(filePath), filePath);
-          out.push(...fresh.links);
+          keep(await fileditchMint(pageForPath(filePath), filePath));
         } catch {
           /* nothing minted */
         }
@@ -1265,6 +1411,18 @@ function preferPageName(urlName, pageName) {
     return headers;
   }
 
+  /** Ask the headless browser for a page's DOM, after any bot check has run. */
+  async function pageHtmlViaBrowser(url) {
+    if (!pageHtmlHook) return null;
+    try {
+      const result = await pageHtmlHook(url);
+      if (!result || !result.html) return null;
+      return result;
+    } catch {
+      return null;
+    }
+  }
+
   /** Ask the headless browser what media a page actually plays, if it is there. */
   async function pageBrowserFiles(url) {
     if (!pageBrowserHook) return null;
@@ -1301,6 +1459,10 @@ function preferPageName(urlName, pageName) {
     pageBrowserHook = typeof hook === 'function' ? hook : null;
   }
 
+  function setPageHtmlBrowser(hook) {
+    pageHtmlHook = typeof hook === 'function' ? hook : null;
+  }
+
   function setGofileBrowser(hook) {
     gofileBrowserHook = typeof hook === 'function' ? hook : null;
   }
@@ -1318,6 +1480,9 @@ function preferPageName(urlName, pageName) {
     isVideo,
     setGofileBrowser,
     setPageBrowser,
+    setPageHtmlBrowser,
+    pageTitleOf,
+    isChallenge,
     gofileDownloadHeaders,
   };
 });

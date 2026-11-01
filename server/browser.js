@@ -258,5 +258,76 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000 } = {}) {
   }
 }
 
-module.exports = { available, gofileFolder, captureMedia, UA };
+/* A page that is a bot check rather than the file's own page. */
+const CHALLENGE_TITLE = /just a moment|attention required|checking your browser|verifying you are human|ddos-guard|one more step/i;
+
+/**
+ * Load a page in a real browser and hand back its DOM once any bot check has
+ * run, plus the cookies the browser earned.
+ *
+ * This is the part Cloudflare actually checks: the challenge script runs, the
+ * browser solves it and gets a `cf_clearance` cookie. Passing that cookie back
+ * is what lets the server download the video afterwards — the CDN checks it
+ * again on the file request.
+ *
+ * @returns {Promise<{url: string, title: string, html: string, cookie: string|null, challenged: boolean}>}
+ */
+async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor = null } = {}) {
+  const pw = load();
+  if (!pw || !pw.chromium) {
+    throw Object.assign(new Error('The headless browser is not installed on this machine.'), {
+      code: 'BROWSER_UNAVAILABLE',
+    });
+  }
+
+  const browser = await pw.chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+  });
+  try {
+    const context = await browser.newContext({
+      userAgent: UA,
+      locale: 'en-US',
+      timezoneId: 'Europe/Lisbon',
+      viewport: { width: 1366, height: 900 },
+      extraHTTPHeaders: { 'accept-language': 'en-US,en;q=0.9' },
+    });
+    await context.addInitScript(() => {
+      // The cheapest automation tell there is; Cloudflare scores it.
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    const page = await context.newPage();
+    const started = Date.now();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
+
+    /* Wait for the challenge to finish: their interstitial reloads the page
+       itself, so the title is the reliable signal. */
+    let title = '';
+    let challenged = false;
+    while (Date.now() - started < timeoutMs) {
+      title = await page.title().catch(() => '');
+      challenged = CHALLENGE_TITLE.test(title);
+      if (!challenged) break;
+      await page.waitForTimeout(1200);
+    }
+    if (waitFor) {
+      await page.waitForSelector(waitFor, { timeout: Math.max(2000, timeoutMs - (Date.now() - started)) }).catch(() => {});
+    }
+    await page.waitForTimeout(settleMs);
+
+    const html = await page.content().catch(() => '');
+    const cookies = await context.cookies().catch(() => []);
+    return {
+      url: page.url(),
+      title: await page.title().catch(() => title),
+      html,
+      cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
+      challenged: CHALLENGE_TITLE.test(await page.title().catch(() => '')),
+    };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+module.exports = { available, gofileFolder, captureMedia, capturePage, UA };
 

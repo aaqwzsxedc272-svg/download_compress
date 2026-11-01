@@ -15,6 +15,8 @@ const {
   extractVideoUrls,
   pageDisplayName,
   preferPageName,
+  setPageHtmlBrowser,
+  pageTitleOf,
 } = require('../shared/resolve');
 
 let passed = 0;
@@ -45,7 +47,7 @@ function stubFetch(handler) {
     const status = (result && result.status) || 200;
     return new Response(body, {
       status,
-      headers: { 'content-type': (result && result.type) || 'application/json' },
+      headers: { 'content-type': (result && result.type) || 'application/json', ...((result && result.headers) || {}) },
     });
   };
   return calls;
@@ -365,6 +367,80 @@ const GOFILE_FOLDER = {
       assert.equal(result.files.length, 1, `${pasted} -> ${result.files.length} files`);
       assert.match(result.files[0].ref.url, /lumistretcheseverymorning/, `${pasted} -> ${result.files[0].ref.url}`);
     }
+  });
+
+  console.log('cloudflare');
+
+  const CHALLENGE = `<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>
+    <div id="challenge-platform"><noscript>Enable JavaScript and cookies to continue</noscript></div>
+    </body></html>`;
+  const clearance = { html: '<title>abc.mp4</title><a href="/signed/after-cf">⬇ Download</a>', cookie: 'cf_clearance=abc123', title: 'Just a moment...' };
+
+  await test('a bot check is recognised, not reported as "the page is gone"', async () => {
+    stubFetch(() => ({ status: 403, raw: CHALLENGE, type: 'text/html', headers: { 'cf-mitigated': 'challenge' } }));
+    setPageHtmlBrowser(null);
+    await assert.rejects(
+      () => resolve('https://theditch.st/qhygxukd'),
+      (err) => err.code === 'CLOUDFLARE' && /browser:install/.test(err.message),
+      'a Cloudflare block has to be named as one',
+    );
+  });
+
+  await test('the headless browser clears it and the page is read', async () => {
+    let ask = 0;
+    stubFetch(() => ({ status: 403, raw: CHALLENGE, type: 'text/html', headers: { 'cf-mitigated': 'challenge' } }));
+    setPageHtmlBrowser(async (url) => {
+      ask += 1;
+      assert.match(url, /fileditchvids\.st|theditch\.st/);
+      return clearance;
+    });
+    const result = await resolve('https://fileditchfiles.me/b78/abc.mp4');
+    setPageHtmlBrowser(null);
+    assert.equal(ask, 1, `the browser was asked ${ask} times`);
+    assert.equal(result.files.length, 1);
+    assert.match(result.files[0].ref.url, /\/signed\/after-cf$/, result.files[0].ref.url);
+  });
+
+  await test('the clearance cookie rides along, or the file request is blocked again', async () => {
+    stubFetch(() => ({ status: 403, raw: CHALLENGE, type: 'text/html', headers: { 'cf-mitigated': 'challenge' } }));
+    setPageHtmlBrowser(async () => clearance);
+    const result = await resolve('https://fileditchfiles.me/b78/abc.mp4');
+    setPageHtmlBrowser(null);
+    assert.equal(result.files[0].ref.cookie, 'cf_clearance=abc123');
+  });
+
+  await test('a page that is not a challenge is read without the browser', async () => {
+    let asked = false;
+    stubFetch(() => ({
+      raw: '<title>Real Page</title><a href="/signed/plain">⬇ Download</a>',
+      type: 'text/html',
+    }));
+    setPageHtmlBrowser(async () => {
+      asked = true;
+      return clearance;
+    });
+    const result = await resolve('https://theditch.st/qhygxukd');
+    setPageHtmlBrowser(null);
+    assert.equal(asked, false, 'a normal page should not cost a headless browser');
+    assert.match(result.files[0].ref.url, /\/signed\/plain$/);
+  });
+
+  await test('the tab title of the linked page is kept, separately from the file name', async () => {
+    stubFetch(() => ({
+      raw: '<title>Holiday clip — fileditch</title>' +
+        '<video src="https://fileditchvids.st/b78/abc.mp4"></video>' +
+        '<a href="/signed/abc">⬇ Download</a>',
+      type: 'text/html',
+    }));
+    const result = await resolve('https://theditch.st/qhygxukd');
+    assert.equal(result.pageTitle, 'Holiday clip — fileditch', JSON.stringify(result.pageTitle));
+    assert.notEqual(result.files[0].name, result.pageTitle, 'the file name and the tab title are different things');
+  });
+
+  await test('a <title> is read the way a browser tab shows it', async () => {
+    assert.equal(pageTitleOf('<title>A &amp; B</title>'), 'A & B');
+    assert.equal(pageTitleOf('<title>  spaced   out </title>'), 'spaced out');
+    assert.equal(pageTitleOf('<html>no title</html>'), null);
   });
 
   console.log('page titles');

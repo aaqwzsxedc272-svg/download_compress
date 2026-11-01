@@ -25,11 +25,21 @@ const {
   DEFAULT_PRESET,
   getPreset,
   buildPlan,
+  segmentArgs,
+  muxArgs,
   targetTooSmall,
 } = require('./compress');
+const segments = require('./segments');
 const hosters = require('./hosters');
 const sources = require('./sources');
-const { resolve, directUrl, directCandidates, setGofileBrowser, setPageBrowser } = require('../shared/resolve');
+const {
+  resolve,
+  directUrl,
+  directCandidates,
+  setGofileBrowser,
+  setPageBrowser,
+  setPageHtmlBrowser,
+} = require('../shared/resolve');
 
 /* gofile mints its API token in an obfuscated browser script, so a headless
    browser is the only way to list a folder once the plain API says no. It is an
@@ -39,6 +49,9 @@ try {
   if (browser.available()) {
     setGofileBrowser((code) => browser.gofileFolder(code));
     setPageBrowser((url) => browser.captureMedia(url));
+    /* Cloudflare-protected pages (fileditch among them): a real browser runs
+       the challenge and hands back the DOM plus the clearance cookie. */
+    setPageHtmlBrowser((url) => browser.capturePage(url, { waitFor: 'a[href], video, source' }));
   }
 } catch {
   /* no browser helper on this deployment */
@@ -229,6 +242,139 @@ async function copyOriginal(job, paths, meta, notes, signal) {
   }
 }
 
+/**
+ * Encode a long video in pieces, so a machine that stops only costs the piece
+ * it was in the middle of.
+ *
+ * Everything the pieces need to fit together is pinned in `segments.json` the
+ * first time: the CRF, the output size, the chunk length, the preset. A restart
+ * reads that file back and encodes only what is missing — which is why a resumed
+ * job must not re-decide its own quality settings: a different CRF halfway
+ * through a file is visible.
+ */
+async function runSegmented(job, plan, paths, meta, controller, { robust = false, maxShortSide = null } = {}) {
+  const duration = Number(meta.duration) || 0;
+  const existing = await segments.read(job.dir);
+  const sameSettings =
+    existing &&
+    existing.crf === plan.crf &&
+    existing.chunkSeconds > 0 &&
+    existing.width === plan.size.width &&
+    existing.height === plan.size.height &&
+    existing.robust === Boolean(robust);
+
+  let state;
+  if (sameSettings) {
+    state = existing;
+  } else {
+    /* Different settings (or the first run): old pieces cannot be joined with
+       new ones, so they go. */
+    await segments.clear(job.dir);
+    state = {
+      version: 1,
+      chunkSeconds: segments.chunkSecondsFor(duration),
+      total: 0,
+      done: [],
+      crf: plan.crf,
+      maxShortSide: Number.isFinite(maxShortSide) ? maxShortSide : null,
+      width: plan.size.width,
+      height: plan.size.height,
+      presetId: job.presetId,
+      robust: Boolean(robust),
+      startedAt: Date.now(),
+    };
+  }
+
+  const pieces = segments.plan({ duration, chunkSeconds: state.chunkSeconds });
+  state.total = pieces.length;
+  const done = await segments.finishedParts(job.dir, state);
+  state.done = [...done].sort((a, b) => a - b);
+  await segments.write(job.dir, state);
+
+  const already = state.done.length;
+  if (already) {
+    job.resumeFrom = Math.round((already / pieces.length) * 100) / 100;
+    console.log(`[job ${job.id}] resuming: ${already}/${pieces.length} parts were already encoded`);
+    jobsStore.updateJob(job, {
+      stage: `Picking up where it stopped — ${already} of ${pieces.length} parts done`,
+    });
+  }
+  await fsp.mkdir(segments.dirFor(job.dir), { recursive: true });
+  jobsStore.updateJob(job, { segmentsDone: already, segmentsTotal: pieces.length });
+
+  for (const piece of pieces) {
+    if (done.has(piece.index)) continue;
+    if (controller.signal.aborted) {
+      throw Object.assign(new Error('Cancelled.'), { code: 'CANCELLED' });
+    }
+    const out = segments.fileFor(job.dir, piece.index);
+    await fsp.rm(out, { force: true }).catch(() => {});
+    const args = segmentArgs({
+      input: paths.source,
+      output: out,
+      meta,
+      size: plan.size,
+      preset: getPreset(job.presetId),
+      crf: plan.crf,
+      robust,
+      start: piece.start,
+      length: piece.length,
+    });
+    await transcode(paths.source, out, args, {
+      signal: controller.signal,
+      duration: piece.length,
+      onProgress: ({ seconds, speed }) => {
+        const within = Math.min(1, (Number(seconds) || 0) / piece.length);
+        const position = piece.start + within * piece.length;
+        job.progress = Math.min(0.999, position / duration);
+        if (speed > 0) {
+          job.speed = speed;
+          job.etaSeconds = Math.round((duration - position) / speed);
+        }
+        jobsStore.updateJob(job, {
+          stage: `Encoding part ${piece.index + 1} of ${pieces.length} — resumable`,
+          segmentsDone: piece.index,
+          segmentsTotal: pieces.length,
+        });
+      },
+    });
+    const stat = await fsp.stat(out);
+    if (!stat.size) throw Object.assign(new Error('A part of the encode came out empty.'), { code: 'EMPTY_OUTPUT' });
+
+    done.add(piece.index);
+    state.done = [...done].sort((a, b) => a - b);
+    await segments.write(job.dir, state);
+    jobsStore.updateJob(job, { segmentsDone: done.size, segmentsTotal: pieces.length });
+  }
+
+  /* All the pieces are on disk: join them and add the audio in one pass. */
+  jobsStore.updateJob(job, { stage: 'Joining the parts', progress: 0.999 });
+  const listPath = await segments.writeConcatFile(job.dir, pieces);
+  const audio = plan.audio || { mode: 'aac', kbps: getPreset(job.presetId).audioKbps };
+  await transcode(paths.source, paths.output, muxArgs({
+    listPath,
+    source: paths.source,
+    output: paths.output,
+    audio,
+    preset: getPreset(job.presetId),
+    robust,
+  }), { signal: controller.signal, duration });
+
+  /* The joined file is checked before the pieces are thrown away: a join that
+     silently lost a part would be worse than no resume at all. */
+  const joined = await probe(paths.output).catch(() => null);
+  if (!joined || !joined.duration || joined.duration < duration * 0.9) {
+    throw Object.assign(
+      new Error(
+        `The joined file is ${joined && joined.duration ? `${Math.round(joined.duration)}s` : 'unreadable'} ` +
+          `instead of ${Math.round(duration)}s.`,
+      ),
+      { code: 'JOIN_FAILED' },
+    );
+  }
+  await segments.cleanup(job.dir);
+}
+
 /** "video: hevc · audio: truehd", for when the encoder refuses a file. */
 function codecSummary(meta) {
   const parts = [];
@@ -300,9 +446,24 @@ async function compressJob(job) {
   let skipEncode = false;
   /* "Just download": some sources are slow to pull from, and the point is a
      fast copy served from this machine (or a host), not a smaller file. */
+  /* A job that was already encoding has its quality settings pinned on disk.
+     Re-deciding them now would stitch two different encodes together. */
+  const resumeState = job.noCompress || job.targetMb ? null : await segments.read(job.dir);
+
   if (job.noCompress) {
     skipEncode = true;
     notes.push('Saved without re-encoding, exactly as downloaded — this was a “just download” job.');
+  } else if (resumeState && resumeState.crf) {
+    crfOverride = resumeState.crf;
+    /* The scale cap the first run used, not its result: buildPlan() has to
+       arrive at exactly the same frame size to keep the pieces joinable. */
+    scaleOverride = 'maxShortSide' in resumeState ? resumeState.maxShortSide : null;
+    const doneParts = Array.isArray(resumeState.done) ? resumeState.done.length : 0;
+    notes.push(
+      doneParts
+        ? `Picked up after a restart: ${doneParts} of ${resumeState.total} parts were already encoded and are kept.`
+        : 'Picked up after a restart with the settings this file started with.',
+    );
   } else if (!job.targetMb) {
     jobsStore.updateJob(job, { stage: 'Checking what is worth encoding' });
     const pick = await chooseCrf({
@@ -398,8 +559,23 @@ async function compressJob(job) {
       scaleNote = plan.scaleNote;
       outSize = { width: plan.size.width, height: plan.size.height };
 
+      /* Long single-pass encodes are cut into parts so a stopped machine can
+         carry on from the last finished part instead of from zero. Two-pass
+         (a size target) and short clips stay in one piece. */
+      const resumable =
+        !plan.twoPass &&
+        meta.duration >= segments.MIN_DURATION_SECONDS &&
+        process.env.SEGMENTED !== '0';
+
       try {
-        await runPasses(job, plan, paths, meta, controller);
+        if (resumable) {
+          await runSegmented(job, plan, paths, meta, controller, {
+            robust: attempt > 0,
+            maxShortSide: scaleOverride,
+          });
+        } else {
+          await runPasses(job, plan, paths, meta, controller);
+        }
         break;
       } catch (err) {
         /* Stopped on purpose, from the job card: what the user wants is the
@@ -408,6 +584,7 @@ async function compressJob(job) {
           jobsStore.updateJob(job, { stage: 'Keeping the original', progress: 1 });
           await fsp.rm(paths.output, { force: true }).catch(() => {});
           await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+          await segments.clear(job.dir).catch(() => {});
           job.noCompress = true;
           usedOriginal = true;
           notes.push('The encode was stopped on request, so the file is handed back exactly as downloaded.');
@@ -423,6 +600,8 @@ async function compressJob(job) {
         attempt += 1;
         await fsp.rm(paths.output, { force: true }).catch(() => {});
         await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+        /* Different encoder settings: the parts on disk no longer fit. */
+        await segments.clear(job.dir).catch(() => {});
         notes.push('The first try tripped over something in this file (its container or bit depth), so it was retried in a more forgiving mode.');
         console.log(`[job ${job.id}] ffmpeg retry: ${err.detail || err.message?.slice(0, 200)}`);
         jobsStore.updateJob(job, { stage: 'Retrying with more forgiving encoder settings' });
@@ -774,6 +953,10 @@ const FRIENDLY = {
   TOO_BIG: 'That file is larger than this server accepts.',
   UNREACHABLE: 'This server could not reach that link.',
   BAD_STATUS: 'The link did not return a video.',
+  CLOUDFLARE:
+    'That host answers with a Cloudflare browser check, which a plain request cannot pass. ' +
+    'Install the browser helper once in this project — `npm run browser:install` — and the page is opened ' +
+    'like a visitor would open it. Meanwhile “Save file” downloads it in your own browser and the drop zone takes it.',
   FILEDITCH_FAILED: 'That fileditch link has expired or the page is gone. Paste the page itself (theditch.st/… or fileditchfiles.me/…) and a fresh link is minted for you.',
   FILEDITCH_NO_LINK: 'fileditch did not offer a download for that page — it may have been removed.',
   FILESTER_BLOCKED: 'filester refused the request (its bot protection). Paste the share page again, or pick another host.',
@@ -839,6 +1022,7 @@ function reportJobError(job, err) {
   const paths = jobsStore.jobPaths(job);
   fsp.rm(paths.source, { force: true }).catch(() => {});
   fsp.rm(paths.output, { force: true }).catch(() => {});
+  segments.clear(job.dir).catch(() => {});
 }
 
 /**
@@ -898,6 +1082,9 @@ async function fetchThenCompress(job, ref) {
         /* keep referer only */
       }
     }
+    /* A Cloudflare clearance earned while reading the page is what the CDN
+       checks again on the file itself. */
+    if (ref && ref.cookie) refHeaders.cookie = ref.cookie;
     const downloadOptions = {
       maxBytes: MAX_UPLOAD_BYTES,
       extraHeaders: refHeaders,
@@ -1179,6 +1366,14 @@ app.get('/api/health', async (req, res) => {
     email: notify.describe(),
     publish: await publish.describe(),
     browserHosters: ['gofile', 'pixeldrain'],
+    /* Cloudflare-protected hosts need this one to be true. */
+    browserAvailable: (() => {
+      try {
+        return require('./browser').available();
+      } catch {
+        return false;
+      }
+    })(),
     /* What the last start picked up off the disk. */
     recovery: {
       resumedSinceStart: jobsStore.listJobs().filter((job) => job.resumed).length,
@@ -1298,6 +1493,8 @@ app.post('/api/resolve', async (req, res) => {
     return res.json({
       resolver: result.resolver,
       title: result.title || null,
+      /* The linked page's own <title>: what its browser tab says. */
+      pageTitle: result.pageTitle || null,
       files: result.files.map((file) => ({
         name: file.name,
         size: file.size || 0,
@@ -1353,6 +1550,7 @@ app.post('/api/jobs', async (req, res) => {
       name: body.name,
       ref,
       hostOrder,
+      sourceTitle: body.sourceTitle ? String(body.sourceTitle).slice(0, 180) : null,
     });
     res.status(201).json({ job: jobsStore.publicView(job) });
     fetchThenCompress(job, ref);
@@ -1517,6 +1715,9 @@ app.post('/api/jobs', async (req, res) => {
     noCompress,
     name: body.name || file.name,
     ref: file.ref,
+    /* What a browser tab shows for the *link* — the page's own <title>, not
+       the name of the file that comes out of it. */
+    sourceTitle: resolved.pageTitle || null,
   });
   res.status(201).json({ job: jobsStore.publicView(job) });
   fetchThenCompress(job, file.ref);

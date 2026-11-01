@@ -290,6 +290,9 @@ function updateCard(entry, job) {
     if (dur) bits.push(dur);
   }
   if (job.status === 'compressing') {
+    /* A long encode runs in parts so a stopped machine can carry on: saying
+       which part is running is the difference between "stuck" and "working". */
+    if (job.segmentsTotal > 1) bits.push(`part ${Math.min(job.segmentsTotal, (job.segmentsDone || 0) + 1)}/${job.segmentsTotal} kept`);
     if (job.speed) bits.push(`${job.speed.toFixed(1)}×`);
     const eta = formatDuration(job.etaSeconds);
     if (eta) bits.push(`${eta} left`);
@@ -325,7 +328,9 @@ function updateCard(entry, job) {
   const sourceEl = $('[data-field="source"]', el);
   if (sourceEl) {
     const sourceUrl = job.url || '';
-    const tabTitle = job.tabTitle || job.outputName || '';
+    /* The tab title of the *link*, which is what was asked for: opening the
+       source page shows this, whatever the compressed file ends up called. */
+    const tabTitle = job.sourceTitle || (job.source === 'upload' || job.source === 'sample' ? '' : job.name || '');
     const link = $('[data-field="sourceUrl"]', sourceEl);
     const tab = $('[data-field="tabTitle"]', sourceEl);
     sourceEl.hidden = !(sourceUrl || tabTitle);
@@ -342,7 +347,7 @@ function updateCard(entry, job) {
       tab.hidden = !tabTitle;
       tab.textContent = tabTitle ? `tab: ${tabTitle}` : '';
       tab.title = tabTitle
-        ? `A browser tab showing this file says “${tabTitle}” — and it is the name it saves under.`
+        ? `Opening the link in a browser tab shows “${tabTitle}”.`
         : '';
     }
   }
@@ -1026,6 +1031,7 @@ async function startPickerFile(file, { pageUrl, mode, noCompress = false }) {
         ref: file.ref,
         name: file.name,
         pageUrl,
+        ...(sourceTabTitle ? { sourceTitle: sourceTabTitle } : {}),
         ...opts,
         ...(noCompress ? { noCompress: true } : {}),
       }),
@@ -1046,6 +1052,10 @@ function knownTotal(files) {
  * mode 'server'  -> the server downloads them itself
  * mode 'browser' -> your browser fetches the bytes and streams them over
  */
+/* What the linked page's own browser tab says. Set on every resolve, used by
+   whatever job the picker (or the single-file path) starts from it. */
+let sourceTabTitle = null;
+
 function showPicker({ pageUrl, resolver, title, files, mode }) {
   clearPicker();
   const panel = document.createElement('section');
@@ -1393,12 +1403,14 @@ async function resolveLink(url) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url }),
     });
+    sourceTabTitle = result.pageTitle || null;
     return { ...result, mode: 'server' };
   } catch (serverErr) {
     // The server often cannot reach consumer file hosts; browsers usually can.
     if (!window.SqueezeResolve) throw serverErr;
     try {
       const result = await window.SqueezeResolve.resolve(url);
+      sourceTabTitle = result.pageTitle || null;
       return { ...result, mode: 'browser' };
     } catch (browserErr) {
       throw Object.assign(new Error(describeFailure(url, serverErr, browserErr)), {
@@ -1435,7 +1447,14 @@ async function handleLink(raw) {
     ({ job } = await api('/api/jobs', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ source: 'ref', ref: file.ref, name: file.name, pageUrl: url, ...currentOptions() }),
+      body: JSON.stringify({
+        source: 'ref',
+        ref: file.ref,
+        name: file.name,
+        pageUrl: url,
+        ...(sourceTabTitle ? { sourceTitle: sourceTabTitle } : {}),
+        ...currentOptions(),
+      }),
     }));
   } else {
     const direct = await window.SqueezeResolve.directUrl(file.ref);

@@ -274,6 +274,74 @@ function buildPlan({
   };
 }
 
+/* ------------------------------------------------------- resumable encoding */
+
+/**
+ * The ffmpeg arguments for one chunk of a resumable encode.
+ *
+ * These mirror the single-pass plan exactly (same encoder, preset, CRF, filter
+ * chain, rate ceiling), with three differences that make the pieces joinable:
+ * the input is seeked to the chunk's start, the chunk is trimmed to its length,
+ * and no audio is encoded — the audio for the whole file is added once, when
+ * the pieces are joined (see `muxArgs`).
+ */
+function segmentArgs({ input, output, meta, size, preset, crf, robust = false, start, length }) {
+  const inputArgs = robust ? ['-fflags', '+genpts'] : [];
+  const outputArgs = robust ? ['-max_muxing_queue_size', '4096', '-max_interleave_delta', '0'] : [];
+  return [
+    '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+    /* -ss before -i seeks by index: instant on a long file, and accurate when
+       re-encoding because every frame after the seek point is decoded. */
+    '-ss', start.toFixed(3),
+    ...inputArgs,
+    '-i', input,
+    '-t', length.toFixed(3),
+    ...outputArgs,
+    '-map', '0:v:0',
+    '-sn', '-dn',
+    '-map_metadata', '-1',
+    '-c:v', 'libx264',
+    '-preset', preset.x264Preset,
+    '-pix_fmt', 'yuv420p',
+    ...(robust ? [] : ['-profile:v', 'high']),
+    ...videoFilter(meta, size, { robust }),
+    '-crf', String(crf),
+    '-maxrate', '16M',
+    '-bufsize', '32M',
+    '-an',
+    '-progress', 'pipe:1',
+    '-nostats',
+    output,
+  ];
+}
+
+/**
+ * Joining the pieces: copy the video (no re-encode, so no quality is lost
+ * twice) and encode the audio once, straight from the source, so its timeline
+ * starts at zero and cannot drift at a seam.
+ */
+function muxArgs({ listPath, source, output, audio, preset, robust = false }) {
+  const audioArgs =
+    audio.mode === 'copy' && !robust
+      ? ['-c:a', 'copy']
+      : audio.mode === 'none'
+        ? ['-an']
+        : ['-c:a', 'aac', '-b:a', `${Math.min(Number(audio.kbps || preset.audioKbps) || 128, 192)}k`, '-ac', '2'];
+  return [
+    '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+    '-f', 'concat', '-safe', '0', '-i', listPath,
+    '-i', source,
+    '-map', '0:v:0',
+    ...(audio.mode === 'none' ? [] : ['-map', '1:a:0?']),
+    '-c:v', 'copy',
+    ...audioArgs,
+    '-movflags', '+faststart',
+    '-shortest',
+    ...(robust ? ['-max_muxing_queue_size', '4096'] : []),
+    output,
+  ];
+}
+
 /** True when a target-size request leaves too little room for usable video. */
 function targetTooSmall({ duration, hasAudio }, preset, targetMb) {
   if (!duration) return false;
@@ -292,5 +360,7 @@ module.exports = {
   targetSize,
   audioPlan,
   buildPlan,
+  segmentArgs,
+  muxArgs,
   targetTooSmall,
 };

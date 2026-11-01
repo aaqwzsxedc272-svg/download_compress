@@ -87,7 +87,7 @@ Squeeze detects it at startup and reports it on `/api/health`.
 | **turbo.cr** | server only | share pages are signed via `api/sign`; the CDN allows no cross-origin reads |
 | **bunkr** | server only | follows the signed-CDN flow; rotates domains, often bot-protected |
 | **filester.me** | server only | public metadata + share-page scrape; behind DDoS-Guard; takes the file's real name from the page, not the CDN's UUID |
-| **fileditch** (`theditch.st`, `fileditch.st`, `fileditchfiles.me`) | server only | three URL shapes for one video: the share page, the signed link it hands out, and the file host. `fileditchfiles.me/…` answers 500 to a plain request, so it is resolved through the player page (`fileditchvids.st`) instead; the signed link lives ~26 minutes, so a fresh one is minted at fetch time and the player URL is the backup route |
+| **fileditch** (`theditch.st`, `fileditch.st`, `fileditchfiles.me`) | server only, needs `npm run browser:install` | three URL shapes for one video: the share page, the signed link it hands out, and the file host. All three sit behind Cloudflare, so the page is opened in a real browser and its clearance cookie is reused for the download. `fileditchfiles.me/…` answers 500 to a plain request, so it is resolved through the player page (`fileditchvids.st`); the signed link lives ~26 minutes, so a fresh one is minted at fetch time |
 | direct `.mp4` / `.webm` | yes | no resolution needed |
 | any page with a video | yes | `og:video`, `<video>`, `<source>`, JSON-LD |
 
@@ -163,6 +163,22 @@ path produced 1280×720 at CRF 24, 15% smaller, prediction within 0.5% of the re
 Fixed-size requests ("fit in N MB") are still supported: the encoder runs two passes so the bits
 land where the detail is. Audio is copied untouched whenever the source is already AAC under
 192 kbps, so nothing is spent re-encoding it.
+
+## What the page shows while a file is being made
+
+Every file in the queue answers three questions without being clicked:
+
+- **Where it came from.** The link itself, on its own line, clickable and opened in a new tab so
+  the app keeps running.
+- **What that link's browser tab says.** Not the name of the file that comes out of it — the
+  `<title>` of the page the link points at, read while the link is resolved. That is the thing
+  that is on screen when the link is opened, so it is the thing worth showing; for a direct
+  `.mp4` URL the two are the same by definition.
+- **How far along it is, and whether a restart would keep the work.** *Encoding part 5 of 12 —
+  resumable* instead of a bare percentage.
+
+The outputs keep their own naming rule (`Name small.mp4`, `Name 720p.mp4`), and the download route
+carries that name in its URL so the browser's save dialog and any download manager agree with it.
 
 ## Just download it (no re-encoding)
 
@@ -252,6 +268,9 @@ fly deploy
 | `AUTO_PUBLISH` | on | Posts the links to the first working sink when the queue drains; `0` disables |
 | `PUBLISH` | auto | `gist,webhook,ntfy,repo,paste` in the order you want; `off` disables |
 | `PUBLISH_WEBHOOK` | — | JSON POST target (Discord, Slack, n8n, …); also settable on the page, which wins |
+| `SEGMENTED` | on | `0` encodes every file in one piece (no resumable parts) |
+| `SEGMENT_SECONDS` | auto | force a part length in seconds (auto: ~a twelfth of the file, 60–300 s) |
+| `SEGMENT_MIN_SECONDS` | `240` | only files longer than this are encoded in parts |
 | `PUBLISH_EVERY_SECONDS` | `60` | a finished file's link is posted this soon after it exists (batched); `0` waits for the queue to drain |
 | `PUBLISH_NTFY` | — | ntfy topic for a phone notification |
 | `PUBLISH_REPO` | off | `1` commits `LINKS.md` to the repo and pushes it |
@@ -469,7 +488,31 @@ headless browser: the page is opened for real, the media request it makes is obs
 referer and cookie), and the bytes are fetched with exactly those headers. If that still fails the
 job says so instead of pretending; the file can always be dropped on the page by hand.
 
-`npm run test:fallback` covers that path against a fake host that refuses plain requests.
+**Cloudflare is a separate problem, and fileditch is behind it.** A challenge is not a 403 that
+better headers fix: the page has to *run its JavaScript* and earn a `cf_clearance` cookie, and the
+same cookie is then checked again when the video is requested. So a page fetch goes:
+
+1. **A plain request with a browser's headers** (`sec-ch-ua`, `sec-fetch-*`, `accept-language`).
+   Most pages answer it and cost nothing.
+2. **A real browser** (`playwright`, optional) when the answer is a challenge — detected by
+   `cf-mitigated: challenge`, a 403/503 from a Cloudflare front, or the interstitial's own text.
+   Chromium runs the challenge, waits for the page to become the real page, and hands back the DOM
+   **plus its cookie jar**. The resolver then mints the signed link from that DOM, and the download
+   sends `cf_clearance` along with the request.
+3. **An honest failure** if neither works: `That host answers with a Cloudflare browser check…`
+   with the one command that fixes it, never "the file was removed" when it was not.
+
+The browser is optional because it is ~150 MB of Chromium:
+
+```bash
+npm run browser:install      # npm install --no-save playwright && npx playwright install chromium
+```
+
+`/api/health` reports `browserAvailable`, so the page knows whether step 2 exists on this machine.
+
+`npm run test:fallback` covers the observe-the-media path against a fake host that refuses plain
+requests, and `npm run test:resolve` covers the Cloudflare path (challenge detected → browser
+asked → cookie carried → and a normal page never costs a browser).
 
 ## Saving results, and not paying for an idle machine
 
@@ -530,13 +573,37 @@ the encode carries on. Two things follow from that, and both are tested rather t
   | Stopped while | What is on disk | What happens on the next start |
   | --- | --- | --- |
   | downloading | a half-written `source` | the fragment is deleted and the file is fetched again, into the same job |
-  | encoding | the whole `source` | the encoder starts again from that file, no re-download |
+  | encoding | the whole `source`, **plus every part already encoded** | the encoder starts again on the *unfinished parts only* (see below) |
   | uploading | the finished `output.mp4` | it is uploaded again; the job is never marked failed |
   | done, posted | the ledger and the link | nothing to do — the link already works |
 
   The page says so too: a restart shows *“This machine stopped before, so 2 files were picked up
   where they left off”*, and each resumed card is tagged *picked up after a restart*. Set
   `RESUME_INTERRUPTED=0` to opt out.
+### A long encode resumes where it stopped, not at the beginning
+
+Restarting a two-hour encode from zero is the difference between "I lost ten minutes" and "I lost
+an hour and a half", so a long file is not encoded in one piece:
+
+- it is cut into **parts** (about twelve of them, between one and five minutes each) and every
+  finished part is written to disk and recorded in `<job>/segments.json` the moment it is done;
+- the parts are **video only**. Joining separately encoded AAC streams leaves a click at every
+  seam, so the audio is encoded once, at the end, from the source — a couple of minutes for a
+  two-hour film, and no drift;
+- the last step **joins** the parts with `-c copy` (the video is not encoded a second time) and
+  muxes the audio in. The joined file is probed before the parts are deleted: a join that lost a
+  part fails loudly instead of handing back a short video.
+
+A restart reads `segments.json`, keeps every part that is still on disk, and encodes only the rest.
+The quality settings are **pinned in that file**, so a resumed job cannot re-decide its own CRF
+halfway through a film — a different CRF in the middle of a file is visible as a shift. The card
+says *Encoding part 5 of 12 — resumable*, and after a restart *Picking up where it stopped — 6 of
+12 parts done*.
+
+The cost is a couple of percent of file size (each part starts a fresh encode), which buys back
+however long the machine had already spent. Short files (<4 min), `targetMb` jobs (two passes
+cannot be split) and `SEGMENTED=0` keep the single-pass, whole-file encode.
+
 - **The two things that can still be lost** are the encoder's *remaining* time (never the whole
   job) and a finished file that was never uploaded, if the container itself is deleted. GitHub
   Codespaces deletes a stopped codespace after 30 days; that is the only deadline that matters,
@@ -591,8 +658,8 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
-- `npm run test:resolve` — 28 resolver tests against stubbed APIs (real response shapes),
-  including the three URL shapes a fileditch page hands out,
+- `npm run test:resolve` — 34 resolver tests against stubbed APIs (real response shapes),
+  including the three URL shapes a fileditch page hands out and the Cloudflare path,
   including the page-title naming rule and fileditch's minted-link/player routes.
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
@@ -623,6 +690,9 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:durability` — a job finishes with nobody watching, and its link survives the
   server being killed and restarted.
 - `npm run test:resume` — an encode killed at 6% finishes after a restart (takes ~5 minutes).
+- `npm run test:segments` — 18 checks: the parts cover the file exactly, a real encode is killed
+  mid-way, the parts from before the crash are reused (their mtimes prove it), and the joined
+  file is as long as the source with its audio.
 - `npm run test:recover` — 26 checks: a download cut in half resumes, a job left mid-upload is
   uploaded again, "just download it" pressed mid-encode returns the original byte for byte, and a
   finished file's link is posted before the queue has drained.

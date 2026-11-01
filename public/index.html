@@ -115,11 +115,12 @@
       <h2>Your videos</h2>
       <button class="ghost" id="clearDone" type="button">Clear finished</button>
     </div>
+    <p class="jobs-note">Encoding runs on the server, not in this tab — close it and the job keeps going.</p>
     <div class="job-list" id="jobList"></div>
   </section>
   <section class="results card" id="resultsSection" hidden>
     <div class="results-head">
-      <h2 class="results-title">Results</h2>
+      <h2 class="results-title">Your links</h2>
       <div class="results-tools">
         <button class="ghost" id="copyAllLinks" type="button">Copy all links</button>
         <button class="ghost" id="saveLinks" type="button">Save links file</button>
@@ -127,7 +128,10 @@
       </div>
     </div>
     <p class="results-hint" id="resultsHint">
-      Share links live on the file host, so they keep working after this machine is stopped.
+      Every share link is saved on this machine's disk, so it is still here after a closed tab or a restarted server.
+    </p>
+    <p class="results-hint results-sub" id="linksNote">
+      They are also in <a href="/api/links.txt" target="_blank" rel="noopener">links.txt</a> — plain text, one link per line.
     </p>
     <div class="results-list" id="resultsList"></div>
   </section>

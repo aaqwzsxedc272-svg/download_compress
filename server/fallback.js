@@ -22,12 +22,31 @@ const RECOVERABLE = new Set(['HTML_PAGE', 'BAD_STATUS', 'UNREACHABLE']);
  * @param {object}   opts.download   an async (url, destPath, options) => void
  * @param {Function} opts.capture    async (pageUrl) => { media: [{url, referer}], cookie }
  * @param {object}   opts.options    options forwarded to the downloader
+ * @param {Function} opts.refresh    async () => a freshly minted URL for the same
+ *                                   file, for hosts whose links expire
  */
-async function downloadWithFallback({ url, pageUrl, destPath, download, capture, options = {} }) {
+async function downloadWithFallback({ url, pageUrl, destPath, download, capture, options = {}, refresh }) {
   try {
     await download(url, destPath, options);
     return { usedBrowser: false, url };
-  } catch (err) {
+  } catch (firstError) {
+    let err = firstError;
+
+    /* Short-lived signed links (fileditch's rotate every ~30 minutes) go stale
+       while a job sits in the queue. Ask the page for another one and retry
+       before spending a headless browser on it. */
+    if (typeof refresh === 'function') {
+      const again = await refresh().catch(() => null);
+      if (again && again !== url) {
+        try {
+          await download(again, destPath, options);
+          return { usedBrowser: false, url: again, refreshed: true };
+        } catch (next) {
+          err = next;
+        }
+      }
+    }
+
     if (!RECOVERABLE.has(err.code) || typeof capture !== 'function') throw err;
 
     const captured = await capture(pageUrl || url).catch(() => null);

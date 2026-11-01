@@ -214,6 +214,31 @@ async function freeDiskBytes(dir) {
 }
 
 /** Stream a remote file to disk, reporting byte progress. */
+/** "attachment; filename*=UTF-8''Name.mp4" / filename="Name.mp4" -> Name.mp4 */
+function filenameFrom(header) {
+  if (!header) return null;
+  const star = /filename\*\s*=\s*([^']*)''([^;]+)/i.exec(header);
+  if (star) {
+    try {
+      return decodeURIComponent(star[2].trim().replace(/^"|"$/g, ''));
+    } catch {
+      /* malformed escape: fall through */
+    }
+  }
+  const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(header);
+  return plain ? plain[1].trim() : null;
+}
+
+/** The last path segment, when it looks like a file name rather than a token. */
+function filenameFromUrl(raw) {
+  try {
+    const last = decodeURIComponent(new URL(raw).pathname.split('/').filter(Boolean).pop() || '');
+    return /\.[a-z0-9]{2,5}$/i.test(last) ? last : null;
+  } catch {
+    return null;
+  }
+}
+
 async function downloadHttp(
   url,
   destPath,
@@ -291,6 +316,10 @@ async function downloadHttp(
 
   const total = Number(res.headers.get('content-length') || 0);
   const type = (res.headers.get('content-type') || '').toLowerCase();
+  /* The host knows what the file is called; a signed CDN URL usually does not.
+     Content-Disposition is the only place a name like "Holiday in Rome.mp4"
+     survives, and it is what filester was losing. */
+  const filename = filenameFrom(res.headers.get('content-disposition')) || filenameFromUrl(res.url);
   if (total > maxBytes) {
     clearTimeout(idle);
     res.body.cancel().catch(() => {});
@@ -334,7 +363,7 @@ async function downloadHttp(
     if (outerSignal) outerSignal.removeEventListener('abort', forwardAbort);
   }
 
-  return { bytes: received, contentType: type };
+  return { bytes: received, contentType: type, filename, url: res.url || url };
 }
 
 module.exports = {
@@ -350,4 +379,6 @@ module.exports = {
   downloadHttp,
   isBlockedHost,
   freeDiskBytes,
+  filenameFrom,
+  filenameFromUrl,
 };

@@ -11,6 +11,7 @@ const jobsStore = require('./jobs');
 const { probe, thumbnail, transcode } = require('./ffmpeg');
 const { downloadWithFallback } = require('./fallback');
 const autoStop = require('./autostop');
+const ledger = require('./ledger');
 const { chooseCrf } = require('./estimate');
 const {
   PRESET_LIST,
@@ -96,6 +97,14 @@ function outputNameFor(job) {
   return `${base}-squeeze-${tag}.mp4`;
 }
 
+/** A file name from the host beats a slug from the link, which beats a token. */
+function bestName(current, candidate) {
+  const looksReal = (name) => Boolean(name) && /\.[a-z0-9]{2,5}$/i.test(name) && !/^[a-f0-9]{16,}\b/i.test(name);
+  if (looksReal(candidate) && !looksReal(current)) return candidate;
+  if (!current) return candidate || current;
+  return current;
+}
+
 function safeNameFromUrl(raw) {
   try {
     const u = new URL(raw);
@@ -161,6 +170,7 @@ async function compressJob(job) {
     );
   };
   if (job.browserFetched) notes.push('Fetched through a headless browser — the host refuses plain requests.');
+  if (job.fetchedNote) notes.push(job.fetchedNote);
   if (job.targetMb && targetTooSmall(meta, preset, job.targetMb)) {
     notes.push(`A ${job.targetMb} MB target is very tight for a clip this long — quality may suffer.`);
   }
@@ -379,8 +389,18 @@ async function hostJob(job, { order } = {}) {
   }
 }
 
-/** Keep a small append-only ledger of share links, independent of job cleanup. */
+/** Keep an append-only ledger of share links, independent of job cleanup. */
 async function persistHostedLink(job, url, provider) {
+  await ledger.record({
+    jobId: job.id,
+    url,
+    provider,
+    name: job.outputName,
+    sourceBytes: job.sourceBytes,
+    outputBytes: job.outputBytes,
+    at: Date.now(),
+  });
+  // Older releases wrote links.json; keep writing it so no history is lost.
   const file = path.join(jobsStore.DATA_DIR, 'links.json');
   const line = JSON.stringify({
     jobId: job.id,
@@ -404,6 +424,9 @@ const FRIENDLY = {
   TOO_BIG: 'That file is larger than this server accepts.',
   UNREACHABLE: 'This server could not reach that link.',
   BAD_STATUS: 'The link did not return a video.',
+  FILEDITCH_FAILED: 'That fileditch link has expired or the page is gone. Paste the page itself (theditch.st/… or fileditchfiles.me/…) and a fresh link is minted for you.',
+  FILEDITCH_NO_LINK: 'fileditch did not offer a download for that page — it may have been removed.',
+  FILESTER_BLOCKED: 'filester refused the request (its bot protection). Paste the share page again, or pick another host.',
   HTML_PAGE: 'That link is a web page, not a video file.',
   PLAYLIST: 'That is a streaming playlist (.m3u8 / .mpd), not a video file. Paste a direct MP4 or WebM link instead.',
   DOWNLOAD_FAILED: 'The download stopped before it finished.',
@@ -507,6 +530,24 @@ async function fetchThenCompress(job, ref) {
       signal: controller.signal,
       onProgress: (received, total) => {
         const p = total ? received / total : 0;
+        /* A host that trickles (bunkr can) is easier to wait for when the speed
+           and the remaining time are on screen. */
+        const now = Date.now();
+        if (job._dlAt) {
+          const seconds = (now - job._dlAt) / 1000;
+          if (seconds >= 0.9) {
+            const rate = (received - (job._dlBytes || 0)) / seconds;
+            if (rate > 0) {
+              job.downloadSpeed = rate;
+              job.downloadEta = total ? Math.round((total - received) / rate) : null;
+            }
+            job._dlAt = now;
+            job._dlBytes = received;
+          }
+        } else {
+          job._dlAt = now;
+          job._dlBytes = received;
+        }
         job.sourceBytes = received;
         job.progress = p;
         job.stage = total
@@ -529,12 +570,30 @@ async function fetchThenCompress(job, ref) {
       download: (target, dest, options) => sources.downloadHttp(target, dest, options),
       capture,
       options: downloadOptions,
+      /* fileditch's signed links expire in about half an hour — shorter than a
+         queue wait — so fetch a fresh one before giving up. */
+      refresh: () => directUrl(ref),
     });
     if (attempt.usedBrowser) {
       job.browserFetched = true;
     }
+    if (attempt.refreshed) job.fetchedNote = 'The host had rotated its download link, so a fresh one was minted.';
 
-    jobsStore.updateJob(job, { progress: 0, sourceBytes: (await fsp.stat(paths.source)).size });
+
+    /* Trust the host's own file name over anything guessed from a URL: a signed
+       CDN link says "abc123", the Content-Disposition says "Holiday.mp4". */
+    const hostName = attempt.filename || (await sources.filenameFromUrl(attempt.url || url));
+    const named = bestName(job.name, hostName);
+    if (named && named !== job.name) {
+      jobsStore.updateJob(job, { name: named });
+    }
+
+    jobsStore.updateJob(job, {
+      progress: 0,
+      sourceBytes: (await fsp.stat(paths.source)).size,
+      downloadSpeed: null,
+      downloadEta: null,
+    });
     startCompression(job);
   } catch (err) {
     reportJobError(job, err);
@@ -608,7 +667,7 @@ function pumpQueue() {
 }
 
 function startCompression(job) {
-  jobsStore.updateJob(job, { status: 'queued', stage: 'Queued', progress: 0 });
+  jobsStore.updateJob(job, { status: 'queued', stage: 'Queued', progress: 0, error: null, interrupted: false });
   queue.push(job);
   pumpQueue();
 }
@@ -1407,6 +1466,47 @@ function finishedJobs() {
     .filter((view) => view.status === 'done' || view.status === 'hosted');
 }
 
+/**
+ * Every share link ever produced, newest first.
+ *
+ * Job records are pruned; the ledger is not. This is what the user sees after
+ * closing the tab, restarting the Codespace, or coming back the next morning.
+ */
+async function allLinks() {
+  const [saved, live] = await Promise.all([ledger.list(), Promise.resolve(finishedJobs())]);
+  const byUrl = new Map();
+  for (const entry of saved) byUrl.set(entry.url, { ...entry, live: false });
+  for (const view of live) {
+    if (!view.hostedUrl) continue;
+    const existing = byUrl.get(view.hostedUrl);
+    byUrl.set(view.hostedUrl, {
+      ...(existing || {}),
+      at: existing?.at || new Date(jobFinishedAt(view) || Date.now()).toISOString(),
+      jobId: view.id,
+      provider: view.hostProvider,
+      url: view.hostedUrl,
+      name: view.outputName || view.name || null,
+      sourceBytes: view.sourceBytes ?? existing?.sourceBytes ?? null,
+      outputBytes: view.outputBytes ?? existing?.outputBytes ?? null,
+      live: view.hasFile === true,
+      saved: view.saved ?? null,
+      usedOriginal: Boolean(view.usedOriginal),
+    });
+  }
+  return [...byUrl.values()].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+}
+
+app.get('/api/links', async (req, res) => {
+  res.json({ links: await allLinks() });
+});
+
+app.get('/api/links.txt', async (req, res) => {
+  const text = await ledger.text();
+  res.type('text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', 'inline; filename="squeeze-links.txt"');
+  res.send(text || 'No share links yet.\n');
+});
+
 app.get('/api/results', (req, res) => {
   res.json({
     results: finishedJobs().map((view) => ({
@@ -1497,6 +1597,60 @@ async function main() {
     );
   }
   app.listen(PORT, '0.0.0.0');
+  await resumeInterrupted();
+  resumeHosting();
+}
+
+/**
+ * A machine that stops mid-encode (a closed laptop, a stopped Codespace, a
+ * reboot) leaves the source file behind. Pick those jobs up instead of leaving
+ * the user to guess whether it finished. Set RESUME_INTERRUPTED=0 to opt out.
+ */
+async function resumeInterrupted() {
+  if (process.env.RESUME_INTERRUPTED === '0') return;
+  const candidates = jobsStore
+    .listJobs()
+    .filter((job) => job.interrupted && !job.hostedUrl)
+    /* A job stopped while downloading may hold a half-written source, so only
+       jobs that got as far as encoding are picked up. Those stopped during the
+       upload already have their MP4 and are handled by resumeHosting(). */
+    .filter((job) => ['compressing', 'queued'].includes(job.interruptedFrom))
+    .filter((job) => fs.existsSync(jobsStore.jobPaths(job).source));
+  if (!candidates.length) return;
+
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  const resumable = [];
+  for (const job of candidates) {
+    const need = Math.max((Number(job.sourceBytes) || 0) * 1.2, 512 * 1024 ** 2);
+    if (free < need) {
+      console.warn(`[resume] not enough space to finish ${job.id} (${formatGb(free)} free)`);
+      continue;
+    }
+    resumable.push(job);
+  }
+  if (!resumable.length) return;
+  console.log(`[resume] picking up ${resumable.length} interrupted job(s)`);
+  for (const job of resumable.reverse()) startCompression(job);
+}
+
+/**
+ * A finished encode whose upload never happened (the machine stopped, the tab
+ * closed, the host timed out) still has its MP4 on disk. Pick those up at
+ * startup instead of making the user notice and press a button.
+ */
+async function resumeHosting() {
+  if (!AUTO_HOST) return;
+  const stale = jobsStore
+    .listJobs()
+    .filter((job) => job.status === 'done' && !job.hostedUrl && !job.hosting)
+    .filter((job) => fs.existsSync(jobsStore.jobPaths(job).output));
+  if (!stale.length) return;
+  console.log(`[resume] ${stale.length} finished file(s) still need a share link`);
+  for (const job of stale) {
+    await hostJob(job, { order: job.hostOrder }).catch((err) => {
+      console.warn(`[resume] ${job.id}: ${err.message}`);
+    });
+  }
 }
 
 if (require.main === module) main();

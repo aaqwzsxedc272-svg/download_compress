@@ -170,6 +170,8 @@ async function main() {
     check('results endpoint lists the finished job', results.results.some((r) => r.id === sampleDone.id));
     const links = await (await fetch(`${BASE}/api/results.txt`)).text();
     check('results.txt is served as plain text', typeof links === 'string');
+    const durable = await (await fetch(`${BASE}/api/links.txt`)).text();
+    check('links.txt is served as plain text', typeof durable === 'string');
 
     const download = await fetchBytes(`${BASE}/api/jobs/${sampleJob.id}/download`);
     check('download returns an MP4', download.status === 200 && isMp4(download.buf), `${download.buf.length} bytes`);
@@ -320,6 +322,10 @@ async function main() {
 
     const jobList = await (await fetch(`${BASE}/api/jobs`)).json();
     check('job list exposes recent jobs', Array.isArray(jobList.jobs) && jobList.jobs.length >= 1);
+    const linksApi = await (await fetch(`${BASE}/api/links`)).json().catch(() => ({}));
+    check('every share link is listed in one durable place', (linksApi.links || []).some((l) => l.url === hostedSample.hostedUrl));
+    const linksTxt = await (await fetch(`${BASE}/api/links.txt`)).text().catch(() => '');
+    check('the links file is plain text and copyable', linksTxt.includes(hostedSample.hostedUrl));
     check(
       'job list carries the share link',
       jobList.jobs.some((j) => j.hostedUrl),

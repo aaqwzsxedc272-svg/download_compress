@@ -651,12 +651,18 @@
 
   /* ------------------------------------------------- fileditch / theditch */
   /* These share hosts serve an HTML player at the file's own URL and hide the
-     real file behind a signed link on a rotating hostname, e.g.
-       fileditchfiles.me/b78/x.mp4  ->  lumistretcheseverymorning.xyz/MTc5...
-     The only reliable way in is to read the page's "Download" anchor. */
-  /* The share hosts move between domains, and the signed links live on random
-     ones, so the list can be extended without a code change:
-       FILEDITCH_HOSTS=fileditchfiles.me,theirdomain.example */
+     real file behind a short-lived signed link on a rotating hostname:
+       theditch.st/qhygxukd
+         -> fileditchvids.st/b78/NAME.mp4       (the player page)
+         -> https://<random host>/<base64>      (signed, ~30 minutes)
+     The base64 decodes to "<expiry>:<signature>:<port>/<path>", so the page
+     that mints a fresh link can always be rebuilt from it:
+       https://fileditchvids.st/b78/NAME.mp4
+     Two rules follow, and both matter:
+       - never hand a signed link to the queue as-is; it expires, so mint a new
+         one at download time (this is what made both files "not work"),
+       - never offer the player URL as a second "file": it is the same video,
+         served as HTML. */
   const fileditchHosts = (process.env.FILEDITCH_HOSTS || '')
     .split(',')
     .map((host) => host.trim().toLowerCase())
@@ -674,19 +680,59 @@
     'i',
   );
 
+  /** base64url -> text, in Node and in the browser. */
+  function decodeBase64Url(token) {
+    const b64 = token.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    try {
+      if (typeof atob === 'function') {
+        const binary = atob(padded);
+        let out = '';
+        for (let i = 0; i < binary.length; i += 1) out += String.fromCharCode(binary.charCodeAt(i));
+        return out;
+      }
+      if (typeof Buffer !== 'undefined') return Buffer.from(padded, 'base64').toString('binary');
+    } catch {
+      /* not base64 */
+    }
+    return null;
+  }
+
+  /**
+   * A fileditch signed link is a base64 blob in place of a path.
+   * Returns { expiry, port, path } or null for anything else.
+   */
+  function signedPayload(url) {
+    const parsed = safeUrl(url);
+    if (!parsed) return null;
+    const last = parsed.pathname.split('/').filter(Boolean).pop() || '';
+    if (last.length < 24 || !/^[A-Za-z0-9_-]+$/.test(last)) return null;
+    const text = decodeBase64Url(last);
+    if (!text) return null;
+    const m = /^(\d{9,}):([^:]{8,}):(\d+)\/(.+\.[a-z0-9]{2,5})$/i.exec(text);
+    if (!m) return null;
+    return { expiry: Number(m[1]), port: Number(m[3]), path: m[4] };
+  }
+
+  /** The player page a signed link was minted from. */
+  const pageBase = () =>
+    (process.env.FILEDITCH_PAGE_BASE || 'https://fileditchvids.st').replace(/\/+$/, '');
+  const pageForPath = (filePath) => `${pageBase()}/${String(filePath).replace(/^\/+/, '')}`;
+
   function fileditchLinks(html, pageUrl) {
-    const out = [];
-    const push = (raw) => {
+    const download = [];
+    const players = [];
+    const push = (list, raw) => {
       if (!raw) return;
       let absolute;
       try {
-        absolute = new URL(raw.replace(/&amp;/g, '&'), pageUrl).href;
+        absolute = new URL(String(raw).replace(/&amp;/g, '&'), pageUrl).href;
       } catch {
         return;
       }
       if (!/^https?:/i.test(absolute)) return;
       if (/abuse\.fileditch\.com|new\.fileditch\.com\/faq|\/report/i.test(absolute)) return;
-      if (!out.includes(absolute)) out.push(absolute);
+      if (!list.includes(absolute)) list.push(absolute);
     };
 
     // The download anchor, whatever its classes look like.
@@ -694,37 +740,95 @@
     let m;
     while ((m = anchorRe.exec(html))) {
       const [, href, text] = m;
-      if (/download|⬇|save file/i.test(text) && !/report/i.test(text)) push(href);
+      if (/download|⬇|save file|JDownloader/i.test(text) && !/report/i.test(text)) push(download, href);
     }
-    // Player sources, in case the page streams the file directly.
+    // A player source is the same file shown as HTML — only worth having when
+    // there is no download anchor to use instead.
     const srcRe = /<(?:video|source)\b[^>]*src=["']([^"']+)["']/gi;
-    while ((m = srcRe.exec(html))) push(m[1]);
+    while ((m = srcRe.exec(html))) push(players, m[1]);
     const og = /<meta[^>]+property=["']og:video(?::url)?["'][^>]+content=["']([^"']+)["']/i.exec(html);
-    if (og) push(og[1]);
+    if (og) push(players, og[1]);
 
-    return out;
+    return { download, players };
   }
 
   function fileditchMeta(html) {
-    const name = (/<title>\s*([^<]{1,180}?)\s*<\/title>/i.exec(html) || [])[1] || null;
+    const title = (/<title>\s*([^<]{1,180}?)\s*<\/title>/i.exec(html) || [])[1] || null;
     const size = /(\d+(?:\.\d+)?)\s*(GB|MB|TB)\b/i.exec(html);
     const toBytes = { TB: 1024 ** 4, GB: 1024 ** 3, MB: 1024 ** 2 };
     return {
-      name: name && /\.(mp4|mkv|webm|mov|avi)$/i.test(name) ? name : null,
+      // fileditch titles the page with the file name itself.
+      name: title && VIDEO_EXT.test(title.trim()) ? title.trim().replace(/\s+/g, ' ') : null,
       size: size ? Math.round(Number(size[1]) * toBytes[size[2].toUpperCase()]) : 0,
     };
+  }
+
+  /** Fetch a fileditch page and return a freshly signed download link. */
+  async function fileditchMint(pageUrl, wantPath) {
+    const res = await fetchWithTimeout(pageUrl, {
+      headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml' },
+      redirect: 'follow',
+    });
+    if (!res.ok) throw new ResolveError(`fileditch answered HTTP ${res.status}.`, 'FILEDITCH_FAILED');
+    const html = await res.text();
+    const base = res.url || pageUrl;
+    const { download, players } = fileditchLinks(html, base);
+
+    const score = (link) => {
+      const payload = signedPayload(link);
+      if (!wantPath) return payload ? 2 : 1;
+      return payload && payload.path.endsWith(wantPath) ? 3 : 0;
+    };
+    const best = [...download, ...players]
+      .map((link) => ({ link, score: score(link) }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score)[0];
+    if (best) return { url: best.link, html, base };
+
+    // No link at all: the page might itself be a player whose media URL is only
+    // visible to a real browser.
+    const viaBrowser = await pageBrowserFiles(base);
+    if (viaBrowser && viaBrowser.length) return { url: viaBrowser[0].ref.url, html, base, viaBrowser: true };
+    throw new ResolveError('fileditch did not expose a download link on that page.', 'FILEDITCH_NO_LINK');
   }
 
   const fileditch = {
     id: 'fileditch',
     match: (url) => {
       const parsed = safeUrl(url);
-      if (!parsed || !FILEDITCH_HOST.test(parsed.hostname)) return null;
-      return 'page';
+      if (!parsed) return null;
+      // A signed link on one of their rotating hosts, pasted straight in.
+      if (signedPayload(url)) return 'signed';
+      if (FILEDITCH_HOST.test(parsed.hostname)) return 'page';
+      return null;
     },
     async list(url) {
+      const signed = signedPayload(url);
+      /* A signed link that is pasted in has usually expired by the time anyone
+         uses it. Go back to the page that minted it and mint another. */
+      if (signed) {
+        const page = pageForPath(signed.path);
+        const fresh = await fileditchMint(page, signed.path);
+        const name = signed.path.split('/').pop();
+        return {
+          resolver: 'fileditch',
+          title: name,
+          files: [
+            {
+              id: fresh.url,
+              name,
+              size: 0,
+              mime: 'video/mp4',
+              kind: 'video',
+              ref: { resolver: 'fileditch', url: fresh.url, page, referer: page, name, path: signed.path },
+            },
+          ],
+        };
+      }
+
       const res = await fetchWithTimeout(url, {
         headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml' },
+        redirect: 'follow',
       }).catch(() => null);
       if (!res || !res.ok) {
         const viaBrowser = await pageBrowserFiles(url);
@@ -732,34 +836,80 @@
         throw new ResolveError(`fileditch answered HTTP ${res ? res.status : 'nothing'}.`, 'FILEDITCH_FAILED');
       }
       const html = await res.text();
-      const links = fileditchLinks(html, url);
-      if (!links.length) {
-        const viaBrowser = await pageBrowserFiles(url);
+      const base = res.url || url;
+      const { download, players } = fileditchLinks(html, base);
+      const candidates = download.length ? download : players;
+      if (!candidates.length) {
+        const viaBrowser = await pageBrowserFiles(base);
         if (viaBrowser && viaBrowser.length) return { resolver: 'fileditch', title: null, files: viaBrowser };
         throw new ResolveError('fileditch did not expose a download link on that page.', 'FILEDITCH_NO_LINK');
       }
+
       const meta = fileditchMeta(html);
-      return {
-        resolver: 'fileditch',
-        title: null,
-        files: links.slice(0, 10).map((link, index) => {
-          let name = meta.name || `video-${index + 1}.mp4`;
-          if (index > 0) name = name.replace(/(\.\w+)$/, `-${index + 1}$1`);
-          return {
-            id: link,
+      /* One file, one entry. Duplicates are the same video behind different
+         URLs, and offering both is what made both of them fail. */
+      const seen = new Set();
+      const files = [];
+      for (const link of candidates) {
+        const payload = signedPayload(link);
+        const key =
+          (payload && payload.path) ||
+          (() => {
+            try {
+              const parsed = new URL(link);
+              return `${parsed.hostname}${parsed.pathname}`.toLowerCase();
+            } catch {
+              return link;
+            }
+          })();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const name =
+          meta.name || (payload && payload.path.split('/').pop()) || `video-${files.length + 1}.mp4`;
+        /* The page that issued the link is the one to ask again later, whether
+           the link is signed (it expires) or a player URL (it is HTML). */
+        files.push({
+          id: link,
+          name,
+          size: files.length === 0 ? meta.size : 0,
+          mime: 'video/mp4',
+          kind: 'video',
+          ref: {
+            resolver: 'fileditch',
+            url: link,
+            page: base,
+            referer: base,
             name,
-            size: index === 0 ? meta.size : 0,
-            mime: 'video/mp4',
-            kind: 'video',
-            ref: { resolver: 'fileditch', url: link, page: url, referer: url, name },
-          };
-        }),
-      };
+            path: payload ? payload.path : null,
+          },
+        });
+      }
+      return { resolver: 'fileditch', title: meta.name, files };
     },
+    /**
+     * Called at download time. A signed link lives about half an hour, which is
+     * shorter than a queue wait, so always ask the page for a fresh one.
+     */
     async direct(ref) {
-      return ref.url;
+      const signed = signedPayload(ref.url);
+      const filePath = (ref.path || (signed && signed.path) || '').replace(/^\/+/, '');
+      const page = ref.page && !signedPayload(ref.page) ? ref.page : null;
+      /* Always mint a fresh link when there is a page to ask: the stored one is
+         signed and usually a few minutes from expiring. */
+      if (page) {
+        try {
+          const fresh = await fileditchMint(page, filePath || null);
+          return fresh.url;
+        } catch {
+          /* page gone: the stored link may still be alive */
+        }
+      }
+      if (ref.url && !ref.url.match(/^\/[^/]/)) return ref.url;
+      if (filePath) return (await fileditchMint(pageForPath(filePath), filePath)).url;
+      throw new ResolveError('fileditch did not give us a download link.', 'FILEDITCH_NO_LINK');
     },
   };
+
 
   const page = {
     id: 'page',

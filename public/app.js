@@ -170,7 +170,9 @@ function cardFor(id, job = {}) {
 }
 
 function updateCard(entry, job) {
+  const previous = entry.data || {};
   entry.data = job;
+  if (job.status === 'hosted' && previous.status !== 'hosted') scheduleResultsRefresh();
   const el = entry.el;
   const name = job.name || (job.url ? basename(job.url) : 'Video');
   $('[data-field="name"]', el).textContent = name;
@@ -197,8 +199,15 @@ function updateCard(entry, job) {
       statusText = 'Queued';
       progressWrap.classList.add('is-indeterminate');
       break;
-    case 'fetching':
-      statusText = job.progress > 0 ? `Downloading video · ${pct}%` : 'Downloading video';
+    case 'fetching': {
+      const speed = job.downloadSpeed ? `${formatBytes(job.downloadSpeed)}/s` : '';
+      const left = job.downloadEta ? formatDuration(job.downloadEta) : '';
+      statusText = job.progress > 0
+        ? `Downloading video · ${pct}%${speed ? ` · ${speed}` : ''}${left ? ` · ${left} left` : ''}`
+        : 'Downloading video';
+      if (job.progress > 0) progressWrap.classList.remove('is-indeterminate');
+      break;
+    }
       if (job.progress <= 0) progressWrap.classList.add('is-indeterminate');
       break;
     case 'compressing':
@@ -442,10 +451,19 @@ async function restoreJobs() {
   } catch {
     ids = [];
   }
+  /* The server is the source of truth, not this browser: a job started before
+     the tab was closed (or from another tab) belongs in the list too. */
+  try {
+    const { jobs } = await api('/api/jobs');
+    const serverIds = (jobs || []).slice(0, 12).map((job) => job.id);
+    ids = [...new Set([...ids, ...serverIds])];
+  } catch {
+    /* offline: fall back to what this browser remembers */
+  }
   for (const id of ids) {
     try {
       const { job } = await api(`/api/jobs/${id}`);
-      trackJob(job);
+      if (!state.jobs.has(id)) trackJob(job);
     } catch {
       /* job expired */
     }
@@ -1553,21 +1571,21 @@ function syncAutoStopToggle(autoStop) {
 async function loadResults() {
   const section = $('#resultsSection');
   if (!section) return;
-  let results = [];
+  let links = [];
   try {
-    ({ results } = await api('/api/results'));
+    ({ links } = await api('/api/links'));
   } catch {
     return;
   }
   const list = $('#resultsList');
   const visible = localStorage.getItem('squeeze.resultsHidden') === '1';
-  section.hidden = !results.length || visible;
+  section.hidden = !links.length || visible;
   list.textContent = '';
-  $('#resultsHint').textContent = results.length
-    ? `${results.length} finished · share links live on the file host and keep working after this machine stops.`
+  $('#resultsHint').textContent = links.length
+    ? `${links.length} share link${links.length === 1 ? '' : 's'} saved · kept on this machine's disk, so they are still here after a restart, a closed tab or a stopped machine.`
     : '';
 
-  for (const result of results) {
+  for (const link of links) {
     const row = document.createElement('div');
     row.className = 'result-row';
 
@@ -1575,64 +1593,62 @@ async function loadResults() {
     main.className = 'result-main';
     const name = document.createElement('div');
     name.className = 'result-name';
-    name.textContent = result.name;
-    name.title = result.name;
+    name.textContent = link.name || 'video.mp4';
+    name.title = link.name || '';
     const meta = document.createElement('div');
     meta.className = 'result-meta';
     const bits = [];
-    if (result.sourceBytes && result.outputBytes) {
+    if (link.sourceBytes && link.outputBytes) {
       bits.push(
-        result.usedOriginal
-          ? `${formatBytes(result.sourceBytes)} · already small, original kept`
-          : `${formatBytes(result.sourceBytes)} → ${formatBytes(result.outputBytes)}`,
+        link.usedOriginal
+          ? `${formatBytes(link.sourceBytes)} · already small, original kept`
+          : `${formatBytes(link.sourceBytes)} → ${formatBytes(link.outputBytes)}`,
       );
     }
-    if (result.shareUrl) {
-      const link = document.createElement('a');
-      link.href = result.shareUrl;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      link.textContent = result.shareUrl;
-      meta.append(...(bits.length ? [bits.join(' · ') + ' · '] : []), link);
-    } else {
-      bits.push('no share link yet');
-      meta.textContent = bits.join(' · ');
-    }
+    const when = link.at ? new Date(link.at) : null;
+    if (when && !Number.isNaN(when.getTime())) bits.push(when.toLocaleString());
+
+    const anchor = document.createElement('a');
+    anchor.href = link.url;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    anchor.textContent = link.url;
+    meta.append(...(bits.length ? [bits.join(' · ') + ' · '] : []), anchor);
     main.append(name, meta);
 
     const actions = document.createElement('div');
     actions.className = 'result-actions';
 
-    if (result.shareUrl) {
-      const copy = document.createElement('button');
-      copy.type = 'button';
-      copy.className = 'btn tiny';
-      copy.textContent = 'Copy link';
-      copy.addEventListener('click', async () => {
-        try {
-          await navigator.clipboard.writeText(result.shareUrl);
-          copy.textContent = 'Copied';
-          setTimeout(() => {
-            copy.textContent = 'Copy link';
-          }, 1400);
-        } catch {
-          showAlert(result.shareUrl, 'ok');
-        }
-      });
-      actions.append(copy);
-    }
-
-    if (result.downloadPath) {
-      const download = document.createElement('a');
-      download.className = 'btn tiny download';
-      download.href = result.downloadPath;
-      download.textContent = 'Download';
-      actions.append(download);
-    }
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'btn tiny';
+    copy.textContent = 'Copy';
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(link.url);
+        copy.textContent = 'Copied';
+        setTimeout(() => {
+          copy.textContent = 'Copy';
+        }, 1400);
+      } catch {
+        showAlert(link.url, 'ok');
+      }
+    });
+    actions.append(copy);
 
     row.append(main, actions);
     list.append(row);
   }
+}
+
+/** The links panel is the durable record: refresh it whenever something lands. */
+let resultsRefresh = null;
+function scheduleResultsRefresh() {
+  if (resultsRefresh) clearTimeout(resultsRefresh);
+  resultsRefresh = setTimeout(() => {
+    resultsRefresh = null;
+    loadResults();
+  }, 1200);
 }
 
 function bindStickyHeader() {
@@ -1745,8 +1761,8 @@ async function boot() {
   if (copyAll) {
     copyAll.addEventListener('click', async () => {
       try {
-        const text = await (await fetch('/api/results.txt')).text();
-        if (!text.trim()) return showAlert('No share links yet — turn on “Give me a share link”.', 'error');
+        const text = await (await fetch('/api/links.txt')).text();
+        if (!text.trim()) return showAlert('No share links yet — a link appears here once a video is uploaded.', 'error');
         await navigator.clipboard.writeText(text);
         showAlert('All share links copied.', 'ok');
       } catch (err) {
@@ -1759,7 +1775,7 @@ async function boot() {
   if (saveLinks) {
     saveLinks.addEventListener('click', () => {
       const link = document.createElement('a');
-      link.href = '/api/results.txt';
+      link.href = '/api/links.txt';
       link.download = 'squeeze-links.txt';
       link.click();
     });

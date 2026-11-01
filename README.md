@@ -245,9 +245,12 @@ Two different things come out of a job, and they live differently:
 | **Download button** | on this machine's disk | no — gone when the session ends |
 
 So the durable result is the share link. Keep *Delivery → Give me a share link* on and the
-**Results** panel holds every link; `data/results.txt` is written on each completion, and
-**Save links file** downloads the list. Pick the host in *Upload to* (Auto, or a specific one);
-the choice is remembered and sent with every job.
+**Your links** panel holds every link. They are appended to `data/links.tsv` the moment a job is
+hosted — an append-only ledger that no cleanup pass touches — so the list is still there after a
+closed tab, a restarted server or a stopped machine. `GET /api/links` returns them as JSON,
+`GET /api/links.txt` as plain text, and `npm run links` prints them from a terminal without
+starting the server at all. Pick the host in *Upload to* (Auto, or a specific one); the choice is
+remembered and sent with every job.
 
 ## When a host refuses
 
@@ -298,9 +301,30 @@ GitHub Codespaces gives a 2-core machine **32 GB**, shared with `node_modules` (
 Playwright's Chromium (~450 MB) and the OS. That is comfortable for 1080p work and tight for a
 queue of 4K files: do them a few at a time.
 
+## Closing the tab, and machines that stop
+
+A job runs in the server process, not in the browser: the tab can be closed, the laptop shut, and
+the encode carries on. Two things follow from that, and both are tested rather than promised:
+
+- **A machine that stops mid-encode is picked up on the next start.** Jobs that were fetching are
+  reported as interrupted (a half-written source cannot be trusted); jobs that were encoding are
+  queued again automatically, and jobs that finished encoding but never uploaded are uploaded on
+  boot. Set `RESUME_INTERRUPTED=0` to opt out.
+- **The links outlive everything.** `data/links.tsv` is append-only, so the share links survive
+  restarts, sweeps and a stopped machine, and the panel reads from it (`/api/links`) rather than
+  from the job list, which is pruned.
+
+`npm run test:durability` proves the first point end to end: it starts a job, never polls it,
+kills the server, starts a fresh one on the same data directory, and finds the share link still
+there. `npm run test:resume` kills the server mid-encode and checks the job finishes after the
+restart.
+
 ## Long jobs and idle hosts
 
-Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Two defences:
+Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three defences:
+
+- A job that was running when the machine stopped is resumed on the next start (see above), so an
+  interrupted encode costs time, not the whole job.
 
 - The server prints a `[keep-alive] <job> 42% · 12m left` line to its terminal every 45 seconds
   while anything is fetching, encoding or uploading. GitHub Codespaces counts terminal output as
@@ -314,7 +338,14 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Two d
 - `npm run test:resolve` — 19 resolver tests against stubbed APIs (real response shapes).
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
-- `npm run smoke` — 54 end-to-end checks: sample, upload, browser relay, target size, range
+- `npm run test:estimate` — the size prediction: a file that cannot shrink is recognised instead
+  of being encoded anyway, a bloated one gets a CRF that really saves, the projection lands within
+  25% of a real encode, and a downscaling preset is probed at its own size.
+- `npm run test:ledger` — share links survive a restart, duplicates and mangled names.
+- `npm run test:durability` — a job finishes with nobody watching, and its link survives the
+  server being killed and restarted.
+- `npm run test:resume` — an encode killed at 6% finishes after a restart (takes ~5 minutes).
+- `npm run smoke` — 56 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
   chunk and an out-of-order chunk), and every rejection path. Starts its own
   server and a fake external host on a spare port.

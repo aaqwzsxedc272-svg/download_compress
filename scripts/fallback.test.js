@@ -44,6 +44,16 @@ function start() {
         res.end(VIDEO);
         return;
       }
+      if (req.url === '/expired.mp4') {
+        res.writeHead(403, { 'content-type': 'text/plain' });
+        res.end('link expired');
+        return;
+      }
+      if (req.url === '/open.mp4') {
+        res.writeHead(200, { 'content-type': 'video/mp4', 'content-length': VIDEO.length });
+        res.end(VIDEO);
+        return;
+      }
       if (req.url === '/watch') {
         res.writeHead(200, { 'content-type': 'text/html' });
         res.end('<html><body><video src="/real.mp4"></video></body></html>');
@@ -106,6 +116,39 @@ function check(name, fn) {
       destPath: dest,
       download: (u, d, o) => sources.downloadHttp(u, d, o),
       capture: async () => ({ media: [{ url: `${base}/real.mp4`, referer: `${base}/watch` }] }),
+    });
+    assert.equal(result.usedBrowser, true);
+    assert.equal((await fsp.readFile(dest)).length, VIDEO.length);
+  });
+
+  await check('an expired signed link is refreshed before the browser is used', async () => {
+    const dest = path.join(dir, 'f.mp4');
+    let captureCalls = 0;
+    const result = await downloadWithFallback({
+      url: `${base}/expired.mp4`,
+      pageUrl: `${base}/watch`,
+      destPath: dest,
+      download: (u, d, o) => sources.downloadHttp(u, d, o),
+      capture: async () => {
+        captureCalls += 1;
+        return { media: [{ url: `${base}/real.mp4`, referer: `${base}/watch` }] };
+      },
+      refresh: async () => `${base}/open.mp4`,
+    });
+    assert.equal(result.refreshed, true);
+    assert.equal(captureCalls, 0, 'it spent a browser on a link it could simply re-mint');
+    assert.equal((await fsp.readFile(dest)).length, VIDEO.length);
+  });
+
+  await check('a refresh that returns a dead link still falls back to the browser', async () => {
+    const dest = path.join(dir, 'g.mp4');
+    const result = await downloadWithFallback({
+      url: `${base}/expired.mp4`,
+      pageUrl: `${base}/watch`,
+      destPath: dest,
+      download: (u, d, o) => sources.downloadHttp(u, d, o),
+      capture: async () => ({ media: [{ url: `${base}/real.mp4`, referer: `${base}/watch` }] }),
+      refresh: async () => `${base}/expired.mp4`,
     });
     assert.equal(result.usedBrowser, true);
     assert.equal((await fsp.readFile(dest)).length, VIDEO.length);

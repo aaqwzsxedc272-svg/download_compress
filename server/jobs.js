@@ -34,9 +34,19 @@ async function init() {
         const job = { ...record, dir: path.join(JOBS_DIR, record.id), abort: null };
         // Anything mid-flight when the process died is not running now.
         if (!['done', 'hosted', 'error'].includes(job.status)) {
+          job.interrupted = true;
+          job.interruptedFrom = job.status;
           job.status = 'error';
+          /* Stopped during the upload: the encode is finished and its MP4 is on
+             disk, so there is nothing left but the upload. */
+          if (job.status === 'hosting' && fs.existsSync(path.join(job.dir, 'output.mp4'))) {
+            job.status = 'done';
+            job.stage = 'Ready (upload interrupted)';
+            job.error = null;
+            job.hostError = 'The upload was interrupted when the machine stopped. It is retried automatically.';
+          }
           job.stage = 'Interrupted';
-          job.error = 'The server restarted before this finished. Try again.';
+          job.error = 'The machine stopped before this finished. It is picked up again automatically when the server starts.';
         }
         jobs.set(job.id, job);
       }
@@ -179,6 +189,8 @@ function publicView(job) {
     twoPass: Boolean(job.twoPass),
     scaledTo: job.scaledTo || null,
     usedOriginal: Boolean(job.usedOriginal),
+    downloadSpeed: job.downloadSpeed || null,
+    downloadEta: job.downloadEta || null,
     projection: job.projection || null,
     hostedUrl: job.hostedUrl || null,
     hostProvider: job.hostProvider || null,

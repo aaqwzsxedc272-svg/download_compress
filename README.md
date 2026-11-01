@@ -240,6 +240,7 @@ fly deploy
 | `SMTP_HOST` / `SMTP_PORT` | — / `587` | Mail server for the share links (`465` = implicit TLS) |
 | `SMTP_USER` / `SMTP_PASS` | — | Login; for Gmail use an **app password**, spaces are ignored |
 | `SMTP_FROM` | `SMTP_USER` | Envelope sender |
+| `ENV_FILE` | `./.env` | Where the `.env` is read from |
 | `NOTIFY_EMAIL` | `aaqwzsxedc272@gmail.com` | Where the links are mailed |
 | `AUTO_EMAIL` | on | Mails the new links when the queue drains; `0` disables |
 | `BEFORE_STOP_TIMEOUT_SECONDS` | `45` | How long an auto-stop waits for the last mail to leave |
@@ -316,17 +317,46 @@ leave the machine on their own:
 - Without SMTP the app does not pretend: the button opens a `mailto:` with every link already
   written into it, and the panel says mail is not set up.
 
-Gmail needs an app password, not the account password: enable 2-step verification, create one at
-<https://myaccount.google.com/apppasswords>, then
+### Set it up once, not on every run
+
+There are two ways, and neither needs retyping an app password before each start.
+
+**1. In the app (easiest).** The *Mail* panel under the links is a form: server, port, username,
+app password, and the address to send to. **Save** stores it in `data/mail.json` (mode `0600`,
+readable only by you), sends a test mail right away, and from then on every start uses it. It
+survives restarts, a rebuilt Codespace and a fresh shell. **Send a test mail** and **Remove** are
+next to it.
+
+**2. In a `.env` file.** Copy `.env.example` to `.env` and fill it in; the server reads it at boot,
+and a real environment variable still wins over it for deployments and Codespaces secrets.
 
 ```
-SMTP_HOST=smtp.gmail.com SMTP_PORT=587 \
-SMTP_USER=you@gmail.com SMTP_PASS='abcd efgh ijkl mnop' \
-NOTIFY_EMAIL=aaqwzsxedc272@gmail.com npm start
+# .env  (already gitignored)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASS=abcd efgh ijkl mnop     # Gmail app password, spaces are fine
+NOTIFY_EMAIL=aaqwzsxedc272@gmail.com
 ```
+
+Gmail needs an **app password**, not the account password: enable 2-step verification, create one
+at <https://myaccount.google.com/apppasswords>. The same page is linked from the form.
+
+Precedence is: `data/mail.json` → `.env` → real environment → built-in default (port 587, the
+owner address). The boot log says which one is in force, so you never have to guess:
+
+```
+Mail: links go to aaqwzsxedc272@gmail.com via smtp.gmail.com:587 (saved in the app)
+Loaded SMTP_HOST, SMTP_PASS from .env
+```
+
+A mail server on `127.0.0.1` (a local relay) needs `ALLOW_PRIVATE_HOSTS=1` — the app refuses
+loopback by default so a public instance cannot probe its own network.
 
 `npm run test:notify` runs a real SMTP conversation against a fake server (greeting, STARTTLS,
-login, envelope, base64 body) — no account needed.
+login, envelope, base64 body) — no account needed. `npm run test:mail` proves the one-time part:
+`.env` parsing and precedence, `data/mail.json` surviving a restart with `0600` permissions and
+never handing the password back, and a running server picking up new settings without a restart.
 
 ## When a host refuses
 
@@ -433,6 +463,9 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:ledger` — share links survive a restart, duplicates and mangled names.
 - `npm run test:notify` — a full SMTP conversation against a fake server: login, envelope,
   base64 body, the `mailto:` fallback and a refused password.
+- `npm run test:mail` — the one-time mail setup: `.env` parsing and precedence, `data/mail.json`
+  surviving a restart with `0600` permissions, the password never returned, and a running server
+  sending a test mail the moment the form is saved.
 - `npm run test:ui` — the browser code in jsdom: the disk pill, the presets, "just download"
   greying the encoder controls, the size list in the picker, the per-picker switch sending
   `noCompress`, and the email button (needs `npm i --no-save jsdom`, skips without it).

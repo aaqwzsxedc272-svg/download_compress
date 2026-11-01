@@ -146,7 +146,58 @@
     <p class="results-hint results-sub" id="emailNote" hidden>
       Mail is not set up on this server yet — the button opens your own mail app with the links already in it.
     </p>
+
     <div class="results-list" id="resultsList"></div>
+  </section>
+
+  <section class="card mail-card" id="mailCard">
+    <details class="mail-setup" id="mailSetup">
+      <summary>
+        <span class="mail-dot" aria-hidden="true"></span>
+        <span id="mailSummary">Mail: not set up</span>
+        <span class="mail-chevron" aria-hidden="true">Set up</span>
+      </summary>
+      <form class="mail-form" id="mailForm" autocomplete="off">
+        <p class="mail-intro">
+          Enter it once. The password is saved on this machine only
+          (<code>data/mail.json</code>, readable by you alone) and still works after a restart
+          or a fresh shell — no environment variables to retype.
+        </p>
+        <div class="mail-grid">
+          <label class="mail-field">
+            <span>Mail server</span>
+            <input id="mailHost" type="text" placeholder="smtp.gmail.com" spellcheck="false" required />
+          </label>
+          <label class="mail-field mail-field-port">
+            <span>Port</span>
+            <input id="mailPort" type="number" min="1" max="65535" step="1" value="587" inputmode="numeric" />
+          </label>
+          <label class="mail-field">
+            <span>Username</span>
+            <input id="mailUser" type="text" placeholder="you@gmail.com" spellcheck="false" />
+          </label>
+          <label class="mail-field">
+            <span>App password</span>
+            <input id="mailPass" type="password" placeholder="abcd efgh ijkl mnop" spellcheck="false" />
+          </label>
+          <label class="mail-field mail-field-to">
+            <span>Send the links to</span>
+            <input id="mailTo" type="email" placeholder="aaqwzsxedc272@gmail.com" spellcheck="false" />
+          </label>
+        </div>
+        <p class="mail-hint">
+          Gmail needs an
+          <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">app password</a>,
+          not your normal password (2-step verification must be on). Spaces are ignored, so paste it as Google shows it.
+        </p>
+        <div class="mail-actions">
+          <button class="btn primary" type="submit" id="mailSave">Save</button>
+          <button class="btn" type="button" id="mailTest">Send a test mail</button>
+          <button class="btn tiny" type="button" id="mailForget">Remove</button>
+          <span class="mail-status" id="mailStatus" role="status"></span>
+        </div>
+      </form>
+    </details>
   </section>
 </main>
 

@@ -10,7 +10,7 @@
     "smoke": "node scripts/smoke.js",
     "test:resolve": "node scripts/resolve.test.js",
     "test:hosters": "node scripts/hosters.test.js",
-    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js && node scripts/notify.test.js && node scripts/ui.test.js",
+    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js && node scripts/notify.test.js && node scripts/mailsetup.test.js && node scripts/ui.test.js",
     "deploy:hf": "scripts/deploy-space.sh",
     "package:hf": "node scripts/package-space.js",
     "verify": "node scripts/verify-deploy.js",
@@ -26,6 +26,7 @@
     "test:notify": "node scripts/notify.test.js",
     "test:ui": "node scripts/ui.test.js",
     "test:space": "node scripts/space.test.js",
+    "test:mail": "node scripts/mailsetup.test.js",
     "test:durability": "node scripts/durability.test.js",
     "test:resume": "node scripts/resume.test.js"
   },

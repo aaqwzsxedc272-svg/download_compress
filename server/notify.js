@@ -32,20 +32,15 @@ const net = require('node:net');
 const tls = require('node:tls');
 const os = require('node:os');
 
-const HOST = process.env.SMTP_HOST || '';
-const PORT = Number(process.env.SMTP_PORT) || (Number(process.env.SMTP_SECURE) === 1 ? 465 : 587);
-const SECURE = Number(process.env.SMTP_SECURE) === 1 || PORT === 465;
-const USER = process.env.SMTP_USER || '';
-const PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, '') || '';
-const FROM = process.env.SMTP_FROM || USER;
-/* The address this project was asked to mail. A user-set NOTIFY_EMAIL wins,
-   then the SMTP account itself, then the known owner address. */
-const OWNER_EMAIL = process.env.NOTIFY_EMAIL || process.env.SMTP_USER || 'aaqwzsxedc272@gmail.com';
-const DEFAULT_TO = OWNER_EMAIL;
+const mailsettings = require('./mailsettings');
 
-const configured = () => Boolean(HOST && FROM && (USER ? PASS : true));
-const defaultTo = () => DEFAULT_TO || null;
-const describe = () => ({ configured: configured(), to: defaultTo(), host: HOST || null, port: PORT });
+/* Read on every use, not once at load: the setup form writes the settings to
+   disk while the server is running, and the next mail has to pick them up. */
+const config = () => mailsettings.current();
+
+const configured = () => config().configured;
+const defaultTo = () => config().to || null;
+const describe = () => mailsettings.describe();
 
 /* ------------------------------------------------------------------ smtp --- */
 
@@ -167,17 +162,20 @@ function message({ from, to, subject, text, date = new Date() }) {
  * Send one plain-text mail. Resolves when the server accepted it.
  * Throws an Error with `code: 'SMTP_FAILED'` (or 'SMTP_UNCONFIGURED').
  */
-async function sendMail({ to = defaultTo(), subject, text, from = FROM, timeoutMs = 25000 } = {}) {
-  if (!configured()) {
+async function sendMail({ to, subject, text, from, timeoutMs = 25000 } = {}) {
+  const settings = config();
+  const recipient = to || settings.to;
+  const sender = from || settings.from || settings.user;
+  if (!settings.configured) {
     throw Object.assign(new Error('Email is not set up on this machine (set SMTP_HOST, SMTP_USER and SMTP_PASS).'), {
       code: 'SMTP_UNCONFIGURED',
     });
   }
-  if (!to) {
+  if (!recipient) {
     throw Object.assign(new Error('No address to send to (set NOTIFY_EMAIL).'), { code: 'SMTP_NO_RECIPIENT' });
   }
 
-  let socket = await connect({ host: HOST, port: PORT, secure: SECURE, timeoutMs });
+  let socket = await connect({ host: settings.host, port: settings.port, secure: settings.secure, timeoutMs });
   let io = reader(socket);
   try {
     expect(await io.next(), [220], 'The greeting');
@@ -192,33 +190,33 @@ async function sendMail({ to = defaultTo(), subject, text, from = FROM, timeoutM
     let capabilityText = caps.lines.join('\n').toUpperCase();
 
     /* Port 587 servers start in the clear and require STARTTLS before auth. */
-    if (!SECURE && /STARTTLS/.test(capabilityText)) {
+    if (!settings.secure && /STARTTLS/.test(capabilityText)) {
       await say('STARTTLS', [220], 'STARTTLS');
-      socket = await upgrade(socket, HOST);
+      socket = await upgrade(socket, settings.host);
       io = reader(socket);
       caps = await say(`EHLO ${helo}`, [250], 'EHLO after STARTTLS');
       capabilityText = caps.lines.join('\n').toUpperCase();
     }
 
-    if (USER) {
+    if (settings.user) {
       if (/AUTH[ =].*PLAIN/.test(capabilityText)) {
-        await say(`AUTH PLAIN ${b64(`\0${USER}\0${PASS}`)}`, [235], 'Login');
+        await say(`AUTH PLAIN ${b64(`\0${settings.user}\0${settings.pass}`)}`, [235], 'Login');
       } else {
         await say('AUTH LOGIN', [334], 'Login');
-        await say(b64(USER), [334], 'The username');
-        await say(b64(PASS), [235], 'The password');
+        await say(b64(settings.user), [334], 'The username');
+        await say(b64(settings.pass), [235], 'The password');
       }
     }
 
-    await say(`MAIL FROM:<${from}>`, [250], 'The sender');
-    await say(`RCPT TO:<${to}>`, [250, 251], 'The recipient');
+    await say(`MAIL FROM:<${sender}>`, [250], 'The sender');
+    await say(`RCPT TO:<${recipient}>`, [250, 251], 'The recipient');
     await say('DATA', [354], 'DATA');
 
-    socket.write(`${message({ from, to, subject, text })}\r\n.\r\n`);
+    socket.write(`${message({ from: sender, to: recipient, subject, text })}\r\n.\r\n`);
     expect(await io.next(), [250], 'The message');
 
     command(socket, 'QUIT');
-    return { ok: true, to };
+    return { ok: true, to: recipient };
   } finally {
     socket.destroy();
   }
@@ -266,16 +264,16 @@ function linksMail(links, { reason } = {}) {
 }
 
 /** Send the given links in one mail. */
-async function sendLinks(links, { to = defaultTo(), reason } = {}) {
+async function sendLinks(links, { to, reason } = {}) {
   const { subject, text } = linksMail(links, { reason });
   return sendMail({ to, subject, text });
 }
 
 /** A mailto: URL that opens the user's mail client with the links written out. */
-function mailtoUrl(links, { to = defaultTo() } = {}) {
+function mailtoUrl(links, { to } = {}) {
   const { subject, text } = linksMail(links, {});
   const query = `subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`;
-  return `mailto:${to || ''}?${query}`;
+  return `mailto:${to || defaultTo() || ''}?${query}`;
 }
 
 module.exports = {

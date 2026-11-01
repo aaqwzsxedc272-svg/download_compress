@@ -1,5 +1,9 @@
 'use strict';
 
+/* Before anything reads process.env: a .env file makes the SMTP password a
+   one-time setup instead of something to retype on every run. */
+const envFile = require('./env').load();
+
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
@@ -13,6 +17,7 @@ const { downloadWithFallback, RECOVERABLE } = require('./fallback');
 const autoStop = require('./autostop');
 const ledger = require('./ledger');
 const notify = require('./notify');
+const mailsettings = require('./mailsettings');
 const { chooseCrf } = require('./estimate');
 const {
   PRESET_LIST,
@@ -1855,8 +1860,87 @@ app.post('/api/links/email', async (req, res) => {
   }
   const result = await emailLinks({ to, force: true, reason: 'Sent from the app.' });
   if (result.sent) return res.json({ ok: true, ...result });
-  if (result.needsConfig) return res.status(200).json({ ok: false, ...result });
+  if (result.needsConfig) {
+    return res.status(200).json({
+      ok: false,
+      ...result,
+      settings: mailsettings.describe(),
+      hint: 'Fill in the mail panel once — the password is saved on this machine and works on every run.',
+    });
+  }
   return res.status(502).json({ ok: false, error: result.error || 'The mail could not be sent.' });
+});
+
+/* ------------------------------------------------------- mail setup (one time) */
+/* The settings live in data/mail.json, so they are typed once and are still
+   there after a restart, a rebuilt Codespace or a fresh shell. */
+
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+app.get('/api/email/settings', (req, res) => {
+  res.json({ settings: mailsettings.describe() });
+});
+
+app.post('/api/email/settings', async (req, res) => {
+  const body = req.body || {};
+  if (body.to != null && body.to !== '' && !EMAIL_RE.test(String(body.to).trim())) {
+    return fail(res, 400, 'BAD_EMAIL', 'That does not look like an email address.');
+  }
+  const host = String(body.host || '').trim();
+  /* The form names a server to connect to, which is a way to probe this box's
+     network. Same guard as the downloader: no loopback or metadata address
+     unless the operator opted in. */
+  if (host && sources.isBlockedHost(`http://${host}:${Number(body.port) || 587}`)) {
+    return fail(res, 400, 'BLOCKED_HOST', 'That mail server address is not allowed.');
+  }
+  try {
+    const settings = await mailsettings.save({
+      host,
+      port: body.port,
+      secure: body.secure,
+      user: body.user,
+      pass: body.pass,
+      from: body.from,
+      to: body.to,
+    });
+    console.log(`[email] settings saved for ${settings.host} — links go to ${settings.to}`);
+    res.json({ ok: true, settings });
+  } catch (err) {
+    return fail(res, 400, 'BAD_SETTINGS', err.message);
+  }
+});
+
+app.delete('/api/email/settings', async (req, res) => {
+  const settings = await mailsettings.forget();
+  res.json({ ok: true, settings });
+});
+
+app.post('/api/email/test', async (req, res) => {
+  const to = String(req.body?.to || '').trim() || undefined;
+  if (to && !EMAIL_RE.test(to)) return fail(res, 400, 'BAD_EMAIL', 'That does not look like an email address.');
+  if (!notify.configured()) {
+    return res.status(400).json({
+      ok: false,
+      needsConfig: true,
+      error: 'Mail is not set up yet — fill in the mail server first.',
+      settings: mailsettings.describe(),
+    });
+  }
+  try {
+    await notify.sendMail({
+      to,
+      subject: 'Squeeze: mail is working',
+      text: [
+        'This is a test from Squeeze.',
+        '',
+        'If you can read this, share links will reach this address on their own —',
+        'including when the machine finishes and switches itself off.',
+      ].join('\n'),
+    });
+    res.json({ ok: true, to: to || notify.defaultTo() });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err.message });
+  }
 });
 
 app.get('/api/links.txt', async (req, res) => {
@@ -1946,6 +2030,16 @@ async function main() {
   ensureSample().catch((err) => console.warn('Sample clip unavailable:', err.message));
   const ytdlp = await sources.hasYtdlp();
   console.log(`Squeeze listening on http://0.0.0.0:${PORT} (yt-dlp: ${ytdlp ? ytdlp.version : 'not installed'})`);
+
+  const mail = mailsettings.describe();
+  if (mail.configured) {
+    console.log(`Mail: links go to ${mail.to} via ${mail.host}:${mail.port} (${mail.source === 'saved' ? 'saved in the app' : 'environment'})`);
+  } else {
+    console.log('Mail: not set up — the app offers a mailto: link instead (see the mail panel on the page)');
+  }
+  if (envFile.loaded && envFile.keys.length) {
+    console.log(`Loaded ${envFile.keys.join(', ')} from ${path.basename(envFile.path)}`);
+  }
 
   const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
   console.log(`Free disk: ${formatGb(free)} in ${jobsStore.DATA_DIR}`);

@@ -20,6 +20,7 @@ const state = {
   serverHostTried: new Set(),
   browserHostTried: new Set(),
   jobs: new Map(), // id -> { el, data, es }
+  mail: null,
   busy: 0,
 };
 
@@ -1781,9 +1782,15 @@ async function emailLinks() {
       showAlert(`The links are on the way to ${result.to}.`, 'ok', { timeout: 6000 });
     } else if (result.needsConfig && result.mailto) {
       /* No SMTP on this server: open the user's own mail app with the body
-         already filled in. Nothing is silently swallowed. */
+         already filled in, and point at the one-time setup that would make the
+         mail automatic from now on. Nothing is silently swallowed. */
       const note = $('#emailNote');
-      if (note) note.hidden = false;
+      if (note) {
+        note.hidden = false;
+        const setup = $('#mailSetup');
+        if (setup) setup.open = true;
+        setMailStatus(result.hint || 'Set this up once and the links are mailed on their own.', '');
+      }
       window.location.href = result.mailto;
       button.textContent = 'Opened your mail app';
       setTimeout(() => {
@@ -1811,6 +1818,117 @@ async function emailLinks() {
       }
     }, 0);
   }
+}
+
+/* ------------------------------------------------------------ mail setup */
+
+/** Paint what the server says about mail into the panel and the results note. */
+function renderMail(settings) {
+  const summary = $('#mailSummary');
+  const chevron = $('.mail-chevron', $('#mailSetup') || document.createElement('div'));
+  const note = $('#emailNote');
+  const configured = Boolean(settings && settings.configured);
+
+  if (summary) {
+    summary.textContent = configured
+      ? `Mail: links go to ${settings.to}${settings.source === 'saved' ? '' : ' (from the environment)'}`
+      : 'Mail: not set up';
+    $('.mail-setup')?.classList.toggle('is-on', configured);
+  }
+  if (chevron) chevron.textContent = configured ? 'Change' : 'Set up';
+  if (note) note.hidden = configured;
+
+  /* Never the password: the form only needs to know that one is stored. */
+  if (settings) {
+    const host = $('#mailHost');
+    if (host && !host.value) host.value = settings.host || '';
+    const port = $('#mailPort');
+    if (port && settings.port) port.value = String(settings.port);
+    const user = $('#mailUser');
+    if (user && !user.value) user.value = settings.user || '';
+    const to = $('#mailTo');
+    if (to && !to.value) to.value = settings.to || '';
+    const pass = $('#mailPass');
+    if (pass) {
+      pass.value = '';
+      pass.placeholder = settings.hasPassword
+        ? 'saved — leave blank to keep it'
+        : 'abcd efgh ijkl mnop';
+    }
+  }
+}
+
+async function loadMailSettings() {
+  try {
+    const { settings } = await api('/api/email/settings');
+    state.mail = settings;
+    renderMail(settings);
+    return settings;
+  } catch {
+    return null;
+  }
+}
+
+function setMailStatus(text, kind = '') {
+  const el = $('#mailStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = `mail-status${kind ? ` is-${kind}` : ''}`;
+}
+
+/**
+ * Save the form, then prove it works by sending a test mail — saving an app
+ * password that silently does not authenticate is the failure this panel exists
+ * to prevent, and only a real conversation with the server can tell.
+ */
+async function saveMailSettings({ test = true } = {}) {
+  const payload = {
+    host: $('#mailHost').value.trim(),
+    port: Number($('#mailPort').value) || 587,
+    user: $('#mailUser').value.trim(),
+    to: $('#mailTo').value.trim(),
+    pass: $('#mailPass').value,
+  };
+  if (!payload.host) {
+    setMailStatus('A mail server is needed (smtp.gmail.com for Gmail).', 'error');
+    $('#mailHost').focus();
+    return null;
+  }
+  if (!payload.to) {
+    setMailStatus('An address to send the links to is needed.', 'error');
+    $('#mailTo').focus();
+    return null;
+  }
+  setMailStatus('Saving…');
+  let settings;
+  try {
+    ({ settings } = await api('/api/email/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    }));
+  } catch (err) {
+    setMailStatus(err.message, 'error');
+    return null;
+  }
+  state.mail = settings;
+  renderMail(settings);
+  if (!test) {
+    setMailStatus('Saved.', 'ok');
+    return settings;
+  }
+  setMailStatus('Saved. Sending a test mail…');
+  try {
+    const result = await api('/api/email/test', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ to: settings.to }),
+    });
+    setMailStatus(`Working — a test mail is on its way to ${result.to}.`, 'ok');
+  } catch (err) {
+    setMailStatus(`Saved, but the test failed: ${err.message}`, 'error');
+  }
+  return settings;
 }
 
 /** The links panel is the durable record: refresh it whenever something lands. */
@@ -1857,6 +1975,46 @@ async function boot() {
 
   $('#emailLinks')?.addEventListener('click', emailLinks);
 
+  const mailForm = $('#mailForm');
+  mailForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = $('#mailSave');
+    if (button) button.disabled = true;
+    try {
+      await saveMailSettings({ test: true });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  $('#mailTest')?.addEventListener('click', async () => {
+    const button = $('#mailTest');
+    if (button) button.disabled = true;
+    setMailStatus('Sending a test mail…');
+    try {
+      const result = await api('/api/email/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ to: $('#mailTo').value.trim() || undefined }),
+      });
+      setMailStatus(`A test mail is on its way to ${result.to}.`, 'ok');
+    } catch (err) {
+      setMailStatus(err.message, 'error');
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  $('#mailForget')?.addEventListener('click', async () => {
+    setMailStatus('Removing…');
+    try {
+      const { settings } = await api('/api/email/settings', { method: 'DELETE' });
+      state.mail = settings;
+      renderMail(settings);
+      setMailStatus('Removed. The links panel falls back to your own mail app.', 'ok');
+    } catch (err) {
+      setMailStatus(err.message, 'error');
+    }
+  });
+
   const autoToggle = $('#autoHost');
   autoToggle.checked = state.autoHost;
   autoToggle.addEventListener('change', () => {
@@ -1894,8 +2052,9 @@ async function boot() {
     $('#engineText').textContent = 'engine unavailable';
   }
 
-  // Disk meter, auto-stop countdown and the results list, refreshed gently.
+  // Disk meter, auto-stop countdown, mail setup and the results list.
   await refreshStatus();
+  await loadMailSettings();
   await loadResults();
   setInterval(refreshStatus, Number(localStorage.getItem('squeeze.statusMs')) || 15000);
   setInterval(loadResults, 30000);

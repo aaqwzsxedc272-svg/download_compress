@@ -70,6 +70,7 @@ async function boot({
   links = LINKS,
   email = { ok: true, sent: true, count: 1, to: 'aaqwzsxedc272@gmail.com' },
   resolved = null,
+  mailSettings = { configured: false, to: 'aaqwzsxedc272@gmail.com', port: 587, hasPassword: false, source: 'none' },
 } = {}) {
   const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
   const dom = new JSDOM(html, {
@@ -86,6 +87,20 @@ async function boot({
     let body = {};
     if (target.includes('/api/health')) body = HEALTH;
     else if (target.includes('/api/links/email')) body = email;
+    else if (target.includes('/api/email/settings')) {
+      body = init.method === 'POST'
+        ? {
+            settings: {
+              ...mailSettings,
+              configured: true,
+              host: JSON.parse(init.body).host,
+              to: JSON.parse(init.body).to,
+              source: 'saved',
+              hasPassword: true,
+            },
+          }
+        : { settings: mailSettings };
+    } else if (target.includes('/api/email/test')) body = { ok: true, to: 'aaqwzsxedc272@gmail.com' };
     else if (target.includes('/api/links')) body = links;
     else if (target.includes('/api/resolve') && resolved) body = resolved;
     else if (target.includes('/api/jobs') && init.method === 'POST') body = { job: { id: 'job1', status: 'queued' } };
@@ -227,6 +242,47 @@ async function boot({
     if (!start) throw new Error('nothing was queued');
     const sent = JSON.parse(start.init.body);
     if (sent.noCompress !== true) throw new Error(`noCompress not sent: ${start.init.body}`);
+  });
+
+  console.log('mail setup');
+
+  await test('an unconfigured machine says so and points at its own mail app', async () => {
+    const fourth = await boot({ links: LINKS });
+    const note = fourth.doc.getElementById('emailNote');
+    if (note.hidden) throw new Error('the fallback is not explained');
+    if (!/not set up/.test(fourth.doc.getElementById('mailSummary').textContent)) {
+      throw new Error(`summary says "${fourth.doc.getElementById('mailSummary').textContent}"`);
+    }
+    if (!/Set up/.test(fourth.doc.querySelector('.mail-chevron').textContent)) throw new Error('no call to action');
+  });
+
+  await test('the form saves once and proves itself with a test mail', async () => {
+    const fifth = await boot({ links: LINKS });
+    const doc = fifth.doc;
+    if (!doc.querySelector('#mailForm')) throw new Error('no setup form');
+    doc.getElementById('mailHost').value = 'smtp.gmail.com';
+    doc.getElementById('mailPort').value = '587';
+    doc.getElementById('mailUser').value = 'owner@gmail.com';
+    doc.getElementById('mailPass').value = 'abcd efgh ijkl mnop';
+    doc.getElementById('mailTo').value = 'aaqwzsxedc272@gmail.com';
+    doc.getElementById('mailForm').dispatchEvent(new fifth.window.Event('submit'));
+    await new Promise((resolve) => fifth.window.setTimeout(resolve, 120));
+
+    const save = fifth.calls.find((call) => call.url.endsWith('/api/email/settings') && call.init.method === 'POST');
+    if (!save) throw new Error('the form never posted the settings');
+    const sent = JSON.parse(save.init.body);
+    if (sent.host !== 'smtp.gmail.com' || sent.to !== 'aaqwzsxedc272@gmail.com') {
+      throw new Error(`posted ${save.init.body}`);
+    }
+    const testMail = fifth.calls.find((call) => call.url.endsWith('/api/email/test'));
+    if (!testMail) throw new Error('saving did not try a real mail');
+    const status = doc.getElementById('mailStatus').textContent;
+    if (!/Working — a test mail is on its way/.test(status)) throw new Error(`status says "${status}"`);
+    if (!/Mail: links go to aaqwzsxedc272@gmail\.com/.test(doc.getElementById('mailSummary').textContent)) {
+      throw new Error('the summary did not update');
+    }
+    if (!doc.getElementById('emailNote').hidden) throw new Error('the fallback note is still showing');
+    if (doc.getElementById('mailPass').value !== '') throw new Error('the password is left in the field');
   });
 
   console.log('');

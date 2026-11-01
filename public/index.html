@@ -152,6 +152,45 @@
     <div class="results-list" id="resultsList"></div>
   </section>
 
+  <section class="card mail-card" id="postCard">
+    <details class="mail-setup" id="postSetup">
+      <summary>
+        <span class="mail-dot" aria-hidden="true"></span>
+        <span id="postSummary">Post the links automatically: not set up</span>
+        <span class="mail-chevron" aria-hidden="true">Set up</span>
+      </summary>
+      <form class="mail-form" id="postForm" autocomplete="off">
+        <p class="mail-intro">
+          Paste a <strong>Discord</strong> or <strong>Slack</strong> webhook URL and every finished
+          queue posts its links to that channel — no email, no app password. In Discord:
+          right-click the channel → <em>Edit Channel</em> → <em>Integrations</em> →
+          <em>Webhooks</em> → <em>New Webhook</em> → copy the URL.
+        </p>
+        <div class="mail-grid">
+          <label class="mail-field mail-field-to">
+            <span>Webhook URL (Discord, Slack, n8n…)</span>
+            <input id="postWebhook" type="password" placeholder="https://discord.com/api/webhooks/…" spellcheck="false" />
+          </label>
+          <label class="mail-field mail-field-to">
+            <span>…or an ntfy topic, for a phone notification (no account)</span>
+            <input id="postNtfy" type="text" placeholder="squeeze-7f3k2p" spellcheck="false" />
+          </label>
+        </div>
+        <p class="mail-hint">
+          Saved on this machine only (<code>data/publish.json</code>, readable by you alone) and used
+          on every run. The URL is a password for that channel: anyone holding it can post there,
+          so keep this page private and never commit it.
+        </p>
+        <div class="mail-actions">
+          <button class="btn primary" type="submit" id="postSave">Save</button>
+          <button class="btn" type="button" id="postTest">Send a test message</button>
+          <button class="btn tiny" type="button" id="postForget">Remove</button>
+          <span class="mail-status" id="postStatus" role="status"></span>
+        </div>
+      </form>
+    </details>
+  </section>
+
   <section class="card mail-card" id="mailCard">
     <details class="mail-setup" id="mailSetup">
       <summary>

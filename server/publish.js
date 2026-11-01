@@ -27,12 +27,15 @@
 const { spawn } = require('node:child_process');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const publishsettings = require('./publishsettings');
 
 const ROOT = path.join(__dirname, '..');
 const DATA_DIR = () => process.env.DATA_DIR || path.join(ROOT, 'data');
 /* Where LINKS.md is committed. The project itself by default; PUBLISH_REPO_DIR
    points it at a notes repository instead. */
 const REPO_ROOT = () => process.env.PUBLISH_REPO_DIR || ROOT;
+/* Settings come from data/publish.json (written by the page) or the environment. */
+const settings = () => publishsettings.current();
 const STATE_PATH = () => path.join(DATA_DIR(), 'published.json');
 const UA = 'Squeeze/1.0 (+link publishing)';
 
@@ -230,7 +233,7 @@ const repo = {
   id: 'repo',
   label: 'LINKS.md in the repository',
   ready: cached(120000, async () => {
-    if (process.env.PUBLISH_REPO !== '1') {
+    if (!settings().repo) {
       return { ready: false, detail: 'set PUBLISH_REPO=1 to commit the links to your repo' };
     }
     const cwd = REPO_ROOT();
@@ -347,8 +350,8 @@ const webhook = {
   id: 'webhook',
   label: 'Webhook',
   ready: cached(60000, async () => {
-    const url = process.env.PUBLISH_WEBHOOK || '';
-    if (!url) return { ready: false, detail: 'set PUBLISH_WEBHOOK' };
+    const url = settings().webhook || '';
+    if (!url) return { ready: false, detail: 'no webhook set' };
     let parsed;
     try {
       parsed = new URL(url);
@@ -359,9 +362,9 @@ const webhook = {
     const kind = /discord(app)?\.com$/.test(host) ? 'Discord' : /slack\.com$/.test(host) ? 'Slack' : host;
     /* Only the host: the path is the token. */
     return { ready: true, detail: `${kind} · ${redact(url)}` };
-  }, () => process.env.PUBLISH_WEBHOOK || ''),
+  }, () => settings().webhook || ''),
   async send(links, { reason } = {}) {
-    const url = process.env.PUBLISH_WEBHOOK;
+    const url = settings().webhook;
     const host = hostOf(url);
     const discord = /discord(app)?\.com$/.test(host);
     const text = linksText(links, { reason });
@@ -412,12 +415,13 @@ const ntfy = {
   id: 'ntfy',
   label: 'ntfy push',
   async ready() {
-    const topic = process.env.PUBLISH_NTFY || '';
-    return topic ? { ready: true, detail: `topic ${topic}` } : { ready: false, detail: 'set PUBLISH_NTFY=<topic>' };
+    const topic = settings().ntfy || '';
+    return topic ? { ready: true, detail: `topic ${topic}` } : { ready: false, detail: 'no ntfy topic set' };
   },
   async send(links, { reason } = {}) {
-    const topic = process.env.PUBLISH_NTFY;
-    const base = (process.env.NTFY_URL || 'https://ntfy.sh').replace(/\/+$/, '');
+    const config = settings();
+    const topic = config.ntfy;
+    const base = (config.ntfyUrl || 'https://ntfy.sh').replace(/\/+$/, '');
     const res = await fetch(`${base}/${encodeURIComponent(topic)}`, {
       method: 'POST',
       headers: {
@@ -440,14 +444,15 @@ const paste = {
   id: 'paste',
   label: 'Anonymous paste',
   async ready() {
-    if (process.env.PUBLISH_PASTE !== '1' && !process.env.PUBLISH) {
+    const config = settings();
+    if (!config.paste) {
       return { ready: false, detail: 'set PUBLISH_PASTE=1 (links become a public paste)' };
     }
-    return { ready: true, detail: process.env.PASTE_URL || 'https://0x0.st' };
+    return { ready: true, detail: config.pasteUrl || 'https://0x0.st' };
   },
   async send(links, { reason } = {}) {
     const text = linksText(links, { reason });
-    const base = (process.env.PASTE_URL || 'https://0x0.st').replace(/\/+$/, '');
+    const base = (settings().pasteUrl || 'https://0x0.st').replace(/\/+$/, '');
 
     if (/paste\.rs$/i.test(base)) {
       const res = await fetch(base, {
@@ -494,11 +499,12 @@ function resolveChain() {
      configured webhook or topic jumps ahead of a gist, because the person
      chose it. */
   const chain = [];
-  if (process.env.PUBLISH_WEBHOOK) chain.push(webhook);
-  if (process.env.PUBLISH_NTFY) chain.push(ntfy);
+  const config = settings();
+  if (config.webhook) chain.push(webhook);
+  if (config.ntfy) chain.push(ntfy);
   chain.push(gist);
-  if (process.env.PUBLISH_REPO === '1') chain.push(repo);
-  if (process.env.PUBLISH_PASTE === '1') chain.push(paste);
+  if (config.repo) chain.push(repo);
+  if (config.paste) chain.push(paste);
   return chain;
 }
 
@@ -561,6 +567,7 @@ async function describe() {
   }
   const state = await readState();
   return {
+    settings: publishsettings.describe(),
     chain: chain.map((sink) => sink.id),
     disabled: !chain.length,
     sinks: ready,
@@ -591,8 +598,10 @@ function banner(links, { reason } = {}) {
 
 module.exports = {
   publish,
+  describe,
   chunkText,
   redact,
+  publishsettings,
   describe,
   banner,
   linksText,

@@ -245,7 +245,7 @@ fly deploy
 | `AUTO_EMAIL` | on | Mails the new links when the queue drains; `0` disables |
 | `AUTO_PUBLISH` | on | Posts the links to the first working sink when the queue drains; `0` disables |
 | `PUBLISH` | auto | `gist,webhook,ntfy,repo,paste` in the order you want; `off` disables |
-| `PUBLISH_WEBHOOK` | — | JSON POST target (Discord, Slack, n8n, …) |
+| `PUBLISH_WEBHOOK` | — | JSON POST target (Discord, Slack, n8n, …); also settable on the page, which wins |
 | `PUBLISH_NTFY` | — | ntfy topic for a phone notification |
 | `PUBLISH_REPO` | off | `1` commits `LINKS.md` to the repo and pushes it |
 | `PUBLISH_REPO_DIR` | this repo | where `LINKS.md` is committed |
@@ -409,15 +409,15 @@ terminal without starting the server.
    (On a server you own, *Server Settings* → *Integrations* → *Webhooks* works too.)
 3. Click the new webhook → **Copy Webhook URL**. It looks like
    `https://discord.com/api/webhooks/1234567890/AbCdEf…`.
-4. Put that line in `.env` in the project root:
+4. On the page, open **Post the links automatically** (under the links), paste the URL,
+   press **Save**. It is stored in `data/publish.json` (mode `0600`) and a test message is
+   sent straight away — if it appears in the channel, you are done. The page says
+   *“Post the links to: Discord · https://discord.com/…”* from then on.
 
-   ```
-   PUBLISH_WEBHOOK=https://discord.com/api/webhooks/1234567890/AbCdEf…
-   ```
-
-   …or run it once: `PUBLISH_WEBHOOK='https://discord.com/api/webhooks/…' npm start`.
-5. Press **Post them** next to the links — the message should appear in the channel at once.
-   From then on it happens by itself, on every finished queue and before auto-stop.
+   Prefer a file? The same value works in `.env` as `PUBLISH_WEBHOOK=…`, or one run:
+   `PUBLISH_WEBHOOK='https://discord.com/api/webhooks/…' npm start`.
+5. That is it. Every finished queue posts by itself, and so does the moment before auto-stop;
+   **Post them** next to the links does it on demand.
 
 What lands in the channel is the same text as the console banner: one line per file with the
 size change and the host, then the link:
@@ -438,6 +438,12 @@ sink it used.
 
 The same line works for **Slack** (an incoming webhook URL), **n8n**, or any endpoint that accepts
 a JSON `POST`; a non-Discord endpoint also gets a `links` array with the names, sizes and hosts.
+
+The settings can also be saved from the page (**Post the links automatically**): a webhook URL,
+an ntfy topic, or nothing. They land in `data/publish.json` with mode `0600`, are read on every
+use so a save takes effect immediately, and the token is never returned by any endpoint — the API
+and the page only ever show `https://discord.com/…`. **Send a test message** proves the channel
+works before you rely on it.
 
 `PUBLISH=gist,webhook` picks the sinks and their order; `PUBLISH=off` disables the step, as does
 `AUTO_PUBLISH=0`. `GET /api/publish` reports which sinks this machine can actually use and the
@@ -553,7 +559,7 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:ledger` — share links survive a restart, duplicates and mangled names.
 - `npm run test:notify` — a full SMTP conversation against a fake server: login, envelope,
   base64 body, the `mailto:` fallback and a refused password.
-- `npm run test:publish` — the no-setup routes: the console floor, a gist created once and
+- `npm run test:publish` — 64 checks over the no-setup routes: the console floor, a gist created once and
   updated afterwards (URL stays the same), a token that cannot make gists reported honestly,
   webhook/ntfy/paste payloads, `LINKS.md` committed and pushed to a real (throwaway) remote, and
   `PUBLISH=off` publishing nothing. The `gh` binary is faked, so no account is needed.

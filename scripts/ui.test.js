@@ -71,7 +71,13 @@ async function boot({
   email = { ok: true, sent: true, count: 1, to: 'aaqwzsxedc272@gmail.com' },
   resolved = null,
   mailSettings = { configured: false, to: 'aaqwzsxedc272@gmail.com', port: 587, hasPassword: false, source: 'none' },
-  publishInfo = { chain: [], disabled: true, sinks: [], last: null },
+  publishInfo = {
+    chain: [],
+    disabled: true,
+    sinks: [],
+    last: null,
+    settings: { hasWebhook: false, webhook: null, ntfy: null, paste: false, repo: false, saved: false },
+  },
   publishResult = { ok: true, sink: 'gist', label: 'GitHub gist', url: 'https://gist.github.com/x/deadbeef', count: 1 },
 } = {}) {
   const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
@@ -82,6 +88,9 @@ async function boot({
   });
   const { window } = dom;
   const calls = [];
+  /* Server-side state the panel mutates, so a save is visible to the next read
+     the way it is in the real app. */
+  let liveSettings = { ...publishInfo.settings };
 
   window.fetch = async (url, init = {}) => {
     const target = String(url);
@@ -104,7 +113,20 @@ async function boot({
         : { settings: mailSettings };
     } else if (target.includes('/api/email/test')) body = { ok: true, to: 'aaqwzsxedc272@gmail.com' };
     else if (target.includes('/api/links/publish')) body = publishResult;
-    else if (target.includes('/api/publish')) body = { publish: publishInfo };
+    else if (target.includes('/api/publish/test')) body = { ok: true, sink: 'webhook', label: 'Discord', url: null };
+    else if (target.includes('/api/publish/settings') && init.method === 'POST') {
+      const sent = JSON.parse(init.body);
+      liveSettings = {
+        ...liveSettings,
+        hasWebhook: Boolean(sent.webhook) || liveSettings.hasWebhook,
+        webhook: sent.webhook ? 'https://discord.com/…' : liveSettings.webhook,
+        webhookKind: sent.webhook ? 'Discord' : liveSettings.webhookKind,
+        ntfy: sent.ntfy || liveSettings.ntfy,
+        saved: true,
+      };
+      body = { settings: liveSettings, publish: { ...publishInfo, settings: liveSettings } };
+    }
+    else if (target.includes('/api/publish')) body = { publish: { ...publishInfo, settings: liveSettings } };
     else if (target.includes('/api/links')) body = links;
     else if (target.includes('/api/resolve') && resolved) body = resolved;
     else if (target.includes('/api/jobs') && init.method === 'POST') body = { job: { id: 'job1', status: 'queued' } };
@@ -319,6 +341,58 @@ async function boot({
     if (!post || post.init.method !== 'POST') throw new Error('nothing was posted');
     const alert = doc.getElementById('alert');
     if (!/gist\.github\.com/.test(alert.textContent)) throw new Error(`alert says "${alert.textContent}"`);
+  });
+
+  console.log('posting setup panel');
+
+  await test('the panel saves a webhook and proves it with a test post', async () => {
+    const eighth = await boot({ links: LINKS });
+    const doc = eighth.doc;
+    if (!doc.getElementById('postForm')) throw new Error('no posting panel');
+    if (!/not set up/.test(doc.getElementById('postSummary').textContent)) {
+      throw new Error(`summary says "${doc.getElementById('postSummary').textContent}"`);
+    }
+    doc.getElementById('postWebhook').value = 'https://discord.com/api/webhooks/1/abc';
+    doc.getElementById('postForm').dispatchEvent(new eighth.window.Event('submit'));
+    await new Promise((resolve) => eighth.window.setTimeout(resolve, 120));
+
+    const save = eighth.calls.find((call) => call.url.endsWith('/api/publish/settings') && call.init.method === 'POST');
+    if (!save) throw new Error('the form never saved');
+    if (JSON.parse(save.init.body).webhook !== 'https://discord.com/api/webhooks/1/abc') throw new Error('wrong payload');
+    const test = eighth.calls.find((call) => call.url.endsWith('/api/publish/test'));
+    if (!test) throw new Error('saving did not send a test message');
+    const status = doc.getElementById('postStatus').textContent;
+    if (!/Posted/.test(status)) throw new Error(`status says "${status}"`);
+    if (!/Post the links to: Discord/.test(doc.getElementById('postSummary').textContent)) {
+      throw new Error(`summary says "${doc.getElementById('postSummary').textContent}"`);
+    }
+    if (doc.getElementById('postWebhook').value !== '') throw new Error('the URL is left in the field');
+    if (doc.getElementById('postWebhook').type !== 'password') throw new Error('the URL is shown in clear text');
+  });
+
+  await test('an empty form does not overwrite what is saved', async () => {
+    const ninth = await boot({
+      links: LINKS,
+      publishInfo: {
+        chain: ['webhook'],
+        disabled: false,
+        sinks: [{ id: 'webhook', label: 'Webhook', ready: true, detail: 'Discord · https://discord.com/…', inChain: true }],
+        last: null,
+        settings: { hasWebhook: true, webhook: 'https://discord.com/…', webhookKind: 'Discord', ntfy: null, paste: false, repo: false, saved: true },
+      },
+    });
+    const doc = ninth.doc;
+    if (!/Post the links to: Discord/.test(doc.getElementById('postSummary').textContent)) {
+      throw new Error('a saved webhook is not shown');
+    }
+    doc.getElementById('postForm').dispatchEvent(new ninth.window.Event('submit'));
+    await new Promise((resolve) => ninth.window.setTimeout(resolve, 80));
+    if (ninth.calls.some((call) => call.url.endsWith('/api/publish/settings') && call.init.method === 'POST')) {
+      throw new Error('an empty form posted and would have cleared the setting');
+    }
+    if (!/Paste a webhook URL/.test(doc.getElementById('postStatus').textContent)) {
+      throw new Error(`status says "${doc.getElementById('postStatus').textContent}"`);
+    }
   });
 
   console.log('');

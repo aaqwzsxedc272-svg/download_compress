@@ -2007,7 +2007,49 @@ app.post('/api/links/publish', async (req, res) => {
 });
 
 app.get('/api/publish/settings', async (req, res) => {
-  res.json({ publish: await publish.describe() });
+  res.json({ settings: publish.publishsettings.describe(), publish: await publish.describe() });
+});
+
+/* Save the webhook / ntfy topic once, from the page. The value is a credential
+   and is never returned. */
+app.post('/api/publish/settings', async (req, res) => {
+  const body = req.body || {};
+  try {
+    const settings = await publish.publishsettings.save({
+      webhook: body.webhook,
+      ntfy: body.ntfy,
+      paste: body.paste,
+      repo: body.repo,
+    });
+    console.log(`[publish] settings saved — ${settings.hasWebhook ? `${settings.webhookKind || 'webhook'} ` : ''}${settings.ntfy ? `ntfy ${settings.ntfy}` : ''}`.trim());
+    res.json({ ok: true, settings, publish: await publish.describe() });
+  } catch (err) {
+    return fail(res, 400, 'BAD_SETTINGS', err.message);
+  }
+});
+
+app.delete('/api/publish/settings', async (req, res) => {
+  const settings = await publish.publishsettings.forget();
+  res.json({ ok: true, settings, publish: await publish.describe() });
+});
+
+/**
+ * Prove the webhook works *now*, with a sentence rather than a link: if this
+ * arrives in the channel, the rest is wiring that has already been tested.
+ */
+app.post('/api/publish/test', async (req, res) => {
+  const result = await publish.publish(
+    [
+      {
+        name: 'Squeeze test message',
+        url: 'https://github.com/aaqwzsxedc272-svg/download_compress',
+        provider: 'test',
+      },
+    ],
+    { reason: 'This is a test — if you can read it, share links will arrive here on their own.' },
+  );
+  if (result.ok) return res.json({ ok: true, ...result });
+  return res.status(502).json({ ok: false, ...result, publish: await publish.describe() });
 });
 
 app.get('/api/links.txt', async (req, res) => {

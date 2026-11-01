@@ -1834,6 +1834,7 @@ function renderPublish(info) {
   const note = $('#publishNote');
   const button = $('#publishLinks');
   if (!note || !button) return;
+  if (info?.settings) renderPost(info.settings);
   const ready = (info?.sinks || []).filter((sink) => sink.ready && sink.inChain);
   const last = info?.last;
 
@@ -1934,6 +1935,98 @@ async function postLinks() {
         }, 3000);
       }
     }, 0);
+  }
+}
+
+/* -------------------------------------------- posting: where the links go */
+
+/** Paint the saved webhook / ntfy topic into the panel. Never the token. */
+function renderPost(settings) {
+  if (!settings) return;
+  const summary = $('#postSummary');
+  const setup = $('#postSetup');
+  const parts = [];
+  if (settings.hasWebhook) parts.push(`${settings.webhookKind || 'Webhook'} · ${settings.webhook}`);
+  if (settings.ntfy) parts.push(`ntfy ${settings.ntfy}`);
+  if (settings.repo) parts.push('LINKS.md');
+  if (settings.paste) parts.push('paste');
+  if (summary) {
+    summary.textContent = parts.length
+      ? `Post the links to: ${parts.join(' + ')}${settings.saved ? '' : ' (from the environment)'}`
+      : 'Post the links automatically: not set up';
+  }
+  if (setup) setup.classList.toggle('is-on', parts.length > 0);
+  const chevron = setup && $('.mail-chevron', setup);
+  if (chevron) chevron.textContent = parts.length ? 'Change' : 'Set up';
+  const webhook = $('#postWebhook');
+  if (webhook) {
+    webhook.value = '';
+    webhook.placeholder = settings.hasWebhook
+      ? `${settings.webhook} — saved, paste a new one to replace it`
+      : 'https://discord.com/api/webhooks/…';
+  }
+  const ntfy = $('#postNtfy');
+  if (ntfy && !ntfy.value) ntfy.placeholder = settings.ntfy ? `saved: ${settings.ntfy}` : 'squeeze-7f3k2p';
+}
+
+function setPostStatus(text, kind = '') {
+  const el = $('#postStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = `mail-status${kind ? ` is-${kind}` : ''}`;
+}
+
+async function savePost({ test = true } = {}) {
+  const payload = {};
+  const webhook = $('#postWebhook').value.trim();
+  const ntfy = $('#postNtfy').value.trim();
+  /* An empty field means "leave it alone", so a bare Save is not destructive. */
+  if (webhook) payload.webhook = webhook;
+  if (ntfy) payload.ntfy = ntfy;
+  if (!Object.keys(payload).length) {
+    setPostStatus('Paste a webhook URL or an ntfy topic first.', 'error');
+    return null;
+  }
+  setPostStatus('Saving…');
+  let settings;
+  try {
+    ({ settings } = await api('/api/publish/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    }));
+  } catch (err) {
+    setPostStatus(err.message, 'error');
+    return null;
+  }
+  renderPost(settings);
+  await loadPublishInfo();
+  $('#postWebhook').value = '';
+  if (!test) {
+    setPostStatus('Saved.', 'ok');
+    return settings;
+  }
+  setPostStatus('Saved. Sending a test message…');
+  await sendTestPost();
+  return settings;
+}
+
+async function sendTestPost() {
+  try {
+    const result = await api('/api/publish/test', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    setPostStatus(
+      result.url ? `Posted — look at the channel (${result.label}).` : `Posted via ${result.label} — check your channel.`,
+      'ok',
+    );
+    await loadPublishInfo();
+    return result;
+  } catch (err) {
+    setPostStatus(`Failed: ${err.message}`, 'error');
+    return null;
   }
 }
 
@@ -2092,6 +2185,38 @@ async function boot() {
 
   $('#emailLinks')?.addEventListener('click', emailLinks);
   $('#publishLinks')?.addEventListener('click', postLinks);
+
+  $('#postForm')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = $('#postSave');
+    if (button) button.disabled = true;
+    try {
+      await savePost({ test: true });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  $('#postTest')?.addEventListener('click', async () => {
+    const button = $('#postTest');
+    if (button) button.disabled = true;
+    setPostStatus('Sending a test message…');
+    try {
+      await sendTestPost();
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  $('#postForget')?.addEventListener('click', async () => {
+    setPostStatus('Removing…');
+    try {
+      const { settings } = await api('/api/publish/settings', { method: 'DELETE' });
+      renderPost(settings);
+      await loadPublishInfo();
+      setPostStatus('Removed. The links still print in the terminal and stay in links.txt.', 'ok');
+    } catch (err) {
+      setPostStatus(err.message, 'error');
+    }
+  });
 
   const mailForm = $('#mailForm');
   mailForm?.addEventListener('submit', async (event) => {

@@ -337,6 +337,64 @@ async function main() {
   delete process.env.PUBLISH;
   delete process.env.PUBLISH_WEBHOOK;
 
+  console.log('settings saved from the page');
+
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'squeeze-pubcfg-'));
+  const savedDataDir = process.env.DATA_DIR;
+  process.env.DATA_DIR = cfgDir;
+  for (const key of ['PUBLISH', 'PUBLISH_WEBHOOK', 'PUBLISH_NTFY', 'PUBLISH_PASTE', 'PUBLISH_REPO']) {
+    delete process.env[key];
+  }
+  const settingsModule = require('../server/publishsettings');
+
+  const empty = settingsModule.describe();
+  check('nothing is configured to start with', empty.hasWebhook === false && empty.ntfy === null);
+
+  const afterSave = await settingsModule.save({ webhook: 'https://discord.com/api/webhooks/999/TOKEN-abc', ntfy: 'squeeze-abc' });
+  check('a webhook can be saved', afterSave.hasWebhook === true && afterSave.webhookKind === 'Discord');
+  check('the kind is recognised', afterSave.webhookKind === 'Discord');
+  check('the token is not returned', !JSON.stringify(afterSave).includes('TOKEN-abc'), JSON.stringify(afterSave));
+  const mode = fs.statSync(settingsModule.SETTINGS_PATH()).mode & 0o777;
+  check('the file is private', mode === 0o600, mode.toString(8));
+  check(
+    'the settings take effect without a restart',
+    (await publish.describe()).chain.includes('webhook') && (await publish.describe()).chain.includes('ntfy'),
+  );
+
+  await settingsModule.save({ webhook: '' });
+  const cleared = settingsModule.describe();
+  check('an empty string removes just that field', cleared.hasWebhook === false && cleared.ntfy === 'squeeze-abc');
+
+  let rejected = null;
+  try {
+    await settingsModule.save({ webhook: 'not-a-url' });
+  } catch (err) {
+    rejected = err;
+  }
+  check('a nonsense URL is refused', Boolean(rejected) && /webhook URL/.test(rejected.message));
+
+  rejected = null;
+  try {
+    await settingsModule.save({ ntfy: 'has spaces!' });
+  } catch (err) {
+    rejected = err;
+  }
+  check('a bad topic is refused', Boolean(rejected) && /topic/.test(rejected.message));
+
+  /* The file wins over the environment, so the page is the source of truth. */
+  process.env.PUBLISH_WEBHOOK = 'https://hooks.slack.com/services/ENV-TOKEN';
+  const envDescribe = settingsModule.describe();
+  check('the environment is used when the file is silent', envDescribe.hasWebhook === true, JSON.stringify(envDescribe));
+  check('and it is labelled Slack', envDescribe.webhookKind === 'Slack');
+  await settingsModule.save({ webhook: 'https://discord.com/api/webhooks/1/FILE-TOKEN' });
+  check('but a saved value wins over it', settingsModule.describe().webhookKind === 'Discord');
+
+  await settingsModule.forget();
+  delete process.env.PUBLISH_WEBHOOK;
+  check('removing falls back to nothing', settingsModule.describe().hasWebhook === false);
+  process.env.DATA_DIR = savedDataDir;
+  await fsp.rm(cfgDir, { recursive: true, force: true }).catch(() => {});
+
   console.log('the banner');
 
   const originalLog = console.log;

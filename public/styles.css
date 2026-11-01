@@ -685,6 +685,39 @@ a { color: inherit; text-decoration: none; }
 .results-sub { margin-top: -6px; }
 .results-sub a { color: var(--accent); }
 
+.job-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  margin-top: 6px;
+  font-size: 12.2px;
+  color: var(--dim);
+  font-family: var(--mono);
+  max-width: 100%;
+}
+.job-source[hidden] { display: none; }
+.job-source-label {
+  font-size: 10.6px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+  opacity: 0.75;
+  flex: none;
+}
+.job-source-url {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px dotted rgba(255, 255, 255, 0.18);
+  max-width: min(58ch, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.job-source-url:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.job-source-tab { color: var(--dim); opacity: 0.9; }
+.job-source-tab::before { content: '· tab: '; opacity: 0.6; }
+
 .job-note {
   margin: 6px 0 0;
   font-size: 12.4px;

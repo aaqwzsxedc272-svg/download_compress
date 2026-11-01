@@ -89,6 +89,31 @@ function fail(res, status, code, message) {
   return res.status(status).json({ error: message, code });
 }
 
+/**
+ * What a browser tab will say for this job's file.
+ *
+ * The download and preview routes carry the file name in the URL, so the tab
+ * title is the last path segment — which is exactly the name shown in the app.
+ * Hosted pages (pixeldrain, bunkr, …) take their title from the same name.
+ */
+function tabTitleFor(job) {
+  if (job.outputName) return job.outputName;
+  try {
+    return outputNameFor(job);
+  } catch {
+    return job.name || 'video.mp4';
+  }
+}
+
+/* Every job view the API and the event stream hand out gets the two things the
+   page shows under a file: the name a browser tab will carry, and the link it
+   can be opened from. */
+jobsStore.setViewHook((job) => ({
+  tabTitle: tabTitleFor(job),
+  downloadPath: `/api/jobs/${job.id}/download/${encodeURIComponent(tabTitleFor(job))}`,
+  previewPath: `/api/jobs/${job.id}/preview/${encodeURIComponent(tabTitleFor(job))}`,
+}));
+
 function outputNameFor(job) {
   const preset = getPreset(job.presetId);
   if (job.noCompress) {
@@ -169,6 +194,41 @@ async function runPasses(job, plan, paths, meta, controller) {
   }
 }
 
+/**
+ * Hand the downloaded bytes back untouched.
+ *
+ * A copy keeps every bit of quality. If the source is an MKV (or anything else
+ * MP4-shaped) it is remuxed instead — a stream copy is seconds of work, loses
+ * nothing, and plays everywhere. The bytes stay identical; only the container
+ * changes. Used by "just download" jobs and by a job that is told to stop
+ * encoding while it runs.
+ */
+async function copyOriginal(job, paths, meta, notes, signal) {
+  const sourceExt = (path.extname(job.name || '') || '.mp4').toLowerCase();
+  if (job.noCompress && sourceExt !== '.mp4') {
+    try {
+      await transcode(paths.source, paths.output, [
+        '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+        '-i', paths.source,
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        paths.output,
+      ], { signal, duration: meta.duration });
+      job.outputExt = '.mp4';
+      notes.push('Repackaged into MP4 without re-encoding — not a single pixel was touched.');
+      return;
+    } catch {
+      /* fall through to a byte-for-byte copy */
+    }
+  }
+  await fsp.copyFile(paths.source, paths.output);
+  job.outputExt = job.noCompress ? sourceExt : '.mp4';
+  if (job.noCompress && sourceExt !== '.mp4') {
+    notes.push(`Kept in its original format (${sourceExt.slice(1)}) because it could not be repackaged losslessly.`);
+  }
+}
+
 /** "video: hevc · audio: truehd", for when the encoder refuses a file. */
 function codecSummary(meta) {
   const parts = [];
@@ -189,7 +249,9 @@ const SKIP_ENCODE_BELOW = Number(process.env.SQUEEZE_SKIP_BELOW) || 0.05;
 async function compressJob(job) {
   const paths = jobsStore.jobPaths(job);
   const preset = getPreset(job.presetId);
-  const controller = makeController(job);
+  /* Mutable: "just download it" pressed mid-encode aborts this signal, and the
+     copy that follows needs a clean one. */
+  let controller = makeController(job);
 
   jobsStore.updateJob(job, { status: 'compressing', stage: 'Reading video info', progress: 0 });
 
@@ -288,7 +350,13 @@ async function compressJob(job) {
   }
 
   if (controller.signal.aborted) {
-    throw Object.assign(new Error('Cancelled.'), { code: 'CANCELLED' });
+    /* Aborted between the probe and the encode is not a cancellation: it is the
+       user asking for the original. The copy takes seconds. */
+    if (!job.skipRequested) throw Object.assign(new Error('Cancelled.'), { code: 'CANCELLED' });
+    skipEncode = true;
+    job.noCompress = true;
+    notes.push('The encode was stopped on request, so the file is handed back exactly as downloaded.');
+    controller = makeController(job);
   }
 
   let outStat = null;
@@ -300,32 +368,7 @@ async function compressJob(job) {
 
   if (skipEncode) {
     jobsStore.updateJob(job, { stage: job.noCompress ? 'Saving the original' : 'Keeping the original', progress: 1 });
-    const sourceExt = (path.extname(job.name || '') || '.mp4').toLowerCase();
-    /* A copy keeps every bit of quality. If the source is an MKV (or anything
-       else MP4-shaped), remux it — a stream copy is seconds of work, loses
-       nothing, and plays everywhere. The bytes stay identical; only the
-       container changes. */
-    if (job.noCompress && sourceExt !== '.mp4') {
-      try {
-        await transcode(paths.source, paths.output, [
-          '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-          '-i', paths.source,
-          '-map', '0:v:0', '-map', '0:a:0?',
-          '-c', 'copy',
-          '-movflags', '+faststart',
-          paths.output,
-        ], { signal: controller.signal, duration: meta.duration });
-        job.outputExt = '.mp4';
-        notes.push('Repackaged into MP4 without re-encoding — not a single pixel was touched.');
-      } catch {
-        await fsp.copyFile(paths.source, paths.output);
-        job.outputExt = sourceExt;
-        notes.push(`Kept in its original format (${sourceExt.slice(1)}) because it could not be repackaged losslessly.`);
-      }
-    } else {
-      await fsp.copyFile(paths.source, paths.output);
-      job.outputExt = job.noCompress ? sourceExt : '.mp4';
-    }
+    await copyOriginal(job, paths, meta, notes, controller.signal);
     outStat = await fsp.stat(paths.output);
     usedOriginal = true;
   } else {
@@ -359,6 +402,19 @@ async function compressJob(job) {
         await runPasses(job, plan, paths, meta, controller);
         break;
       } catch (err) {
+        /* Stopped on purpose, from the job card: what the user wants is the
+           file that was already downloaded, not a failed encode. */
+        if (job.skipRequested && controller.signal.aborted) {
+          jobsStore.updateJob(job, { stage: 'Keeping the original', progress: 1 });
+          await fsp.rm(paths.output, { force: true }).catch(() => {});
+          await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+          job.noCompress = true;
+          usedOriginal = true;
+          notes.push('The encode was stopped on request, so the file is handed back exactly as downloaded.');
+          await copyOriginal(job, paths, meta, notes, makeController(job).signal);
+          outStat = await fsp.stat(paths.output);
+          break;
+        }
         const recoverable = err.code === 'FFMPEG_FAILED' && attempt === 0 && !controller.signal.aborted;
         if (!recoverable) {
           if (err.code === 'FFMPEG_FAILED') err.codecNote = codecSummary(meta);
@@ -376,16 +432,18 @@ async function compressJob(job) {
     await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
     await fsp.rm(`${path.join(job.dir, 'x264pass')}.log.mbtree`, { force: true }).catch(() => {});
 
-    outStat = await fsp.stat(paths.output);
-    if (!outStat.size) throw Object.assign(new Error('Compression produced an empty file.'), { code: 'EMPTY_OUTPUT' });
-
-    // Never hand back a file that is bigger AND no better: if the re-encode
-    // did not pay off, deliver the original bytes instead.
-    if (!job.targetMb && outStat.size >= job.sourceBytes) {
-      await fsp.copyFile(paths.source, paths.output);
+    if (!outStat) {
       outStat = await fsp.stat(paths.output);
-      usedOriginal = true;
-      notes.push('Re-encoding would have made this bigger, so the original file is what gets shared.');
+      if (!outStat.size) throw Object.assign(new Error('Compression produced an empty file.'), { code: 'EMPTY_OUTPUT' });
+
+      // Never hand back a file that is bigger AND no better: if the re-encode
+      // did not pay off, deliver the original bytes instead.
+      if (!job.targetMb && outStat.size >= job.sourceBytes) {
+        await fsp.copyFile(paths.source, paths.output);
+        outStat = await fsp.stat(paths.output);
+        usedOriginal = true;
+        notes.push('Re-encoding would have made this bigger, so the original file is what gets shared.');
+      }
     }
   }
 
@@ -470,6 +528,7 @@ async function hostJob(job, { order } = {}) {
       hostedAt: Date.now(),
     });
     writeResultsFile();
+    queueEarlyPost(job);
     persistHostedLink(job, result.url, result.provider);
 
     /* Space is the scarcest thing on these machines. Once the file is on a host
@@ -623,6 +682,48 @@ async function publishLinks({ reason, quiet = false } = {}) {
   if (!links.length) return { ok: false, reason: 'nothing-to-publish' };
   publish.banner(links, { reason });
   return publish.publish(links, { reason, quiet });
+}
+
+/* A share link that exists is worth reporting before the queue is finished: if
+   the machine runs out of minutes and never drains, the links for the files it
+   already treated must not go down with it. Batched, so a seven-file queue does
+   not become seven Discord messages — and PUBLISH_EVERY_SECONDS=0 turns it off
+   (the drain post still sends everything). */
+const EARLY_PUBLISH_MS = Math.max(0, Number(process.env.PUBLISH_EVERY_SECONDS ?? 60)) * 1000;
+const earlyPosts = new Map();
+let earlyTimer = null;
+
+function linkEntryFor(job) {
+  return {
+    url: job.hostedUrl,
+    name: job.outputName || job.name || null,
+    provider: job.hostProvider || null,
+    sourceBytes: job.sourceBytes || 0,
+    outputBytes: job.outputBytes || 0,
+    usedOriginal: Boolean(job.usedOriginal),
+  };
+}
+
+function queueEarlyPost(job) {
+  if (!AUTO_PUBLISH || !EARLY_PUBLISH_MS || !job || !job.hostedUrl) return;
+  earlyPosts.set(job.hostedUrl, linkEntryFor(job));
+  if (earlyTimer) return;
+  earlyTimer = setTimeout(() => {
+    earlyTimer = null;
+    const batch = [...earlyPosts.values()];
+    earlyPosts.clear();
+    if (!batch.length) return;
+    publish
+      .publish(batch, { reason: 'A file finished — here is its link. The rest follow as they finish.' })
+      .then((result) => {
+        if (result && result.ok) console.log(`[publish] ${batch.length} finished link(s) posted early`);
+        else if (result && result.reason !== 'nothing-to-publish') {
+          console.warn(`[publish] early post failed: ${result.reason || 'no sink'}`);
+        }
+      })
+      .catch(() => {});
+  }, EARLY_PUBLISH_MS);
+  if (earlyTimer.unref) earlyTimer.unref();
 }
 
 /**
@@ -1078,6 +1179,13 @@ app.get('/api/health', async (req, res) => {
     email: notify.describe(),
     publish: await publish.describe(),
     browserHosters: ['gofile', 'pixeldrain'],
+    /* What the last start picked up off the disk. */
+    recovery: {
+      resumedSinceStart: jobsStore.listJobs().filter((job) => job.resumed).length,
+      interruptedNow: jobsStore
+        .listJobs()
+        .filter((job) => job.interrupted && !job.hostedUrl).length,
+    },
   });
 });
 
@@ -1734,6 +1842,7 @@ app.post('/api/jobs/:id/hosted', (req, res) => {
   });
   writeResultsFile();
   persistHostedLink(job, url, provider).catch(() => {});
+  queueEarlyPost(job);
   res.json({ job: jobsStore.publicView(job) });
 });
 
@@ -2066,8 +2175,8 @@ app.get('/api/results', (req, res) => {
       name: view.outputName || view.name || `video-${view.id}.mp4`,
       shareUrl: view.hostedUrl || null,
       provider: view.hostProvider || null,
-      downloadPath: view.hasFile ? `/api/jobs/${view.id}/download` : null,
-      previewPath: view.hasFile ? `/api/jobs/${view.id}/preview` : null,
+      downloadPath: view.hasFile ? view.downloadPath : null,
+      previewPath: view.hasFile ? view.previewPath : null,
       sourceBytes: view.sourceBytes,
       outputBytes: view.outputBytes,
       saved: view.saved,
@@ -2084,8 +2193,50 @@ app.get('/api/results.txt', (req, res) => {
   res.type('text/plain').send(lines.length ? `${lines.join('\n')}\n` : '');
 });
 
-app.get('/api/jobs/:id/preview', (req, res) => serveOutput(req, res, 'inline'));
-app.get('/api/jobs/:id/download', (req, res) => serveOutput(req, res, 'attachment'));
+/* The name is in the URL on purpose: a browser tab, a "Save as" box and a
+   download manager all take the file name from it, so what the page promises
+   is what the browser shows. The bare form still works for old links. */
+app.get('/api/jobs/:id/preview/:name?', (req, res) => serveOutput(req, res, 'inline'));
+app.get('/api/jobs/:id/download/:name?', (req, res) => serveOutput(req, res, 'attachment'));
+
+/**
+ * "Just download it" for a file that is already here or on its way.
+ *
+ * The toggle on the composer decides this before a job starts; this is the same
+ * decision taken while it runs, which is when a slow encode actually becomes
+ * obvious. Whatever has been downloaded is kept, the encoder is stopped, and
+ * the untouched bytes are handed back (remuxed to MP4 only if that loses
+ * nothing).
+ */
+app.post('/api/jobs/:id/keep-original', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  if (['done', 'hosted', 'hosting'].includes(job.status)) {
+    return fail(
+      res,
+      409,
+      'ALREADY_DONE',
+      'The encode has already finished — the original is not what this job is holding any more.',
+    );
+  }
+  if (job.status === 'error') {
+    return fail(res, 409, 'JOB_FAILED', 'That job already failed. Start it again with “Just download it” switched on.');
+  }
+
+  const was = job.status;
+  job.skipRequested = true;
+  jobsStore.updateJob(job, {
+    noCompress: true,
+    stage: was === 'compressing' ? 'Stopping the encode — the original is kept' : 'The original will be kept',
+  });
+
+  /* Mid-encode: abort ffmpeg. compressJob() turns that into "copy the source",
+     so the seconds already spent are the only thing lost. */
+  if (was === 'compressing' && job.abort) job.abort();
+
+  const view = jobsStore.publicView(job);
+  res.json({ ok: true, was, job: view });
+});
 
 app.delete('/api/jobs/:id', async (req, res) => {
   const job = jobsStore.getJob(req.params.id);
@@ -2170,14 +2321,25 @@ async function main() {
  */
 async function resumeInterrupted() {
   if (process.env.RESUME_INTERRUPTED === '0') return;
-  const candidates = jobsStore
+  const interrupted = jobsStore
     .listJobs()
-    .filter((job) => job.interrupted && !job.hostedUrl)
-    /* A job stopped while downloading may hold a half-written source, so only
-       jobs that got as far as encoding are picked up. Those stopped during the
-       upload already have their MP4 and are handled by resumeHosting(). */
+    .filter((job) => job.interrupted && !job.hostedUrl);
+
+  /* Stopped after the download, before or during the encode: the source is
+     whole, so the encoder just starts again. */
+  const encode = interrupted
     .filter((job) => ['compressing', 'queued'].includes(job.interruptedFrom))
     .filter((job) => fs.existsSync(jobsStore.jobPaths(job).source));
+
+  /* Stopped in the middle of the download: whatever is on disk is a fragment,
+     so it is thrown away and fetched again from the same link. The ledger and
+     the resolved reference are both on disk, which is why this can work
+     without the browser having kept anything. */
+  const fetchAgain = interrupted
+    .filter((job) => job.interruptedFrom === 'fetching' && job.ref && (job.url || job.ref.url))
+    .filter((job) => ['url', 'relay', 'ytdlp'].includes(job.source));
+
+  const candidates = [...encode, ...fetchAgain];
   if (!candidates.length) return;
 
   const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
@@ -2191,8 +2353,28 @@ async function resumeInterrupted() {
     resumable.push(job);
   }
   if (!resumable.length) return;
-  console.log(`[resume] picking up ${resumable.length} interrupted job(s)`);
-  for (const job of resumable.reverse()) startCompression(job);
+  console.log(
+    `[resume] picking up ${resumable.length} interrupted job(s) ` +
+      `(${encode.length} to finish encoding, ${fetchAgain.length} to download again)`,
+  );
+
+  for (const job of resumable.reverse()) {
+    job.resumed = true;
+    if (encode.includes(job)) {
+      startCompression(job);
+      continue;
+    }
+    await fsp.rm(jobsStore.jobPaths(job).source, { force: true }).catch(() => {});
+    jobsStore.updateJob(job, {
+      status: 'queued',
+      stage: 'Picking up the download again',
+      progress: 0,
+      error: null,
+      interrupted: false,
+      resumed: true,
+    });
+    fetchThenCompress(job, job.ref);
+  }
 }
 
 /**

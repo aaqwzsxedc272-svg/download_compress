@@ -881,14 +881,23 @@ function preferPageName(urlName, pageName) {
       const payload = signedPayload(link);
       if (!wantPath) return payload ? 2 : 1;
       const path = pathOf(link);
-      if (!path.endsWith(wantPath)) return 0;
+      // -1 means "a different file": that is worth knowing, but see below.
+      if (!path.endsWith(wantPath)) return -1;
       return payload ? 3 : 2;
     };
-    const ranked = [...download, ...players]
-      .map((link) => ({ link, score: score(link) }))
+    const scored = [...download, ...players].map((link) => ({ link, score: score(link) }));
+    const ranked = scored
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.link);
+    /* Nothing on the page mentions the path we came for. Their own "Download"
+       anchor is still what the page tells a visitor to click, so it beats
+       giving up and handing back a player URL that serves HTML. */
+    if (!ranked.length) {
+      for (const entry of scored) {
+        if (download.includes(entry.link) && !ranked.includes(entry.link)) ranked.push(entry.link);
+      }
+    }
     /* The page we just loaded is the player URL, token and all; it is the same
        backend that the signed link proxies to. A share page (no file
        extension) is not a route to the bytes, so it does not count. */
@@ -910,6 +919,26 @@ function preferPageName(urlName, pageName) {
       return { url: links[0], links, html, base, viaBrowser: true };
     }
     throw new ResolveError('fileditch did not expose a download link on that page.', 'FILEDITCH_NO_LINK');
+  }
+
+  /**
+   * The file's own path (b78/NAME.mp4) when the URL carries one, else null.
+   *
+   * fileditch hands out three shapes for the same video, and only one of them
+   * is a page worth reading:
+   *   theditch.st/qhygxukd                      share page   -> read it
+   *   <random host>/<base64>                    signed       -> decode, re-mint
+   *   fileditchfiles.me/b78/NAME.mp4            file host    -> mint from the
+   *                                               player page; the file host
+   *                                               itself answers 500 to a GET
+   */
+  function filePathOf(url) {
+    try {
+      const filePath = decodeURIComponent(new URL(url).pathname).replace(/^\/+/, '');
+      return VIDEO_EXT.test(filePath) ? filePath : null;
+    } catch {
+      return null;
+    }
   }
 
   const fileditch = {
@@ -944,6 +973,40 @@ function preferPageName(urlName, pageName) {
             },
           ],
         };
+      }
+
+      /* A URL that already names the file (fileditchfiles.me/b78/NAME.mp4) is
+         not readable on its own: that host returns 500 to a plain GET and the
+         bytes only come from a link minted by the player page. Ask the player
+         for one instead of failing on the file host. */
+      const filePath = filePathOf(url);
+      if (filePath) {
+        const page = pageForPath(filePath);
+        try {
+          const fresh = await fileditchMint(page, filePath);
+          /* The player page carries the real name and size even when the file
+             host itself refuses to talk. */
+          const meta = fileditchMeta(fresh.html || '');
+          const name = meta.name || decodeURIComponent(filePath.split('/').pop());
+          return {
+            resolver: 'fileditch',
+            title: name,
+            files: [
+              {
+                id: fresh.url,
+                name,
+                size: meta.size || 0,
+                mime: 'video/mp4',
+                kind: 'video',
+                ref: { resolver: 'fileditch', url: fresh.url, page, referer: page, name, path: filePath },
+              },
+            ],
+          };
+        } catch (err) {
+          /* The player page refused; reading the pasted URL as a page is the
+             only thing left, and sometimes new.fileditch.com does serve it. */
+          console.log(`[resolve] fileditch player page for ${filePath} failed: ${err.message}`);
+        }
       }
 
       const res = await fetchWithTimeout(url, {

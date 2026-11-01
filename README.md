@@ -87,7 +87,7 @@ Squeeze detects it at startup and reports it on `/api/health`.
 | **turbo.cr** | server only | share pages are signed via `api/sign`; the CDN allows no cross-origin reads |
 | **bunkr** | server only | follows the signed-CDN flow; rotates domains, often bot-protected |
 | **filester.me** | server only | public metadata + share-page scrape; behind DDoS-Guard; takes the file's real name from the page, not the CDN's UUID |
-| **fileditch** (`fileditch.st`, `theditch.st`, `fileditchfiles.me`) | server only | follows the page's minted download anchor; the signed link lives ~26 minutes, so a fresh one is minted at fetch time and the player URL is the backup route |
+| **fileditch** (`theditch.st`, `fileditch.st`, `fileditchfiles.me`) | server only | three URL shapes for one video: the share page, the signed link it hands out, and the file host. `fileditchfiles.me/…` answers 500 to a plain request, so it is resolved through the player page (`fileditchvids.st`) instead; the signed link lives ~26 minutes, so a fresh one is minted at fetch time and the player URL is the backup route |
 | direct `.mp4` / `.webm` | yes | no resolution needed |
 | any page with a video | yes | `og:video`, `<video>`, `<source>`, JSON-LD |
 
@@ -178,6 +178,12 @@ composer (or the same switch in the file picker) hands the original back untouch
 - Disk need drops from ~2.2× the file to ~1.2×, because there is no encoder scratch space.
 - It can still be uploaded to a host and still appears in the links panel, so a slow-source
   download also survives the machine stopping.
+- **The decision can be taken late.** A slow encode is obvious a minute in, so the card of a
+  file that is queued, downloading or being treated has its own **Just download it** button.
+  Pressing it stops the encoder, keeps whatever has already been downloaded, and hands those
+  bytes back (re-wrapping the container only when that is lossless). Nothing is restarted: the
+  file goes straight on to a share link, and it says *Downloaded as-is* instead of
+  *Compressed*.
 
 ## Hosts used for the output
 
@@ -246,6 +252,7 @@ fly deploy
 | `AUTO_PUBLISH` | on | Posts the links to the first working sink when the queue drains; `0` disables |
 | `PUBLISH` | auto | `gist,webhook,ntfy,repo,paste` in the order you want; `off` disables |
 | `PUBLISH_WEBHOOK` | — | JSON POST target (Discord, Slack, n8n, …); also settable on the page, which wins |
+| `PUBLISH_EVERY_SECONDS` | `60` | a finished file's link is posted this soon after it exists (batched); `0` waits for the queue to drain |
 | `PUBLISH_NTFY` | — | ntfy topic for a phone notification |
 | `PUBLISH_REPO` | off | `1` commits `LINKS.md` to the repo and pushes it |
 | `PUBLISH_REPO_DIR` | this repo | where `LINKS.md` is committed |
@@ -517,10 +524,23 @@ queue of 4K files: do them a few at a time.
 A job runs in the server process, not in the browser: the tab can be closed, the laptop shut, and
 the encode carries on. Two things follow from that, and both are tested rather than promised:
 
-- **A machine that stops mid-encode is picked up on the next start.** Jobs that were fetching are
-  reported as interrupted (a half-written source cannot be trusted); jobs that were encoding are
-  queued again automatically, and jobs that finished encoding but never uploaded are uploaded on
-  boot. Set `RESUME_INTERRUPTED=0` to opt out.
+- **A machine that stops is picked up on the next start, whatever stage it was in.** Each stage
+  leaves something usable behind, and the boot routine uses it:
+
+  | Stopped while | What is on disk | What happens on the next start |
+  | --- | --- | --- |
+  | downloading | a half-written `source` | the fragment is deleted and the file is fetched again, into the same job |
+  | encoding | the whole `source` | the encoder starts again from that file, no re-download |
+  | uploading | the finished `output.mp4` | it is uploaded again; the job is never marked failed |
+  | done, posted | the ledger and the link | nothing to do — the link already works |
+
+  The page says so too: a restart shows *“This machine stopped before, so 2 files were picked up
+  where they left off”*, and each resumed card is tagged *picked up after a restart*. Set
+  `RESUME_INTERRUPTED=0` to opt out.
+- **The two things that can still be lost** are the encoder's *remaining* time (never the whole
+  job) and a finished file that was never uploaded, if the container itself is deleted. GitHub
+  Codespaces deletes a stopped codespace after 30 days; that is the only deadline that matters,
+  and it is why the share links are posted and mailed as they finish.
 - **The links outlive everything.** `data/links.tsv` is append-only, so the share links survive
   restarts, sweeps and a stopped machine, and the panel reads from it (`/api/links`) rather than
   from the job list, which is pruned.
@@ -528,7 +548,32 @@ the encode carries on. Two things follow from that, and both are tested rather t
 `npm run test:durability` proves the first point end to end: it starts a job, never polls it,
 kills the server, starts a fresh one on the same data directory, and finds the share link still
 there. `npm run test:resume` kills the server mid-encode and checks the job finishes after the
-restart.
+restart. `npm run test:recover` covers the other two rows of that table — it cuts a real download
+in half, restarts into a job left mid-upload, presses *Just download it* on a running encode, and
+checks that the first link is posted while the second file is still being worked on.
+
+**Links leave as soon as they exist.** The queue-drained post is the tidy summary, but a file that
+has a share link is posted a minute later, in a small batch of its own (`PUBLISH_EVERY_SECONDS`,
+`0` turns it off). If the machine's minutes run out halfway through a queue, the links for the
+files it already treated are already in Discord — they are not waiting for a summary that will
+never be sent.
+
+### Codespaces minutes, and what running out means
+
+The free plan is **120 core-hours a month** — 60 hours of a 2-core codespace — plus 15 GB-months
+of storage, and there is no weekly limit. The idle timeout is 30 minutes by default (settable up
+to 240); a running encode keeps the machine awake on its own (see below), so the meter is really
+"how long do you leave it up".
+
+- **Do not worry about a long encode being cut off.** It is resumed from its source on the next
+  start, and the links you already have keep working meanwhile.
+- **Do worry about leaving it running.** A forgotten codespace burns core-hours; *Stop the machine
+  when done* ends the run right after the queue and its links are posted.
+- **When the minutes are gone**, the codespace stops and cannot be started again until the month
+  resets (or a payment method is added for overage at $0.18/core-hour). The container's disk —
+  and therefore `data/`, the queue, and the links — survives that stop, so the next start resumes
+  as described above. What does *not* survive is the codespace being deleted (30 days after it was
+  last stopped), which is the one case where an unposted file is lost.
 
 ## Long jobs and idle hosts
 
@@ -546,7 +591,8 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
-- `npm run test:resolve` — 26 resolver tests against stubbed APIs (real response shapes),
+- `npm run test:resolve` — 28 resolver tests against stubbed APIs (real response shapes),
+  including the three URL shapes a fileditch page hands out,
   including the page-title naming rule and fileditch's minted-link/player routes.
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
@@ -568,13 +614,18 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   sending a test mail the moment the form is saved.
 - `npm run test:ui` — the browser code in jsdom: the disk pill, the presets, "just download"
   greying the encoder controls, the size list in the picker, the per-picker switch sending
-  `noCompress`, and the email button (needs `npm i --no-save jsdom`, skips without it).
+  `noCompress`, the email button, the webhook panel, and a running job's card showing its link,
+  the name its browser tab will carry, and its own "Just download it" button (needs
+  `npm i --no-save jsdom`, skips without it).
 - `npm run test:space` — the space policy end to end: a hosted job's files are deleted,
   the link survives, the download route answers `410`, and `KEEP_LOCAL_AFTER_UPLOAD=1` keeps
   everything.
 - `npm run test:durability` — a job finishes with nobody watching, and its link survives the
   server being killed and restarted.
 - `npm run test:resume` — an encode killed at 6% finishes after a restart (takes ~5 minutes).
+- `npm run test:recover` — 26 checks: a download cut in half resumes, a job left mid-upload is
+  uploaded again, "just download it" pressed mid-encode returns the original byte for byte, and a
+  finished file's link is posted before the queue has drained.
 - `npm run smoke` — 61 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
   chunk and an out-of-order chunk), and every rejection path. Starts its own

@@ -124,6 +124,7 @@
       <h2>Your videos</h2>
       <button class="ghost" id="clearDone" type="button">Clear finished</button>
     </div>
+    <p class="jobs-note" id="recoveryNote" hidden></p>
     <p class="jobs-note">Encoding runs on the server, not in this tab — close it and the job keeps going.</p>
     <div class="job-list" id="jobList"></div>
   </section>
@@ -263,6 +264,11 @@
       <div class="job-status" data-field="status">Queued</div>
       <div class="progress" data-field="progressWrap"><div class="progress-bar" data-field="progressBar"></div></div>
       <div class="job-meta" data-field="meta"></div>
+      <div class="job-source" data-field="source" hidden>
+        <span class="job-source-label">Link</span>
+        <a data-field="sourceUrl" class="job-source-url" target="_blank" rel="noopener noreferrer"></a>
+        <span class="job-source-tab" data-field="tabTitle"></span>
+      </div>
       <p class="job-note" data-field="note" hidden></p>
       <div class="job-actions" data-field="actions"></div>
     </div>

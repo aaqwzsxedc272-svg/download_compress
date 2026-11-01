@@ -85,7 +85,7 @@ function render(job) {
       video.controls = true;
       video.playsInline = true;
       video.preload = 'metadata';
-      video.src = `/api/jobs/${job.id}/preview`;
+      video.src = job.previewPath || `/api/jobs/${job.id}/preview`;
       video.style.cssText = 'width:100%;height:100%;display:block;background:#000;object-fit:contain';
       slot.innerHTML = '';
       slot.style.position = 'relative';
@@ -205,7 +205,7 @@ function render(job) {
   if (done && job.hasFile) {
     const dl = document.createElement('a');
     dl.className = 'btn';
-    dl.href = `/api/jobs/${job.id}/download`;
+    dl.href = job.downloadPath || `/api/jobs/${job.id}/download`;
     dl.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> Download ${job.outputName ? '' : 'video'}`;
     actions.append(dl);
 

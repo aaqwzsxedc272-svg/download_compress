@@ -317,6 +317,56 @@ const GOFILE_FOLDER = {
     assert.ok(!/fileditchfiles\.me$/.test(result.files[0].ref.url), result.files[0].ref.url);
   });
 
+  await test('a file host that answers 500 is replaced by the player page', async () => {
+    /* What the host really does: fileditchfiles.me returns 500 to a plain GET,
+       and the bytes only come from a link minted by fileditchvids.st. */
+    const signed = Buffer.from('1793509933:pZQFcRjiXh9:36884/b78/abc.mp4').toString('base64url');
+    const calls = stubFetch((url) => {
+      if (url.includes('fileditchfiles.me')) return { status: 500, statusText: 'Internal Server Error', raw: 'error' };
+      return {
+        raw:
+          '<title>abc.mp4</title><video src="https://fileditchvids.st/b78/abc.mp4"></video>' +
+          `<a href="https://lumistretcheseverymorning.xyz/${signed}">⬇ Download</a>`,
+        type: 'text/html',
+      };
+    });
+    const result = await resolve('https://fileditchfiles.me/b78/abc.mp4');
+    assert.equal(result.resolver, 'fileditch');
+    assert.equal(result.files.length, 1);
+    assert.match(result.files[0].ref.url, /lumistretcheseverymorning/, result.files[0].ref.url);
+    assert.equal(result.files[0].name, 'abc.mp4');
+    assert.ok(!calls.some((call) => call.url.includes('fileditchfiles.me')), 'the dead file host was fetched anyway');
+  });
+
+  await test('the exact links from a real fileditch page all end at the same file', async () => {
+    /* theditch.st/qhygxukd, the signed link it hands out, and the file-host URL
+       are three views of one video and used to fail in three different ways. */
+    const signed = Buffer.from('1793555458:8v0oCffZzS6jNrkzoIi1r-hCD1bi0i2_9FdSVo r7eu49pk:36884/b78/WlVHBYDPhhHcSTmGUcvy.mp4'.replace(/ /g, ''))
+      .toString('base64url');
+    assert.match(signed, /^[A-Za-z0-9_-]+$/);
+    const player = 'https://fileditchvids.st/b78/WlVHBYDPhhHcSTmGUcvy.mp4';
+    const html =
+      '<title>WlVHBYDPhhHcSTmGUcvy.mp4</title>' +
+      `<video src="${player}"></video>` +
+      `<a href="https://lumistretcheseverymorning.xyz/${signed}">⬇ Download</a>`;
+    stubFetch((url) =>
+      url.includes('fileditchfiles.me')
+        ? { status: 500, statusText: 'Internal Server Error', raw: 'error' }
+        : { raw: html, type: 'text/html' },
+    );
+
+    for (const pasted of [
+      'https://theditch.st/qhygxukd',
+      `https://lumistretcheseverymorning.xyz/${signed}`,
+      'https://fileditchfiles.me/b78/WlVHBYDPhhHcSTmGUcvy.mp4',
+    ]) {
+      const result = await resolve(pasted);
+      assert.equal(result.resolver, 'fileditch', pasted);
+      assert.equal(result.files.length, 1, `${pasted} -> ${result.files.length} files`);
+      assert.match(result.files[0].ref.url, /lumistretcheseverymorning/, `${pasted} -> ${result.files[0].ref.url}`);
+    }
+  });
+
   console.log('page titles');
 
   await test('reads og:title, title and h1, and strips the site suffix', async () => {

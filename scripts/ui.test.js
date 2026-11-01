@@ -142,7 +142,11 @@ async function boot({
     calls.push({ error: String(event.error || event.message) });
   });
 
-  window.eval(fs.readFileSync(path.join(ROOT, 'public/app.js'), 'utf8'));
+  /* app.js is evaluated as a strict-mode eval, so its top-level functions do not
+     leak into the window. Handing the few the tests drive back out keeps those
+     names out of production code. */
+  const source = fs.readFileSync(path.join(ROOT, 'public/app.js'), 'utf8');
+  window.eval(`${source}\nwindow.__app = { trackJob, updateCard, renderRecovery, state };`);
   await new Promise((resolve) => window.setTimeout(resolve, 60));
   return { dom, window, doc: window.document, calls };
 }
@@ -393,6 +397,106 @@ async function boot({
     if (!/Paste a webhook URL/.test(doc.getElementById('postStatus').textContent)) {
       throw new Error(`status says "${doc.getElementById('postStatus').textContent}"`);
     }
+  });
+
+  console.log('a file while it runs');
+
+  await test('it shows the link it came from and the name a browser tab will use', async () => {
+    const tenth = await boot({ links: LINKS });
+    const { window, doc } = tenth;
+    /* jsdom has no event streams; the card only needs close(). */
+    window.EventSource = class {
+      constructor() {
+        this.readyState = 0;
+      }
+      close() {}
+    };
+    window.__app.trackJob({
+      id: 'jobRun',
+      status: 'fetching',
+      progress: 0.42,
+      name: 'Holiday.mp4',
+      url: 'https://theditch.st/qhygxukd',
+      tabTitle: 'Holiday 720p.mp4',
+      downloadPath: '/api/jobs/jobRun/download/Holiday%20720p.mp4',
+      source: 'url',
+      hasFile: false,
+    });
+    const card = doc.querySelector('[data-job-id="jobRun"]');
+    if (!card) throw new Error('no card was rendered for a running job');
+    const row = card.querySelector('[data-field="source"]');
+    if (!row || row.hidden) throw new Error('the link is not shown under a running file');
+    const link = card.querySelector('[data-field="sourceUrl"]');
+    if (link.textContent !== 'https://theditch.st/qhygxukd') throw new Error(`link says "${link.textContent}"`);
+    if (link.getAttribute('href') !== 'https://theditch.st/qhygxukd') throw new Error('the link is not clickable');
+    if (link.getAttribute('target') !== '_blank') throw new Error('the link would replace the app');
+    const tab = card.querySelector('[data-field="tabTitle"]');
+    if (!/Holiday 720p\.mp4/.test(tab.textContent)) throw new Error(`tab title says "${tab.textContent}"`);
+  });
+
+  await test('"just download it" is offered on a running file and calls the server', async () => {
+    const eleventh = await boot({ links: LINKS });
+    const { window, doc } = eleventh;
+    window.EventSource = class {
+      close() {}
+    };
+    window.__app.trackJob({
+      id: 'jobRun2',
+      status: 'compressing',
+      progress: 0.3,
+      name: 'Long One.mp4',
+      url: 'https://pixeldrain.com/u/abc',
+      tabTitle: 'Long One.mp4',
+      source: 'url',
+      hasFile: false,
+    });
+    const card = doc.querySelector('[data-job-id="jobRun2"]');
+    const button = [...card.querySelectorAll('.job-actions button')].find(
+      (item) => item.textContent === 'Just download it',
+    );
+    if (!button) throw new Error('no “Just download it” next to a file being treated');
+    button.dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    const call = eleventh.calls.find((entry) => entry.url.includes('/api/jobs/jobRun2/keep-original'));
+    if (!call) throw new Error('the button never called the server');
+    if (call.init.method !== 'POST') throw new Error(`used ${call.init.method}`);
+  });
+
+  await test('a file that was already downloaded as-is says so', async () => {
+    const twelfth = await boot({ links: LINKS });
+    const { window, doc } = twelfth;
+    window.EventSource = class {
+      close() {}
+    };
+    window.__app.trackJob({
+      id: 'jobCopy',
+      status: 'hosted',
+      name: 'Long One.mp4',
+      outputName: 'Long One.mp4',
+      noCompress: true,
+      sourceBytes: 300 * 1024 ** 2,
+      outputBytes: 300 * 1024 ** 2,
+      hostedUrl: 'https://pixeldrain.com/u/Copy1',
+      hasFile: true,
+      source: 'url',
+    });
+    const card = doc.querySelector('[data-job-id="jobCopy"]');
+    const status = card.querySelector('[data-field="status"]').textContent;
+    if (!/as downloaded/.test(status)) throw new Error(`status says "${status}"`);
+    if (/Compressed/.test(status)) throw new Error(`a copy is reported as compressed: "${status}"`);
+  });
+
+  await test('a restart is announced, with what was picked up', async () => {
+    const thirteenth = await boot({ links: LINKS });
+    const { window, doc } = thirteenth;
+    window.__app.renderRecovery({ resumedSinceStart: 2, interruptedNow: 0 });
+    const note = doc.getElementById('recoveryNote');
+    if (note.hidden) throw new Error('nothing is said after a restart');
+    if (!/2 files were picked up/.test(note.textContent)) throw new Error(`note says "${note.textContent}"`);
+    window.__app.renderRecovery({ resumedSinceStart: 0, interruptedNow: 1 });
+    if (!/being picked up/.test(note.textContent)) throw new Error(`note says "${note.textContent}"`);
+    window.__app.renderRecovery({ resumedSinceStart: 0, interruptedNow: 0 });
+    if (!note.hidden) throw new Error('the note stays after a clean start');
   });
 
   console.log('');

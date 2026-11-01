@@ -212,10 +212,9 @@ function updateCard(entry, job) {
         ? `Downloading video · ${pct}%${speed ? ` · ${speed}` : ''}${left ? ` · ${left} left` : ''}`
         : 'Downloading video';
       if (job.progress > 0) progressWrap.classList.remove('is-indeterminate');
+      else progressWrap.classList.add('is-indeterminate');
       break;
     }
-      if (job.progress <= 0) progressWrap.classList.add('is-indeterminate');
-      break;
     case 'compressing':
       // Before the encoder has reported progress the stage says what is going on
       // ("Checking what is worth encoding"), which matters on a slow file.
@@ -225,8 +224,10 @@ function updateCard(entry, job) {
       const before = job.sourceBytes || 0;
       const after = job.outputBytes || 0;
       const saved = before && after ? Math.max(0, 1 - after / before) : 0;
-      statusText = job.usedOriginal
-        ? `Already compressed · original kept · ${formatBytes(before)}`
+      statusText = job.noCompress
+        ? `Downloaded as-is · ${formatBytes(before || after)} · no re-encode`
+        : job.usedOriginal
+          ? `Already compressed · original kept · ${formatBytes(before)}`
         : `Compressed · ${formatBytes(before)} → ${formatBytes(after)}${saved > 0.02 ? ` (−${Math.round(saved * 100)}%)` : ''}`;
       statusEl.classList.add('is-done');
       showProgress = false;
@@ -240,8 +241,10 @@ function updateCard(entry, job) {
       const before = job.sourceBytes || 0;
       const after = job.outputBytes || 0;
       const saved = before && after ? Math.max(0, 1 - after / before) : 0;
-      statusText = job.usedOriginal
-        ? `Link ready · original kept · ${formatBytes(before)}`
+      statusText = job.noCompress
+        ? `Link ready · as downloaded · ${formatBytes(before || after)}`
+        : job.usedOriginal
+          ? `Link ready · original kept · ${formatBytes(before)}`
         : `Link ready · ${formatBytes(before)} → ${formatBytes(after)}${saved > 0.02 ? ` (−${Math.round(saved * 100)}%)` : ''}`;
       statusEl.classList.add('is-done');
       showProgress = false;
@@ -311,8 +314,38 @@ function updateCard(entry, job) {
     }
   }
   if (job.source === 'relay') bits.push('via your browser');
+  if (job.resumed) bits.push('picked up after a restart');
   metaEl.innerHTML = bits.join('<span style="opacity:.3">·</span>');
   metaEl.style.display = bits.length ? '' : 'none';
+
+  /* Where this file came from and what a browser tab will call it. Both are
+     useful while the job runs: the link is the thing to paste again if the
+     machine stops, and the name is what ends up on the user's disk (the
+     download route carries it in the URL, so the tab matches exactly). */
+  const sourceEl = $('[data-field="source"]', el);
+  if (sourceEl) {
+    const sourceUrl = job.url || '';
+    const tabTitle = job.tabTitle || job.outputName || '';
+    const link = $('[data-field="sourceUrl"]', sourceEl);
+    const tab = $('[data-field="tabTitle"]', sourceEl);
+    sourceEl.hidden = !(sourceUrl || tabTitle);
+    if (sourceUrl) {
+      link.hidden = false;
+      link.textContent = sourceUrl;
+      link.href = sourceUrl;
+      link.title = `${sourceUrl}\nOpens in a new tab — this page keeps working.`;
+    } else {
+      link.hidden = true;
+      link.removeAttribute('href');
+    }
+    if (tab) {
+      tab.hidden = !tabTitle;
+      tab.textContent = tabTitle ? `tab: ${tabTitle}` : '';
+      tab.title = tabTitle
+        ? `A browser tab showing this file says “${tabTitle}” — and it is the name it saves under.`
+        : '';
+    }
+  }
 
   // Why a file came back the size it did — especially when it could not shrink.
   const noteEl = $('[data-field="note"]', el);
@@ -329,6 +362,31 @@ function updateCard(entry, job) {
   if (oldHosted) oldHosted.remove();
   if (job.hostedUrl) {
     metaEl.insertAdjacentElement('beforebegin', hostedBlock(job));
+  }
+
+  /* "Just download it" is not only a decision made before starting: a slow
+     encode is obvious a minute in, and the file already downloaded is exactly
+     what the user wants. */
+  if (['queued', 'fetching', 'compressing'].includes(job.status) && !job.noCompress) {
+    const keep = document.createElement('button');
+    keep.type = 'button';
+    keep.className = 'btn tiny';
+    keep.textContent = 'Just download it';
+    keep.title =
+      'Stop treating this file and hand back the original, untouched. Whatever has already been downloaded is kept.';
+    keep.addEventListener('click', async () => {
+      keep.disabled = true;
+      keep.textContent = 'Keeping the original…';
+      try {
+        await api(`/api/jobs/${job.id}/keep-original`, { method: 'POST' });
+        showAlert('Okay — this file will be handed back as downloaded, without re-encoding.', 'ok');
+      } catch (err) {
+        showAlert(`Could not switch this file: ${err.message}`, 'error');
+        keep.disabled = false;
+        keep.textContent = 'Just download it';
+      }
+    });
+    actions.append(keep);
   }
 
   if (job.status === 'hosted' && job.hasFile) {
@@ -369,7 +427,7 @@ function updateCard(entry, job) {
   if (job.status === 'done' && job.hasFile) {
     const dl = document.createElement('a');
     dl.className = 'btn download';
-    dl.href = `/api/jobs/${job.id}/download`;
+    dl.href = job.downloadPath || `/api/jobs/${job.id}/download`;
     dl.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> Download`;
     actions.append(dl);
 
@@ -1667,9 +1725,34 @@ async function refreshStatus() {
     state.health = health;
     renderDisk(health.disk);
     renderStopBanner(health.autoStop);
+    renderRecovery(health.recovery);
     if (health.autoStop) syncAutoStopToggle(health.autoStop);
   } catch {
     /* the server may be busy encoding; try again on the next tick */
+  }
+}
+
+/**
+ * "The machine stopped on me" is worth saying out loud: the files below are
+ * being picked up on their own, so nothing has to be pasted again.
+ */
+function renderRecovery(recovery) {
+  const el = document.getElementById('recoveryNote');
+  if (!el) return;
+  const resumed = Number(recovery && recovery.resumedSinceStart) || 0;
+  const now = Number(recovery && recovery.interruptedNow) || 0;
+  if (!resumed && !now) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  if (now) {
+    el.textContent =
+      `${now} file${now === 1 ? '' : 's'} were cut off when this machine stopped and are being picked up — ` +
+      'the links you already have keep working while they finish.';
+  } else {
+    el.textContent =
+      `This machine stopped before, so ${resumed} file${resumed === 1 ? ' was' : 's were'} picked up where they left off.`;
   }
 }
 
@@ -2273,6 +2356,7 @@ async function boot() {
   try {
     const health = await api('/api/health');
     state.health = health;
+    renderRecovery(health.recovery);
     if (!localStorage.getItem(STORAGE.preset) && health.defaultPreset) state.presetId = health.defaultPreset;
     renderPresets(health.presets);
     const pill = $('#enginePill');

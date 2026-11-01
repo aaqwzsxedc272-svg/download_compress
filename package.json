@@ -29,7 +29,8 @@
     "test:mail": "node scripts/mailsetup.test.js",
     "test:publish": "node scripts/publish.test.js",
     "test:durability": "node scripts/durability.test.js",
-    "test:resume": "node scripts/resume.test.js"
+    "test:resume": "node scripts/resume.test.js",
+    "test:recover": "node scripts/recovery.test.js"
   },
   "engines": {
     "node": ">=18"

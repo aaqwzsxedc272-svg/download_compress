@@ -34,19 +34,23 @@ async function init() {
         const job = { ...record, dir: path.join(JOBS_DIR, record.id), abort: null };
         // Anything mid-flight when the process died is not running now.
         if (!['done', 'hosted', 'error'].includes(job.status)) {
+          const wasDoing = job.status;
           job.interrupted = true;
-          job.interruptedFrom = job.status;
+          job.interruptedFrom = wasDoing;
           job.status = 'error';
           /* Stopped during the upload: the encode is finished and its MP4 is on
-             disk, so there is nothing left but the upload. */
-          if (job.status === 'hosting' && fs.existsSync(path.join(job.dir, 'output.mp4'))) {
+             disk, so there is nothing left but the upload. (This used to test
+             job.status after overwriting it with "error", so it never fired.) */
+          if (wasDoing === 'hosting' && fs.existsSync(path.join(job.dir, 'output.mp4'))) {
             job.status = 'done';
             job.stage = 'Ready (upload interrupted)';
             job.error = null;
             job.hostError = 'The upload was interrupted when the machine stopped. It is retried automatically.';
+          } else {
+            job.stage = 'Interrupted';
+            job.error =
+              'The machine stopped before this finished. It is picked up again automatically when the server starts.';
           }
-          job.stage = 'Interrupted';
-          job.error = 'The machine stopped before this finished. It is picked up again automatically when the server starts.';
         }
         jobs.set(job.id, job);
       }
@@ -168,8 +172,16 @@ function jobPaths(job) {
 
 const jobsStorePath = (job) => path.join(job.dir, 'output.mp4');
 
+/* The server knows how a finished file will be named; jobs.js does not, and
+   duplicating that rule here would drift. The server installs a hook instead. */
+let viewHook = null;
+
+function setViewHook(fn) {
+  viewHook = typeof fn === 'function' ? fn : null;
+}
+
 function publicView(job) {
-  return {
+  const view = {
     id: job.id,
     status: job.status,
     stage: job.stage,
@@ -207,7 +219,17 @@ function publicView(job) {
     hasFile:
       ['done', 'hosting', 'hosted'].includes(job.status) && fs.existsSync(jobsStorePath(job)),
     hosting: Boolean(job.hosting),
+    /* True once the queue picked this up after the machine stopped. */
+    resumed: Boolean(job.resumed),
   };
+  if (viewHook) {
+    try {
+      Object.assign(view, viewHook(job) || {});
+    } catch {
+      /* a view hook must never break a status update */
+    }
+  }
+  return view;
 }
 
 async function removeJob(id) {
@@ -245,6 +267,7 @@ function sweep() {
 setInterval(sweep, 10 * 60 * 1000).unref();
 
 module.exports = {
+  setViewHook,
   bus,
   DATA_DIR,
   JOBS_DIR,

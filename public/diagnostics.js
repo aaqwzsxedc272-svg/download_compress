@@ -114,7 +114,7 @@ const CHECKS = [
       const created = await fetch('/api/jobs', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ source: 'sample', presetId: 'tiny' }),
+        body: JSON.stringify({ source: 'sample', presetId: 'small' }),
       });
       if (!created.ok) throw new Error(`could not create a job (HTTP ${created.status})`);
       const { job } = await created.json();

@@ -3,12 +3,15 @@
 const id = location.pathname.split('/').filter(Boolean).pop();
 const $ = (sel) => document.querySelector(sel);
 
+/* Names only. Promising a resolution here was wrong twice over: the encoder
+   keeps the source resolution until a saving needs 720p, and this map was a
+   version behind the presets. The real output size is shown after encoding. */
 const PRESET_LABELS = {
-  tiny: 'Tiny · 360p',
-  small: 'Small · 480p',
-  balanced: 'Balanced · 720p',
-  high: 'High · 1080p',
-  original: 'Original resolution',
+  auto: 'Recommended',
+  max: 'Max quality',
+  high: 'High quality',
+  balanced: 'Smaller',
+  small: 'Smallest',
 };
 
 function formatBytes(bytes) {
@@ -123,6 +126,9 @@ function render(job) {
     );
     const saved = job.sourceBytes && job.outputBytes ? Math.max(0, 1 - job.outputBytes / job.sourceBytes) : 0;
     if (done && saved > 0.01) stats.append(stat('Saved', `${Math.round(saved * 100)}%`, true));
+    if (done && job.outputSize && job.outputSize.height) {
+      stats.append(stat('Output size', `${job.outputSize.width}×${job.outputSize.height}`));
+    }
     if (job.meta.videoCodec) stats.append(stat('Source codec', job.meta.videoCodec));
     if (job.meta.fps) stats.append(stat('Frame rate', `${job.meta.fps} fps`));
     if (job.status === 'compressing' && formatDuration(job.etaSeconds)) {

@@ -124,19 +124,39 @@ Everything runs in the background: create jobs, close the tab, come back for the
 
 ## Quality and size
 
-| Preset | Resolution | CRF | x264 preset | Typical saving |
-| --- | --- | --- | --- | --- |
-| Max quality | native | 19 | slow | small, near-lossless |
-| High quality *(default)* | native | 22 | medium | 60–85% |
-| Balanced | up to 1080p | 24 | fast | 70–90% |
-| Small | up to 720p | 27 | fast | 80–95% |
-| Tiny | up to 480p | 31 | veryfast | 90–97% |
+The rule is simple: **the picture never gets worse, then the file gets smaller.** That is
+enforced twice over.
 
-Fixed *and* fixed-quality requests are both supported: with "fit in N MB" the encoder runs
-two passes so the bits land where the detail is (measured: a 6 MB target produced 5.66 MB, an
-8 MB target produced 7.69 MB on a 39.8 MB 1080p source). Audio is copied untouched whenever
-the source is already AAC under 192 kbps, so quality there is unchanged and nothing is
-spent re-encoding it.
+**Two hard limits, for every preset and every automatic decision:**
+
+- **CRF never goes above 26.** Past that, x264 stops discarding invisible detail and starts
+  discarding visible detail. A 1080p file at CRF 34 *is* 1080p in name and looks like 480p —
+  which is exactly what used to happen to files that could not be shrunk any other way.
+- **The short side never drops below 720p.** When a file cannot be made smaller at full
+  resolution inside the CRF limit, the encoder downscales to 720p *instead of* crushing the
+  frame. Crisp 720p beats muddy 1080p, and it says so: `1920×1080 → 1280×720` on the job.
+
+| Preset | Resolution | CRF | Ceiling | x264 preset |
+| --- | --- | --- | --- | --- |
+| **Recommended** *(default)* | up to 1080p | 23 | 26 | medium |
+| Max quality | native | 19 | 21 | slow |
+| High quality | native | 22 | 25 | medium |
+| Smaller | up to 1080p | 24 | 26 | fast |
+| Smallest | up to 720p | 26 | 26 | fast |
+
+**Before encoding, the app measures.** Two 12-second slices are encoded at candidate settings
+and scaled by duration, so the real encode starts with a CRF and a resolution that are known to
+save at least 12%. The ladder is: preset CRF → CRF ceiling → 720p at preset CRF → 720p at the
+ceiling; the first rung that saves enough wins. If no rung saves at least 5%, the file is not
+encoded at all — it is copied through in seconds and the original is what gets shared, with a
+note saying it was already as small as it can get without losing quality.
+
+Measured on a 1080p 2 Mbps source that previously came out at CRF 34 looking like 480p: the new
+path produced 1280×720 at CRF 24, 15% smaller, prediction within 0.5% of the real file.
+
+Fixed-size requests ("fit in N MB") are still supported: the encoder runs two passes so the bits
+land where the detail is. Audio is copied untouched whenever the source is already AAC under
+192 kbps, so nothing is spent re-encoding it.
 
 ## Hosts used for the output
 
@@ -338,9 +358,12 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:resolve` — 19 resolver tests against stubbed APIs (real response shapes).
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
-- `npm run test:estimate` — the size prediction: a file that cannot shrink is recognised instead
-  of being encoded anyway, a bloated one gets a CRF that really saves, the projection lands within
-  25% of a real encode, and a downscaling preset is probed at its own size.
+- `npm run test:estimate` — the quality rules and the size prediction: a dense 1080p file is
+  never encoded above CRF 26 and never below 720p, it downscales instead of being crushed, every
+  preset stays inside both limits, a hopeless file is recognised instead of being encoded anyway,
+  and the projection lands within 25% of a real encode.
+- `npm run test:encode` — an MKV whose audio the MP4 muxer refuses: the normal plan fails, the
+  forgiving retry succeeds, and the error carries the one ffmpeg line a person can act on.
 - `npm run test:ledger` — share links survive a restart, duplicates and mangled names.
 - `npm run test:durability` — a job finishes with nobody watching, and its link survives the
   server being killed and restarted.

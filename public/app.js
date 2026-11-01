@@ -13,7 +13,7 @@ const STORAGE = {
 const state = {
   health: null,
   presets: [],
-  presetId: localStorage.getItem(STORAGE.preset) || 'high',
+  presetId: localStorage.getItem(STORAGE.preset) || 'auto',
   autoHost: localStorage.getItem(STORAGE.autoHost) !== '0',
   serverHostTried: new Set(),
   browserHostTried: new Set(),
@@ -291,6 +291,10 @@ function updateCard(entry, job) {
       bits.push(`projected ${formatBytes(proj.projectedBytes)} (−${Math.round(proj.saving * 100)}%)`);
     }
     if (proj && proj.crf && proj.crf !== preset.crf) bits.push(`CRF ${proj.crf}`);
+  }
+  if (['done', 'hosted'].includes(job.status) && job.outputSize && job.outputSize.width) {
+    const sameAsSource = job.meta && job.meta.width === job.outputSize.width;
+    if (!sameAsSource) bits.push(`${job.outputSize.width}×${job.outputSize.height} out`);
   }
   if (job.status === 'done' && job.sourceBytes && job.outputBytes) {
     const saved = Math.max(0, 1 - job.outputBytes / job.sourceBytes);
@@ -1391,7 +1395,14 @@ function renderPresets(presets) {
     });
     wrap.append(btn);
   }
-  if (!presets.some((p) => p.id === state.presetId)) state.presetId = 'balanced';
+  if (!presets.some((p) => p.id === state.presetId)) {
+    // A saved choice from an older version ("tiny", "original") no longer exists.
+    state.presetId = presets.some((p) => p.id === 'auto') ? 'auto' : presets[0].id;
+    localStorage.setItem(STORAGE.preset, state.presetId);
+    for (const other of wrap.children) {
+      other.setAttribute('aria-checked', String(other.dataset.preset === state.presetId));
+    }
+  }
 }
 
 function bindDropzone() {
@@ -1701,11 +1712,10 @@ async function boot() {
     renderHostChoices(health.hosters);
   } catch {
     renderPresets([
-      { id: 'tiny', label: 'Tiny', hint: '' },
-      { id: 'small', label: 'Small', hint: '' },
-      { id: 'balanced', label: 'Balanced', hint: '' },
-      { id: 'high', label: 'High', hint: '' },
-      { id: 'original', label: 'Original res', hint: '' },
+      { id: 'auto', label: 'Recommended', hint: 'best quality it can afford' },
+      { id: 'high', label: 'High quality', hint: 'full resolution' },
+      { id: 'balanced', label: 'Smaller', hint: 'up to 1080p' },
+      { id: 'small', label: 'Smallest', hint: 'up to 720p' },
     ]);
     $('#engineText').textContent = 'engine unavailable';
   }

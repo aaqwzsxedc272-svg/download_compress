@@ -159,7 +159,7 @@ async function main() {
     check('health reports the auto-stop state', Boolean(health.autoStop) && 'enabled' in health.autoStop);
 
     // ---------------------------------------------------------------- sample
-    const sampleJob = await createJob({ source: 'sample', presetId: 'tiny' });
+    const sampleJob = await createJob({ source: 'sample', presetId: 'small' });
     const sampleDone = await waitForJob(sampleJob.id);
     check('sample job completes', ['done', 'hosted'].includes(sampleDone.status), sampleDone.error || '');
     check('sample output is smaller', sampleDone.outputBytes > 0 && sampleDone.outputBytes < sampleDone.sourceBytes,
@@ -228,7 +228,7 @@ async function main() {
     ).json();
     check('probe detects a fetchable direct link', probe.serverCanFetch === true);
 
-    const urlJob = await createJob({ source: 'url', url: selfUrl, presetId: 'tiny' });
+    const urlJob = await createJob({ source: 'url', url: selfUrl, presetId: 'small' });
     const urlDone = await waitForJob(urlJob.id);
     check('url job completes', ['done', 'hosted'].includes(urlDone.status), urlDone.error || '');
     check('url job recorded its source', urlDone.source === 'url');
@@ -272,7 +272,7 @@ async function main() {
       ref: resolved.files[0].ref,
       name: resolved.files[0].name,
       pageUrl,
-      presetId: 'tiny',
+      presetId: 'small',
     });
     const refDone = await waitForJob(refJob.id);
     check(
@@ -333,7 +333,7 @@ async function main() {
     );
 
     // A link obtained elsewhere (e.g. uploaded from the browser) can be attached.
-    const manual = await createJob({ source: 'sample', presetId: 'tiny' });
+    const manual = await createJob({ source: 'sample', presetId: 'small' });
     await waitForStatus(manual.id, ['done', 'hosted', 'error'], 120000);
     const attach = await fetch(`${BASE}/api/jobs/${manual.id}/hosted`, {
       method: 'POST',
@@ -359,7 +359,7 @@ async function main() {
       await fetch(`${BASE}/api/upload/init`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ filename: 'chunked.mp4', size: fileBytes.length, presetId: 'tiny' }),
+        body: JSON.stringify({ filename: 'chunked.mp4', size: fileBytes.length, presetId: 'small' }),
       })
     ).json();
     check('chunked upload init returns an id', Boolean(chunkInit.uploadId) && chunkInit.chunkSize > 0);

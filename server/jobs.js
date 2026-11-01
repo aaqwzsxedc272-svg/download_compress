@@ -188,6 +188,7 @@ function publicView(job) {
     audioMode: job.audioMode || null,
     twoPass: Boolean(job.twoPass),
     scaledTo: job.scaledTo || null,
+    outputSize: job.outputSize || null,
     usedOriginal: Boolean(job.usedOriginal),
     downloadSpeed: job.downloadSpeed || null,
     downloadEta: job.downloadEta || null,

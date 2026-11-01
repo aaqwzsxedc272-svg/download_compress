@@ -122,6 +122,47 @@ function makeController(job) {
   return controller;
 }
 
+
+/** Run every pass of a plan, keeping progress/ETA on the job. */
+async function runPasses(job, plan, paths, meta, controller) {
+  const passCount = plan.passes.length;
+  let lastEmit = 0;
+  for (let index = 0; index < passCount; index += 1) {
+    const pass = plan.passes[index];
+    const slice = 1 / passCount;
+    await transcode(paths.source, paths.output, pass.args, {
+      signal: controller.signal,
+      duration: meta.duration,
+      onProgress: ({ seconds, speed }) => {
+        const now = Date.now();
+        if (seconds != null && meta.duration > 0) {
+          const within = Math.min(1, seconds / meta.duration);
+          job.progress = Math.min(1, index * slice + within * slice);
+        }
+        if (speed != null && speed > 0) {
+          job.speed = speed;
+          const remaining = Math.max(0, meta.duration - (seconds || 0));
+          job.etaSeconds = Math.round(remaining / speed);
+        }
+        if (now - lastEmit > 400) {
+          lastEmit = now;
+          jobsStore.updateJob(job, {
+            stage: passCount > 1 ? `${pass.label} (${index + 1}/${passCount})` : 'Compressing',
+          });
+        }
+      },
+    });
+  }
+}
+
+/** "video: hevc · audio: truehd", for when the encoder refuses a file. */
+function codecSummary(meta) {
+  const parts = [];
+  if (meta.videoCodec) parts.push(`video ${meta.videoCodec}`);
+  if (meta.audioCodec) parts.push(`audio ${meta.audioCodec}`);
+  return parts.join(' · ');
+}
+
 /* ------------------------------------------------------- the actual work */
 
 /** Auto-host finished files when a hoster is configured. */
@@ -129,7 +170,7 @@ const AUTO_HOST = process.env.AUTO_HOST !== '0';
 
 /* Below this predicted saving the encode is skipped and the original is shared:
    spending half an hour to hand back the same bytes is worse than saying so. */
-const SKIP_ENCODE_BELOW = Number(process.env.SQUEEZE_SKIP_BELOW) || 0.02;
+const SKIP_ENCODE_BELOW = Number(process.env.SQUEEZE_SKIP_BELOW) || 0.05;
 
 async function compressJob(job) {
   const paths = jobsStore.jobPaths(job);
@@ -165,7 +206,8 @@ async function compressJob(job) {
   let usedOriginal = false;
   const note = (pick) => {
     console.log(
-      `[job ${job.id}] predicted ${formatSize(pick.projectedBytes)} at CRF ${pick.crf} ` +
+      `[job ${job.id}] predicted ${formatSize(pick.projectedBytes)} at CRF ${pick.crf}` +
+        `${pick.size ? ` ${pick.size.width}x${pick.size.height}` : ''} ` +
         `(${pick.saving >= 0 ? '−' : '+'}${Math.abs(Math.round(pick.saving * 100))}% vs the original)`,
     );
   };
@@ -175,10 +217,10 @@ async function compressJob(job) {
     notes.push(`A ${job.targetMb} MB target is very tight for a clip this long — quality may suffer.`);
   }
 
-  /* Predict the result before spending an hour on it: a file that is already
-     efficiently compressed can come out bigger at the preset's CRF, and the only
-     way to know is to encode a few short slices first. */
+  /* Decide the settings before spending an hour encoding: what CRF, at what
+     resolution, is predicted to be smaller *without looking worse*. */
   let crfOverride = null;
+  let scaleOverride = null;
   let skipEncode = false;
   if (!job.targetMb) {
     jobsStore.updateJob(job, { stage: 'Checking what is worth encoding' });
@@ -191,30 +233,38 @@ async function compressJob(job) {
     });
     if (pick.probes) {
       note(pick);
+      const pickSize = pick.size || null;
       jobsStore.updateJob(job, {
         projection: {
           crf: pick.crf,
           projectedBytes: pick.projectedBytes,
           saving: Math.round(pick.saving * 1000) / 1000,
+          width: pickSize ? pickSize.width : null,
+          height: pickSize ? pickSize.height : null,
         },
       });
       if (pick.saving < SKIP_ENCODE_BELOW) {
         skipEncode = true;
         notes.push(
-          'This file is already compressed about as far as it goes — a re-encode would be the same size or bigger, so the original bytes are what gets shared.',
+          'This file is already about as small as it can be without losing quality, so the original is what gets shared.',
         );
-      } else if (pick.saving < 0.12) {
-        notes.push(
-          `This file is packed tightly already — about ${Math.round(pick.saving * 100)}% is the most that can be trimmed` +
-            (pick.crf !== preset.crf ? `, so the encoder ran at CRF ${pick.crf} instead of ${preset.crf}.` : '.'),
-        );
-      } else if (pick.crf - preset.crf >= 6) {
-        notes.push(
-          `This source is dense, so CRF ${pick.crf} was needed (the preset asks for ${preset.crf}) — the saving is real, ` +
-            'but fine detail and fast motion will look softer than the original.',
-        );
+      } else {
+        if (pick.saving < 0.15) {
+          notes.push(`Packed tightly already — ${Math.round(pick.saving * 100)}% is all that can come off without hurting the picture.`);
+        }
+        if (pick.maxShortSide && pick.crf > preset.crf) {
+          notes.push(`Straight re-encode is not enough for this one, so it runs slightly flatter (CRF ${pick.crf}).`);
+        }
+        if (pickSize && meta.width && pickSize.width < meta.width) {
+          notes.push(
+            `${meta.width}×${meta.height} → ${pickSize.width}×${pickSize.height}: shrinking the frame keeps the picture sharp where a flatter 1080p encode would have looked soft.`,
+          );
+        }
       }
       if (pick.crf !== preset.crf) crfOverride = pick.crf;
+      if (pick.maxShortSide && pick.maxShortSide !== preset.maxShortSide) {
+        scaleOverride = pick.maxShortSide;
+      }
     }
   }
 
@@ -227,6 +277,7 @@ async function compressJob(job) {
   let audioMode = null;
   let twoPass = false;
   let scaleNote = null;
+  let outSize = { width: meta.width, height: meta.height };
 
   if (skipEncode) {
     jobsStore.updateJob(job, { stage: 'Keeping the original', progress: 1 });
@@ -234,49 +285,48 @@ async function compressJob(job) {
     outStat = await fsp.stat(paths.output);
     usedOriginal = true;
   } else {
-    const plan = buildPlan({
-      input: paths.source,
-      output: paths.output,
-      meta,
-      preset,
-      targetMb: job.targetMb,
-      passlogBase: path.join(job.dir, 'x264pass'),
-      crfOverride,
-    });
-
-    videoKbps = plan.videoKbps;
-    audioMode = plan.audio.mode;
-    twoPass = plan.twoPass;
-    scaleNote = plan.scaleNote;
-
-    // Progress is spread across passes so a two-pass encode still reads 0-100%.
-    const passCount = plan.passes.length;
-    let lastEmit = 0;
-
-    for (let index = 0; index < passCount; index += 1) {
-      const pass = plan.passes[index];
-      const slice = 1 / passCount;
-
-      await transcode(paths.source, paths.output, pass.args, {
-        signal: controller.signal,
-        duration: meta.duration,
-        onProgress: ({ seconds, speed }) => {
-          const now = Date.now();
-          if (seconds != null && meta.duration > 0) {
-            const within = Math.min(1, seconds / meta.duration);
-            job.progress = Math.min(1, index * slice + within * slice);
-          }
-          if (speed != null && speed > 0) {
-            job.speed = speed;
-            const remaining = Math.max(0, meta.duration - (seconds || 0));
-            job.etaSeconds = Math.round(remaining / speed);
-          }
-          if (now - lastEmit > 400) {
-            lastEmit = now;
-            jobsStore.updateJob(job, { stage: passCount > 1 ? `${pass.label} (${index + 1}/${passCount})` : 'Compressing' });
-          }
-        },
+    /* First attempt uses the normal plan. If ffmpeg trips over the container
+       (an MKV with broken timestamps, a 10-bit or 4:2:2 stream, more packets
+       buffered than the muxer will take) it is retried once with the forgiving
+       flags before the job is allowed to fail — that is the difference between
+       "ffmpeg could not process this file" and a working video. */
+    let attempt = 0;
+    let plan = null;
+    for (;;) {
+      plan = buildPlan({
+        input: paths.source,
+        output: paths.output,
+        meta,
+        preset,
+        targetMb: job.targetMb,
+        passlogBase: path.join(job.dir, 'x264pass'),
+        crfOverride,
+        maxShortSide: scaleOverride,
+        robust: attempt > 0,
       });
+
+      videoKbps = plan.videoKbps;
+      audioMode = plan.audio.mode;
+      twoPass = plan.twoPass;
+      scaleNote = plan.scaleNote;
+      outSize = { width: plan.size.width, height: plan.size.height };
+
+      try {
+        await runPasses(job, plan, paths, meta, controller);
+        break;
+      } catch (err) {
+        const recoverable = err.code === 'FFMPEG_FAILED' && attempt === 0 && !controller.signal.aborted;
+        if (!recoverable) {
+          if (err.code === 'FFMPEG_FAILED') err.codecNote = codecSummary(meta);
+          throw err;
+        }
+        attempt += 1;
+        await fsp.rm(paths.output, { force: true }).catch(() => {});
+        await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+        notes.push('The first try tripped over something in this file (its container or bit depth), so it was retried in a more forgiving mode.');
+        console.log(`[job ${job.id}] ffmpeg retry: ${err.detail || err.message?.slice(0, 200)}`);
+        jobsStore.updateJob(job, { stage: 'Retrying with more forgiving encoder settings' });
+      }
     }
 
     await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
@@ -285,8 +335,8 @@ async function compressJob(job) {
     outStat = await fsp.stat(paths.output);
     if (!outStat.size) throw Object.assign(new Error('Compression produced an empty file.'), { code: 'EMPTY_OUTPUT' });
 
-    // Never hand back a file that is bigger AND no better: if the re-encode did
-    // not pay off, deliver the original bytes instead.
+    // Never hand back a file that is bigger AND no better: if the re-encode
+    // did not pay off, deliver the original bytes instead.
     if (!job.targetMb && outStat.size >= job.sourceBytes) {
       await fsp.copyFile(paths.source, paths.output);
       outStat = await fsp.stat(paths.output);
@@ -319,6 +369,7 @@ async function compressJob(job) {
     audioMode,
     twoPass,
     scaledTo: scaleNote,
+    outputSize: outSize,
     projection: job.projection || null,
     saved,
   });
@@ -466,9 +517,16 @@ async function diskUsage(dir) {
 
 function reportJobError(job, err) {
   const outOfSpace = err.code === 'NO_DISK' || OUT_OF_SPACE.test(String(err.message || ''));
+  /* When the encoder refuses a file, the reason matters more than the apology:
+     "ffmpeg could not process this file" hides whether it was the container, the
+     bit depth or a codec this build cannot decode. */
+  const ffmpegDetail = err.code === 'FFMPEG_FAILED' ? (err.detail || '').trim() : '';
   const message = outOfSpace
     ? 'This machine ran out of disk space. Delete finished videos (the Remove button) and try again — a long 4K file needs about three times its own size free.'
-    : FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
+    : err.code === 'FFMPEG_FAILED'
+      ? `ffmpeg could not process this file${err.codecNote ? ` (${err.codecNote})` : ''}.` +
+        `${ffmpegDetail ? ` It said: ${ffmpegDetail}` : ''} Try another preset, or a different source file.`
+      : FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
   jobsStore.updateJob(job, {
     status: 'error',
     stage: outOfSpace ? 'Out of disk space' : 'Failed',

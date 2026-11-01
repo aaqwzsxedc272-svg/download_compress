@@ -10,7 +10,7 @@
     "smoke": "node scripts/smoke.js",
     "test:resolve": "node scripts/resolve.test.js",
     "test:hosters": "node scripts/hosters.test.js",
-    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js",
+    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js",
     "deploy:hf": "scripts/deploy-space.sh",
     "package:hf": "node scripts/package-space.js",
     "verify": "node scripts/verify-deploy.js",
@@ -21,6 +21,7 @@
     "links": "node scripts/links.js",
     "test:refs": "node scripts/refs.test.js",
     "test:estimate": "node scripts/estimate.test.js",
+    "test:encode": "node scripts/encode.test.js",
     "test:ledger": "node scripts/ledger.test.js",
     "test:durability": "node scripts/durability.test.js",
     "test:resume": "node scripts/resume.test.js"

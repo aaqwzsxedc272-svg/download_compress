@@ -103,6 +103,30 @@ function parseTimecode(value) {
 }
 
 /**
+ * ffmpeg's stderr is a wall of banner noise around the one line that matters.
+ * Pick the most specific complaint, preferring explicit errors.
+ */
+function usefulLine(stderr) {
+  const lines = String(stderr || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const isNoise = (line) =>
+    /^(ffmpeg version|built with|configuration:|lib(av|sw|postproc)|Input #|Output #|Stream #|Metadata:|Duration:|Press \[q\]|frame=|size=)/i.test(line);
+  const meaningful = lines.filter((line) => !isNoise(line));
+  const generic = /^(conversion failed!?|error while (?:filtering|processing)|exiting normally|terminating)$/i;
+  const strong =
+    /not divisible|incompatible|unsupported|unknown (?:decoder|encoder)|decoder .*not found|no such filter|invalid (?:data|argument|stream)|too many packets|could not (?:find|open|write)|does not support|failed to (?:decode|initialize|open)|cannot (?:open|write)/i;
+  const weak = /error|failed|cannot|invalid|unsupported/i;
+  const candidates = meaningful.filter((line) => !generic.test(line.replace(/^\[[^\]]+\]\s*/, '').trim()));
+  const pick =
+    [...candidates].reverse().find((line) => strong.test(line)) ||
+    [...candidates].reverse().find((line) => weak.test(line)) ||
+    candidates.slice(-1)[0];
+  return (pick || '').replace(/^\[[^\]]+\]\s*/, '').slice(0, 300) || null;
+}
+
+/**
  * Transcode with live progress reporting.
  * onProgress receives { seconds, speed, fps } as ffmpeg reports it.
  */
@@ -158,9 +182,11 @@ function transcode(input, output, args, { onProgress, duration = 0, signal } = {
       reject(Object.assign(new Error(stderr.trim() || `ffmpeg exited with code ${code}`), {
         code: 'FFMPEG_FAILED',
         stderr,
+        /* The last line ffmpeg actually complained about, for the user. */
+        detail: usefulLine(stderr),
       }));
     });
   });
 }
 
-module.exports = { ffmpegPath, ffprobePath, probe, thumbnail, transcode, execFile };
+module.exports = { ffmpegPath, ffprobePath, probe, thumbnail, transcode, execFile, usefulLine };

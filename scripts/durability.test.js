@@ -95,7 +95,7 @@ async function ready() {
       await fetch(`${BASE}/api/jobs`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ source: 'sample', presetId: 'tiny' }),
+        body: JSON.stringify({ source: 'sample', presetId: 'small' }),
       })
     ).json();
     const id = created.job?.id;

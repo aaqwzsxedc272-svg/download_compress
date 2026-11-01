@@ -26,7 +26,7 @@ const argValue = (flag, fallback) => {
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 };
 
-const PRESET = argValue('--preset', 'tiny');
+const PRESET = argValue('--preset', 'small');
 const KEEP = process.argv.includes('--keep');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

@@ -149,11 +149,17 @@ async function writeState(patch) {
  * page every few seconds, so each check is cached briefly. Saving an env change
  * takes effect within the TTL; a publish attempt always re-checks for real.
  */
-function cached(ttlMs, fn) {
+function cached(ttlMs, fn, keyFn = () => '') {
   let at = 0;
   let value = null;
   let pending = null;
+  let key = null;
   const wrapped = async ({ fresh = false } = {}) => {
+    const now = keyFn();
+    if (now !== key) {
+      key = now;
+      value = null;
+    }
     if (!fresh) {
       if (value && Date.now() - at < ttlMs) return value;
       if (pending) return pending;
@@ -188,7 +194,7 @@ const gist = {
     const auth = await run('gh', ['auth', 'status'], { timeoutMs: 8000 });
     if (auth.code === 0) return { ready: true, detail: 'gh is logged in' };
     return { ready: false, detail: 'gh is not logged in' };
-  }),
+  }, () => `${process.env.GITHUB_TOKEN ? 'token' : ''}|${process.env.GH_TOKEN ? 'gh-token' : ''}`),
   async send(links) {
     const content = linksMarkdown(links);
     const file = path.join(DATA_DIR(), 'links-publish.md');
@@ -233,7 +239,7 @@ const repo = {
     const remote = await run('git', ['remote', 'get-url', 'origin'], { cwd, timeoutMs: 5000 });
     if (remote.code !== 0) return { ready: false, detail: 'no origin remote to push to' };
     return { ready: true, detail: remote.stdout.trim() };
-  }),
+  }, () => `${process.env.PUBLISH_REPO}|${REPO_ROOT()}`),
   async send(links) {
     const root = REPO_ROOT();
     const file = path.join(root, 'LINKS.md');
@@ -272,37 +278,132 @@ const repo = {
   },
 };
 
+/**
+ * A webhook URL is a credential: anyone who has it can post to that channel.
+ * /api/publish and /api/health are readable, so only the scheme and host are
+ * ever handed back — never the path, which is where Discord and Slack keep the
+ * token.
+ */
+function redact(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}/…`;
+  } catch {
+    return '(an unreadable URL)';
+  }
+}
+
+const hostOf = (url) => {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+};
+
+/** Discord's content limit is 2000 characters; leave room for the ellipsis. */
+const MESSAGE_LIMIT = 1900;
+const MAX_MESSAGES = 6;
+
+/**
+ * Split a message into pieces a chat service will accept, on blank lines, so a
+ * link is never cut in half. Anything that does not fit is summarised rather
+ * than dropped.
+ */
+function chunkText(text, { limit = MESSAGE_LIMIT, max = MAX_MESSAGES } = {}) {
+  if (text.length <= limit) return [text];
+  const parts = String(text)
+    .split(/\n{2,}/)
+    .filter(Boolean);
+  const chunks = [];
+  let current = '';
+  for (const part of parts) {
+    const next = current ? `${current}\n\n${part}` : part;
+    if (next.length <= limit) {
+      current = next;
+      continue;
+    }
+    if (current) chunks.push(current);
+    if (part.length > limit) {
+      for (let i = 0; i < part.length; i += limit) chunks.push(part.slice(i, i + limit));
+      current = '';
+    } else {
+      current = part;
+    }
+  }
+  if (current) chunks.push(current);
+  if (chunks.length > max) {
+    const kept = chunks.slice(0, max - 1);
+    kept.push(
+      `…and ${chunks.length - (max - 1)} more message(s) of links. The full list is on the page, in data/links.tsv and at /api/links.txt.`,
+    );
+    return kept;
+  }
+  return chunks;
+}
+
 /** Any URL that takes a JSON POST: Discord, Slack, n8n, a home server. */
 const webhook = {
   id: 'webhook',
   label: 'Webhook',
-  async ready() {
+  ready: cached(60000, async () => {
     const url = process.env.PUBLISH_WEBHOOK || '';
-    return url ? { ready: true, detail: url.replace(/\/\/[^/]+\//, '//…/') } : { ready: false, detail: 'set PUBLISH_WEBHOOK' };
-  },
+    if (!url) return { ready: false, detail: 'set PUBLISH_WEBHOOK' };
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return { ready: false, detail: 'PUBLISH_WEBHOOK is not a URL' };
+    }
+    const host = parsed.hostname.toLowerCase();
+    const kind = /discord(app)?\.com$/.test(host) ? 'Discord' : /slack\.com$/.test(host) ? 'Slack' : host;
+    /* Only the host: the path is the token. */
+    return { ready: true, detail: `${kind} · ${redact(url)}` };
+  }, () => process.env.PUBLISH_WEBHOOK || ''),
   async send(links, { reason } = {}) {
     const url = process.env.PUBLISH_WEBHOOK;
+    const host = hostOf(url);
+    const discord = /discord(app)?\.com$/.test(host);
     const text = linksText(links, { reason });
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'user-agent': UA },
-      /* Both keys, so Discord (`content`) and Slack (`text`) work unchanged. */
-      body: JSON.stringify({
-        content: text,
-        text,
-        title: 'Squeeze share links',
-        links: links.map((link) => ({
-          name: link.name,
-          url: link.url,
-          provider: link.provider,
-          sourceBytes: link.sourceBytes,
-          outputBytes: link.outputBytes,
-        })),
-      }),
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) throw new Error(`the webhook answered HTTP ${res.status}`);
-    return { url: null, posted: true };
+    const pieces = chunkText(text);
+
+    /* Discord rejects anything over 2000 characters in `content` outright, so a
+       long queue becomes several messages; Slack reads `text`. Send the shape
+       each one actually reads. */
+    for (const piece of pieces) {
+      const body = discord
+        ? { content: piece, allowed_mentions: { parse: [] } }
+        : {
+            text: piece,
+            content: piece,
+            links: links.map((link) => ({
+              name: link.name,
+              url: link.url,
+              provider: link.provider,
+              sourceBytes: link.sourceBytes,
+              outputBytes: link.outputBytes,
+            })),
+          };
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'user-agent': UA },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        /* The service explains itself in the body; that detail is the difference
+           between "it failed" and "the webhook was deleted". */
+        const raw = await res.text().catch(() => '');
+        let detail = '';
+        try {
+          detail = JSON.parse(raw).message || '';
+        } catch {
+          detail = raw.slice(0, 160);
+        }
+        throw new Error(`the webhook answered HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
+      }
+    }
+    return { url: null, posted: true, messages: pieces.length };
   },
 };
 
@@ -490,6 +591,8 @@ function banner(links, { reason } = {}) {
 
 module.exports = {
   publish,
+  chunkText,
+  redact,
   describe,
   banner,
   linksText,

@@ -380,7 +380,7 @@ works, and each one needs either nothing or a single line:
 | --- | --- | --- |
 | console banner | none | the terminal, and `data/links.tsv` — always printed, always there |
 | **GitHub gist** | none in a Codespace (`gh` is logged in) | a gist URL that never changes, updated in place |
-| **webhook** | `PUBLISH_WEBHOOK=<url>` | Discord / Slack / n8n / your own server |
+| **webhook** | `PUBLISH_WEBHOOK=<url>` | Discord / Slack / n8n / your own server ([Discord, five clicks](#discord-in-five-clicks)) |
 | **ntfy** | `PUBLISH_NTFY=<topic>` | a push notification on your phone, no account |
 | **LINKS.md** | `PUBLISH_REPO=1` | your repository on GitHub, from any device |
 | paste | `PUBLISH_PASTE=1` | an anonymous URL (`0x0.st`, `paste.rs`) |
@@ -400,6 +400,44 @@ The floor costs nothing and needs no configuration: every finished queue prints
 
 and they are on the page and in `data/links.tsv` either way. `npm run links` prints them from a
 terminal without starting the server.
+
+### Discord in five clicks
+
+1. Open the Discord server (or make one just for this — a private server works).
+2. Right-click the channel you want the links in → **Edit Channel** →
+   **Integrations** → **Webhooks** → **New Webhook**.
+   (On a server you own, *Server Settings* → *Integrations* → *Webhooks* works too.)
+3. Click the new webhook → **Copy Webhook URL**. It looks like
+   `https://discord.com/api/webhooks/1234567890/AbCdEf…`.
+4. Put that line in `.env` in the project root:
+
+   ```
+   PUBLISH_WEBHOOK=https://discord.com/api/webhooks/1234567890/AbCdEf…
+   ```
+
+   …or run it once: `PUBLISH_WEBHOOK='https://discord.com/api/webhooks/…' npm start`.
+5. Press **Post them** next to the links — the message should appear in the channel at once.
+   From then on it happens by itself, on every finished queue and before auto-stop.
+
+What lands in the channel is the same text as the console banner: one line per file with the
+size change and the host, then the link:
+
+```
+The queue is finished.
+
+Kate Dalia - Lazy Day Off.mp4 · 508 MB → 341 MB · on pixeldrain
+https://pixeldrain.com/u/aaaaaaaaaaaa
+```
+
+Discord refuses messages over 2000 characters, so a long queue becomes several messages, split
+between files so no link is ever cut; if there would be more than six, the last one says how many
+were sent and where the full list is. Deleting the webhook in Discord makes the app say
+`HTTP 400: Unknown Webhook` — the URL is a credential, so it is written only in `.env`
+(never in the repository) and the app shows only `https://discord.com/…` when it reports which
+sink it used.
+
+The same line works for **Slack** (an incoming webhook URL), **n8n**, or any endpoint that accepts
+a JSON `POST`; a non-Discord endpoint also gets a `links` array with the names, sizes and hosts.
 
 `PUBLISH=gist,webhook` picks the sinks and their order; `PUBLISH=off` disables the step, as does
 `AUTO_PUBLISH=0`. `GET /api/publish` reports which sinks this machine can actually use and the

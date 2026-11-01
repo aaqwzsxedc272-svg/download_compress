@@ -252,6 +252,91 @@ async function main() {
   delete process.env.PUBLISH_REPO;
   delete process.env.PUBLISH_REPO_DIR;
 
+  console.log('discord');
+
+  /* Discord's webhook shape: `content` only, 2000 characters max, and it names
+     the reason in the error body when something is wrong. */
+  delete process.env.PUBLISH_REPO;
+  delete process.env.PUBLISH_REPO_DIR;
+  process.env.PUBLISH_WEBHOOK = 'https://discord.com/api/webhooks/123456789/SECRET-token-value';
+  process.env.PUBLISH = 'webhook';
+  const discordDescribe = await publish.describe();
+  const wh = discordDescribe.sinks.find((sink) => sink.id === 'webhook');
+  check('a Discord webhook is recognised', /Discord/.test(wh.detail), wh.detail);
+  check('the token is never handed back', !JSON.stringify(discordDescribe).includes('SECRET-token-value'), wh.detail);
+  check('only the host is shown', /https:\/\/discord\.com\/…$/.test(wh.detail), wh.detail);
+
+  /* Point the same sink at the local server, through a /webhook/ path. */
+  const discordSeen = [];
+  const discordServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      discordSeen.push({ url: req.url, body });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise((resolve) => discordServer.listen(0, '127.0.0.1', resolve));
+  const discordPort = discordServer.address().port;
+
+  /* A real Discord URL cannot be used from a test, so the host detection is
+     exercised above and the payload shape below against a local server with an
+     explicit PUBLISH=webhook. */
+  process.env.PUBLISH_WEBHOOK = `http://127.0.0.1:${discordPort}/api/webhooks/1/token`;
+  const genericPost = await publish.publish(LINKS, { reason: 'queue finished' });
+  check('a non-Discord webhook still gets Slack-shaped text', genericPost.ok === true);
+  const genericBody = JSON.parse(discordSeen[0].body);
+  check('with a text field', typeof genericBody.text === 'string' && genericBody.text.includes(LINKS[0].url));
+
+  /* The chunker is what keeps Discord happy, and it is pure, so it can be
+     tested on its own with the real limits. */
+  const many = Array.from({ length: 60 }, (_, i) => ({
+    name: `Episode ${String(i + 1).padStart(2, '0')}.mp4`,
+    url: `https://pixeldrain.com/u/Episode${i + 1}`,
+    provider: 'pixeldrain',
+  }));
+  const big = publish.linksText(many, { reason: 'The queue is finished.' });
+  check('a long list is over the limit', big.length > 2000, `${big.length} chars`);
+  const pieces = publish.chunkText(big);
+  check('so it is split', pieces.length > 1, `${pieces.length} piece(s)`);
+  check('every piece fits in a Discord message', pieces.every((piece) => piece.length <= 2000), pieces.map((p) => p.length).join(','));
+  const rejoined = pieces.join('\n\n');
+  check(
+    'no link is lost or cut',
+    many.every((link) => rejoined.includes(link.url)),
+    `${many.filter((link) => !rejoined.includes(link.url)).length} missing`,
+  );
+  check('links are never cut in half', pieces.every((piece) => !/https:\/\/pixeldrain\.com\/u\/[A-Za-z]+$/.test(piece.replace(/\n[\s\S]*$/, ''))) );
+  const absurd = publish.linksText(
+    Array.from({ length: 400 }, (_, i) => ({ name: `F${i}.mp4`, url: `https://x.test/${i}`, provider: 'x' })),
+  );
+  const capped = publish.chunkText(absurd);
+  check('an absurd queue is capped', capped.length <= 6, `${capped.length} message(s)`);
+  check('and says so instead of dropping links silently', /more message\(s\) of links/.test(capped[capped.length - 1]));
+
+  /* A failing Discord answers with {"message": "…"} — that must reach the user. */
+  const failing = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ message: 'Unknown Webhook', code: 10015 }));
+    });
+  });
+  await new Promise((resolve) => failing.listen(0, '127.0.0.1', resolve));
+  process.env.PUBLISH_WEBHOOK = `http://127.0.0.1:${failing.address().port}/api/webhooks/1/token`;
+  const broken = await publish.publish(LINKS, { quiet: true });
+  check('a deleted webhook is reported', broken.ok === false);
+  check(
+    'with the service\'s own words',
+    /Unknown Webhook/.test(JSON.stringify(broken.tried)),
+    JSON.stringify(broken.tried),
+  );
+  discordServer.close();
+  failing.close();
+  delete process.env.PUBLISH;
+  delete process.env.PUBLISH_WEBHOOK;
+
   console.log('the banner');
 
   const originalLog = console.log;

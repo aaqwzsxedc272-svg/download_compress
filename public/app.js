@@ -1839,6 +1839,14 @@ function renderPublish(info) {
 
   if (!ready.length) {
     button.hidden = true;
+    /* Nothing to post with: say the one line that would enable it, rather than
+       leaving the feature invisible. */
+    if (!last?.url && info && info.disabled !== true && $('#resultsList')?.children.length) {
+      note.hidden = false;
+      note.textContent =
+        'Tip: set PUBLISH_WEBHOOK=<your Discord or Slack webhook URL> in .env to have these posted to a channel on every run.';
+      return;
+    }
     if (last?.url) {
       note.hidden = false;
       note.textContent = '';

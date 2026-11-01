@@ -103,6 +103,10 @@ async function main() {
     HOSTERS: 'pixeldrain', // keep the chain deterministic in tests
     PIXELDRAIN_API_BASE: `http://127.0.0.1:${HOSTER_PORT}`,
     AUTO_HOST: '1',
+    /* The throwaway data dir holds the only copy of these files, and the
+       download/preview/self-fetch checks below read them after hosting. The
+       delete-once-hosted policy has its own run in scripts/space.test.js. */
+    KEEP_LOCAL_AFTER_UPLOAD: '1',
   };
 
   let serverLog = '';
@@ -247,8 +251,28 @@ async function main() {
       const name = req.url === '/watch.html' ? 'watch.html' : 'clip.mp4';
       try {
         const body = await fs.readFile(path.join(mediaDir, name));
-        res.writeHead(200, { 'content-type': name.endsWith('.html') ? 'text/html' : 'video/mp4' });
-        res.end(body);
+        /* Real hosts advertise a length and honour ranges; a fake that streams
+           chunked would hide the size-probing path from this test. */
+        const headers = {
+          'content-type': name.endsWith('.html') ? 'text/html' : 'video/mp4',
+          'content-length': String(body.length),
+          'accept-ranges': 'bytes',
+        };
+        const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
+        if (range) {
+          const start = Number(range[1]);
+          const end = range[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
+          const slice = body.subarray(start, end + 1);
+          res.writeHead(206, {
+            ...headers,
+            'content-length': String(slice.length),
+            'content-range': `bytes ${start}-${end}/${body.length}`,
+          });
+          res.end(req.method === 'HEAD' ? undefined : slice);
+          return;
+        }
+        res.writeHead(200, headers);
+        res.end(req.method === 'HEAD' ? undefined : body);
       } catch {
         res.writeHead(404).end();
       }
@@ -266,6 +290,14 @@ async function main() {
     check('resolves an HTML page to its video file', resolved.files?.length === 1, JSON.stringify(resolved).slice(0, 120));
     check('resolver identified the page route', resolved.resolver === 'page');
     check('resolved file has a usable name', /clip\.mp4$/.test(resolved.files?.[0]?.name || ''), resolved.files?.[0]?.name);
+    /* A picker is only useful if it says how big each file is; the server
+       probes the sizes after resolving, so the number arrives here. */
+    const expectedSize = (await fs.stat(path.join(mediaDir, 'clip.mp4'))).size;
+    check(
+      'the resolved file carries its size for the picker',
+      resolved.files?.[0]?.size === expectedSize,
+      `${resolved.files?.[0]?.size} vs ${expectedSize}`,
+    );
 
     const refJob = await createJob({
       source: 'ref',
@@ -319,6 +351,7 @@ async function main() {
     );
     check('hosted provider is reported', hostedSample.hostProvider === 'pixeldrain', hostedSample.hostProvider);
     check('hosted file stays downloadable locally', hostedSample.hasFile === true);
+    check('nothing was reclaimed while keeping local copies', hostedSample.localDeleted !== true);
 
     const jobList = await (await fetch(`${BASE}/api/jobs`)).json();
     check('job list exposes recent jobs', Array.isArray(jobList.jobs) && jobList.jobs.length >= 1);

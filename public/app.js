@@ -8,6 +8,7 @@ const STORAGE = {
   preset: 'squeeze.preset',
   jobs: 'squeeze.jobs',
   autoHost: 'squeeze.autohost',
+  noCompress: 'squeeze.nocompress',
 };
 
 const state = {
@@ -15,6 +16,7 @@ const state = {
   presets: [],
   presetId: localStorage.getItem(STORAGE.preset) || 'auto',
   autoHost: localStorage.getItem(STORAGE.autoHost) !== '0',
+  noCompress: localStorage.getItem(STORAGE.noCompress) === '1',
   serverHostTried: new Set(),
   browserHostTried: new Set(),
   jobs: new Map(), // id -> { el, data, es }
@@ -482,7 +484,7 @@ function setBusy(delta) {
   if (!btn) return;
   btn.disabled = state.busy > 0;
   btn.classList.toggle('is-busy', state.busy > 0);
-  $('span', btn).textContent = state.busy > 0 ? 'Working…' : 'Squeeze';
+  $('span', btn).textContent = state.busy > 0 ? 'Working…' : state.noCompress ? 'Download' : 'Squeeze';
 }
 
 const STORAGE_HOST = 'squeeze.host';
@@ -496,7 +498,37 @@ function hostOrderChoice() {
 function currentOptions() {
   const targetRaw = $('#targetMb')?.value;
   const targetMb = Number(targetRaw) > 0 ? Math.round(Number(targetRaw)) : null;
-  return { presetId: state.presetId, targetMb, hostOrder: hostOrderChoice() };
+  return {
+    presetId: state.presetId,
+    targetMb,
+    hostOrder: hostOrderChoice(),
+    ...(state.noCompress ? { noCompress: true } : {}),
+  };
+}
+
+/**
+ * "Just download it" turns the encoder off, so the quality controls stop
+ * meaning anything. Grey them out rather than leave live-looking knobs that
+ * do nothing.
+ */
+function syncComposerMode() {
+  const on = state.noCompress;
+  for (const sel of ['#quality', '#targetMb']) {
+    const el = $(sel);
+    if (!el) continue;
+    el.classList.toggle('is-off', on);
+    el.disabled = on;
+    if (el.parentElement) el.parentElement.classList.toggle('is-off', on);
+  }
+  const go = $('#goBtn');
+  if (go && !state.busy) $('span', go).textContent = on ? 'Download' : 'Squeeze';
+  const note = $('#composerNote');
+  if (note) {
+    note.textContent = on
+      ? 'The original file is handed back untouched — only re-wrapped to MP4 when the host stores it as something else.'
+      : '';
+    note.hidden = !on;
+  }
 }
 
 
@@ -521,6 +553,7 @@ async function chunkedUpload(source, { name, pageUrl, total, label }) {
       presetId: opts.presetId,
       targetMb: opts.targetMb,
       url: pageUrl || null,
+      noCompress: Boolean(opts.noCompress),
     }),
   });
 
@@ -920,7 +953,7 @@ function clearPicker() {
  * mode 'server'  -> the server downloads it itself
  * mode 'browser' -> your browser fetches the bytes and streams them over
  */
-async function startPickerFile(file, { pageUrl, mode }) {
+async function startPickerFile(file, { pageUrl, mode, noCompress = false }) {
   if (mode === 'server') {
     const opts = currentOptions();
     const { job } = await api('/api/jobs', {
@@ -932,12 +965,18 @@ async function startPickerFile(file, { pageUrl, mode }) {
         name: file.name,
         pageUrl,
         ...opts,
+        ...(noCompress ? { noCompress: true } : {}),
       }),
     });
     return job;
   }
   const direct = await window.SqueezeResolve.directUrl(file.ref);
   return relayBytes(direct, { pageUrl, filename: file.name });
+}
+
+/** Total of the sizes we actually know about, or 0 when the host hid them all. */
+function knownTotal(files) {
+  return files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
 }
 
 /**
@@ -951,14 +990,21 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
   panel.id = 'pickerPanel';
   panel.className = 'card picker';
 
+  let wantsOriginal = state.noCompress;
+
   const head = document.createElement('div');
   head.className = 'picker-head';
   const heading = document.createElement('div');
   heading.innerHTML = '<div class="picker-title"></div><div class="picker-sub"></div>';
   $('.picker-title', heading).textContent = title || shortHost(pageUrl) || 'Choose a file';
   const count = files.length;
+  const total = knownTotal(files);
+  const unknown = files.filter((file) => !Number(file.size)).length;
   $('.picker-sub', heading).textContent =
-    `${count} file${count === 1 ? '' : 's'} found · ${resolver}` +
+    `${count} file${count === 1 ? '' : 's'} found` +
+    (total ? ` · ${formatBytes(total)} altogether` : '') +
+    (unknown && unknown < count ? ` · ${unknown} without a size` : '') +
+    ` · ${resolver}` +
     (mode === 'browser' ? ' · fetched through your browser' : '');
   head.append(heading);
 
@@ -978,10 +1024,12 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
   tools.append(close);
   head.append(tools);
   panel.append(head);
+  panel.append(modeToggle());
 
   const list = document.createElement('div');
   list.className = 'picker-list';
   const boxes = [];
+  const modeButtons = [];
 
   for (const file of files) {
     const row = document.createElement('div');
@@ -1006,7 +1054,9 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
     const meta = document.createElement('div');
     meta.className = 'picker-meta';
     const bits = [];
-    if (file.size) bits.push(formatBytes(file.size));
+    /* The size is the thing that decides which file is worth queueing. When a
+       host hides it the server probes it, so "unknown" should be rare. */
+    bits.push(file.size ? formatBytes(file.size) : 'size unknown');
     bits.push(VIDEO_KIND_LABEL[file.kind] || 'file');
     if (mode === 'browser' && file.size > 1.5 * 1024 ** 3) {
       bits.push('large — your browser downloads it in full first');
@@ -1021,6 +1071,7 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
     button.type = 'button';
     button.className = 'btn download';
     button.textContent = 'Compress';
+    modeButtons.push(button);
 
     button.addEventListener('click', async () => {
       button.disabled = true;
@@ -1028,7 +1079,7 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
       button.textContent = 'Starting…';
       setBusy(1);
       try {
-        const job = await startPickerFile(file, { pageUrl, mode });
+        const job = await startPickerFile(file, { pageUrl, mode, noCompress: wantsOriginal });
         trackJob(job);
         clearPicker();
       } catch (err) {
@@ -1081,12 +1132,63 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
   queueSelected.className = 'btn primary';
   queueSelected.disabled = true;
 
+  /** The per-picker switch: same flag as the composer, kept in sync with it. */
+  function modeToggle() {
+    const wrap = document.createElement('div');
+    wrap.className = 'picker-mode';
+    const label = document.createElement('label');
+    label.className = 'toggle';
+    label.htmlFor = 'pickerNoCompress';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.id = 'pickerNoCompress';
+    input.checked = wantsOriginal;
+    const track = document.createElement('span');
+    track.className = 'toggle-track';
+    track.setAttribute('aria-hidden', 'true');
+    track.innerHTML = '<span class="toggle-thumb"></span>';
+    const text = document.createElement('span');
+    text.className = 'toggle-text';
+    label.append(input, track, text);
+
+    const hint = document.createElement('span');
+    hint.className = 'picker-mode-hint';
+
+    const sync = () => {
+      wantsOriginal = input.checked;
+      text.textContent = wantsOriginal ? 'Just download — no re-encoding' : 'Compress to a smaller file';
+      hint.textContent = wantsOriginal
+        ? 'The file comes back exactly as the host has it, only re-wrapped to MP4 when it is not one already.'
+        : 'Re-encoded to H.264 at 720p or better, and only kept when it is really smaller.';
+      for (const button of modeButtons) button.textContent = wantsOriginal ? 'Download' : 'Compress';
+      const composer = $('#noCompress');
+      if (composer && composer.checked !== wantsOriginal) {
+        composer.checked = wantsOriginal;
+        state.noCompress = wantsOriginal;
+        localStorage.setItem(STORAGE.noCompress, wantsOriginal ? '1' : '0');
+        syncComposerMode();
+      }
+      updateFooter();
+    };
+    input.addEventListener('change', sync);
+
+    wrap.append(label, hint);
+    setTimeout(sync, 0);
+    return wrap;
+  }
+
   function updateFooter() {
     const picked = boxes.filter((b) => b.pick.checked);
+    const pickedBytes = knownTotal(picked.map((b) => b.file));
     summary.textContent = picked.length
-      ? `${picked.length} selected${picked.length > 1 ? ' · they queue one after another' : ''}`
+      ? `${picked.length} selected${pickedBytes ? ` · ${formatBytes(pickedBytes)}` : ''}` +
+        (picked.length > 1 ? ' · they queue one after another' : '')
       : 'Tick the files you want';
-    queueSelected.textContent = picked.length ? `Compress ${picked.length}` : 'Compress selected';
+    queueSelected.textContent = picked.length
+      ? `${wantsOriginal ? 'Download' : 'Compress'} ${picked.length}`
+      : wantsOriginal
+        ? 'Download selected'
+        : 'Compress selected';
     queueSelected.disabled = !picked.length;
     selectAll.textContent = picked.length === boxes.length ? 'Select none' : 'Select all';
   }
@@ -1110,7 +1212,7 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
     for (const file of picked) {
       queueSelected.textContent = `Starting ${started + 1}/${picked.length}…`;
       try {
-        const job = await startPickerFile(file, { pageUrl, mode });
+        const job = await startPickerFile(file, { pageUrl, mode, noCompress: wantsOriginal });
         trackJob(job);
         started += 1;
       } catch (err) {
@@ -1296,6 +1398,7 @@ async function handleFile(file) {
   } else {
     const qs = new URLSearchParams({ name: file.name, presetId: opts.presetId });
     if (opts.targetMb) qs.set('targetMb', String(opts.targetMb));
+    if (opts.noCompress) qs.set('noCompress', '1');
     job = await uploadBlob(file, { endpoint: `/api/upload?${qs}`, method: 'POST', name: file.name });
   }
 
@@ -1652,6 +1755,64 @@ async function loadResults() {
   }
 }
 
+/**
+ * Mail the saved share links to the address the server was set up with.
+ *
+ * The point of this button is the unattended run: start a queue, tick "stop
+ * the machine", close the laptop, and read the links on your phone later. When
+ * SMTP is not configured the server hands back a ready-made mailto: so the
+ * links still leave the machine, in whatever mail app you already have.
+ */
+async function emailLinks() {
+  const button = $('#emailLinks');
+  if (!button || button.disabled) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Sending…';
+  try {
+    const result = await api('/api/links/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (result.ok && result.sent) {
+      const count = result.count || 0;
+      button.textContent = `Sent · ${count} link${count === 1 ? '' : 's'}`;
+      showAlert(`The links are on the way to ${result.to}.`, 'ok', { timeout: 6000 });
+    } else if (result.needsConfig && result.mailto) {
+      /* No SMTP on this server: open the user's own mail app with the body
+         already filled in. Nothing is silently swallowed. */
+      const note = $('#emailNote');
+      if (note) note.hidden = false;
+      window.location.href = result.mailto;
+      button.textContent = 'Opened your mail app';
+      setTimeout(() => {
+        button.textContent = original;
+        button.disabled = false;
+      }, 2600);
+      return;
+    } else if (result.skipped) {
+      button.textContent = 'No new links';
+      showAlert('Nothing has been hosted since the last mail.', 'ok', { timeout: 5000 });
+    } else {
+      throw new Error(result.error || 'The mail could not be sent.');
+    }
+  } catch (err) {
+    showAlert(err.message, 'error');
+    button.textContent = original;
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      if (button.textContent !== original && button.textContent !== 'Sent · 0 links') {
+        // leave the confirmation on screen briefly, then restore the label
+        setTimeout(() => {
+          button.textContent = original;
+        }, 2600);
+      }
+    }, 0);
+  }
+}
+
 /** The links panel is the durable record: refresh it whenever something lands. */
 let resultsRefresh = null;
 function scheduleResultsRefresh() {
@@ -1683,6 +1844,19 @@ async function boot() {
   $('#urlInput').addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') squeeze();
   });
+  const modeToggle = $('#noCompress');
+  if (modeToggle) {
+    modeToggle.checked = state.noCompress;
+    modeToggle.addEventListener('change', () => {
+      state.noCompress = modeToggle.checked;
+      localStorage.setItem(STORAGE.noCompress, state.noCompress ? '1' : '0');
+      syncComposerMode();
+    });
+    syncComposerMode();
+  }
+
+  $('#emailLinks')?.addEventListener('click', emailLinks);
+
   const autoToggle = $('#autoHost');
   autoToggle.checked = state.autoHost;
   autoToggle.addEventListener('change', () => {

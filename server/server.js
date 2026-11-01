@@ -9,9 +9,10 @@ const express = require('express');
 
 const jobsStore = require('./jobs');
 const { probe, thumbnail, transcode } = require('./ffmpeg');
-const { downloadWithFallback } = require('./fallback');
+const { downloadWithFallback, RECOVERABLE } = require('./fallback');
 const autoStop = require('./autostop');
 const ledger = require('./ledger');
+const notify = require('./notify');
 const { chooseCrf } = require('./estimate');
 const {
   PRESET_LIST,
@@ -22,7 +23,7 @@ const {
 } = require('./compress');
 const hosters = require('./hosters');
 const sources = require('./sources');
-const { resolve, directUrl, setGofileBrowser, setPageBrowser } = require('../shared/resolve');
+const { resolve, directUrl, directCandidates, setGofileBrowser, setPageBrowser } = require('../shared/resolve');
 
 /* gofile mints its API token in an obfuscated browser script, so a headless
    browser is the only way to list a folder once the plain API says no. It is an
@@ -84,6 +85,13 @@ function fail(res, status, code, message) {
 
 function outputNameFor(job) {
   const preset = getPreset(job.presetId);
+  if (job.noCompress) {
+    /* A copy is not re-encoded, so it keeps the source's own name — and its own
+       extension when it could not be repackaged as MP4. */
+    const source = job.name || (job.url ? safeNameFromUrl(job.url) : 'video');
+    const base = source.replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\w\-. ]+/g, '').trim().slice(0, 80) || 'video';
+    return `${base}${job.outputExt || '.mp4'}`;
+  }
   let base = job.name || (job.url ? safeNameFromUrl(job.url) : 'video');
   base = base.replace(/\.[a-z0-9]{2,5}$/i, '');
   base = base
@@ -222,7 +230,12 @@ async function compressJob(job) {
   let crfOverride = null;
   let scaleOverride = null;
   let skipEncode = false;
-  if (!job.targetMb) {
+  /* "Just download": some sources are slow to pull from, and the point is a
+     fast copy served from this machine (or a host), not a smaller file. */
+  if (job.noCompress) {
+    skipEncode = true;
+    notes.push('Saved without re-encoding, exactly as downloaded — this was a “just download” job.');
+  } else if (!job.targetMb) {
     jobsStore.updateJob(job, { stage: 'Checking what is worth encoding' });
     const pick = await chooseCrf({
       input: paths.source,
@@ -280,8 +293,33 @@ async function compressJob(job) {
   let outSize = { width: meta.width, height: meta.height };
 
   if (skipEncode) {
-    jobsStore.updateJob(job, { stage: 'Keeping the original', progress: 1 });
-    await fsp.copyFile(paths.source, paths.output);
+    jobsStore.updateJob(job, { stage: job.noCompress ? 'Saving the original' : 'Keeping the original', progress: 1 });
+    const sourceExt = (path.extname(job.name || '') || '.mp4').toLowerCase();
+    /* A copy keeps every bit of quality. If the source is an MKV (or anything
+       else MP4-shaped), remux it — a stream copy is seconds of work, loses
+       nothing, and plays everywhere. The bytes stay identical; only the
+       container changes. */
+    if (job.noCompress && sourceExt !== '.mp4') {
+      try {
+        await transcode(paths.source, paths.output, [
+          '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+          '-i', paths.source,
+          '-map', '0:v:0', '-map', '0:a:0?',
+          '-c', 'copy',
+          '-movflags', '+faststart',
+          paths.output,
+        ], { signal: controller.signal, duration: meta.duration });
+        job.outputExt = '.mp4';
+        notes.push('Repackaged into MP4 without re-encoding — not a single pixel was touched.');
+      } catch {
+        await fsp.copyFile(paths.source, paths.output);
+        job.outputExt = sourceExt;
+        notes.push(`Kept in its original format (${sourceExt.slice(1)}) because it could not be repackaged losslessly.`);
+      }
+    } else {
+      await fsp.copyFile(paths.source, paths.output);
+      job.outputExt = job.noCompress ? sourceExt : '.mp4';
+    }
     outStat = await fsp.stat(paths.output);
     usedOriginal = true;
   } else {
@@ -351,7 +389,8 @@ async function compressJob(job) {
   await fsp.rm(paths.source, { force: true }).catch(() => {});
 
   const saved = job.sourceBytes ? Math.max(0, 1 - outStat.size / job.sourceBytes) : 0;
-  if (!usedOriginal && saved < 0.05 && !job.targetMb) {
+  if (job.noCompress) usedOriginal = false;
+  if (!job.noCompress && !usedOriginal && saved < 0.05 && !job.targetMb) {
     notes.push('This one was already small — the compressed copy is about the same size.');
   }
 
@@ -426,6 +465,21 @@ async function hostJob(job, { order } = {}) {
     });
     writeResultsFile();
     persistHostedLink(job, result.url, result.provider);
+
+    /* Space is the scarcest thing on these machines. Once the file is on a host
+       and the link is in the ledger, the local copy has done its job. */
+    if (DELETE_AFTER_UPLOAD) {
+      const freed = await dropLocalCopy(job);
+      if (freed) {
+        jobsStore.updateJob(job, {
+          localDeleted: true,
+          note: [job.note, `The local copy was deleted after upload to keep ${formatSize(freed)} free.`]
+            .filter(Boolean)
+            .join(' '),
+        });
+        console.log(`[job ${job.id}] uploaded, freed ${formatSize(freed)} locally`);
+      }
+    }
     return job;
   } catch (err) {
     jobsStore.updateJob(job, {
@@ -438,6 +492,51 @@ async function hostJob(job, { order } = {}) {
   } finally {
     job.hosting = false;
   }
+}
+
+/**
+ * Delete a finished job's files from disk (its share link stays in the ledger).
+ * Returns the bytes freed.
+ */
+async function dropLocalCopy(job) {
+  const paths = jobsStore.jobPaths(job);
+  let freed = 0;
+  for (const file of [paths.output, paths.thumb, paths.source]) {
+    const size = await fsp.stat(file).then((stat) => stat.size).catch(() => 0);
+    if (!size) continue;
+    const removed = await fsp.rm(file, { force: true }).then(() => size).catch(() => 0);
+    freed += removed;
+  }
+  return freed;
+}
+
+/**
+ * Make room by deleting files that are already on a host, oldest first.
+ * Called before a job starts, so a full disk costs a re-download at worst —
+ * never the share links, which are already recorded.
+ */
+async function reclaimSpace(neededBytes) {
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  if (!neededBytes || free >= neededBytes) return { free, reclaimed: 0, jobs: 0 };
+
+  let reclaimed = 0;
+  let count = 0;
+  const candidates = jobsStore
+    .listJobs()
+    .filter((job) => job.hostedUrl && !job.hosting)
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+
+  for (const job of candidates) {
+    if (free + reclaimed >= neededBytes) break;
+    const freed = await dropLocalCopy(job);
+    if (!freed) continue;
+    reclaimed += freed;
+    count += 1;
+    jobsStore.updateJob(job, { localDeleted: true });
+    console.log(`[space] freed ${formatSize(freed)} from ${job.id} (already hosted)`);
+  }
+  const after = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  return { free: after, reclaimed, jobs: count };
 }
 
 /** Keep an append-only ledger of share links, independent of job cleanup. */
@@ -465,6 +564,59 @@ async function persistHostedLink(job, url, provider) {
   });
   await fsp.appendFile(file, `${line}\n`).catch(() => {});
 }
+
+/* --------------------------------------------------------------- emailing */
+
+/** Links newer than this have not been mailed yet. Boot time, so a restart does
+    not re-send yesterday's links. */
+let lastEmailedAt = Date.now();
+let emailInFlight = null;
+
+/**
+ * Mail every share link that appeared since the last mail.
+ * `force` sends the whole ledger (the "Email me the links" button).
+ */
+async function emailLinks({ to, force = false, reason } = {}) {
+  if (!notify.configured()) {
+    return {
+      sent: false,
+      needsConfig: true,
+      to: to || notify.defaultTo(),
+      mailto: notify.mailtoUrl(await allLinks(), { to: to || notify.defaultTo() }),
+      reason: 'Email is not set up on this machine.',
+    };
+  }
+  if (emailInFlight) return emailInFlight;
+
+  emailInFlight = (async () => {
+    const links = await allLinks();
+    const fresh = force ? links : links.filter((link) => Date.parse(link.at || 0) >= lastEmailedAt);
+    if (!fresh.length) return { sent: false, skipped: true, count: 0, to: to || notify.defaultTo() };
+    try {
+      await notify.sendLinks(fresh, { to: to || notify.defaultTo(), reason });
+      lastEmailedAt = Date.now();
+      console.log(`[email] ${fresh.length} link(s) sent to ${to || notify.defaultTo()}`);
+      return { sent: true, count: fresh.length, to: to || notify.defaultTo() };
+    } catch (err) {
+      console.error(`[email] failed: ${err.message}`);
+      return { sent: false, error: err.message, to: to || notify.defaultTo() };
+    }
+  })().finally(() => {
+    emailInFlight = null;
+  });
+  return emailInFlight;
+}
+
+/* The queue draining is the moment the links are all final — and the moment
+   auto-stop would take the page away — so that is when the mail goes out. */
+const AUTO_EMAIL = process.env.AUTO_EMAIL !== '0';
+/* Delete the encoded file once the host has it. The link is what was asked for;
+   the bytes are still on the host. KEEP_LOCAL_AFTER_UPLOAD=1 to keep them. */
+const DELETE_AFTER_UPLOAD = process.env.KEEP_LOCAL_AFTER_UPLOAD !== '1';
+autoStop.setBeforeStop(async () => {
+  if (!AUTO_EMAIL) return;
+  await emailLinks({ reason: 'This machine has finished and is about to switch itself off.' });
+});
 
 const FRIENDLY = {
   CANCELLED: 'Cancelled.',
@@ -553,16 +705,33 @@ async function fetchThenCompress(job, ref) {
   try {
     jobsStore.updateJob(job, { status: 'fetching', stage: 'Finding the video file' });
 
-    const url = await directUrl(ref);
-    const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+    /* Every URL that might serve this file, best first. Most hosts have one;
+       fileditch has a handful because its signed links rot in half an hour. */
+    let candidates = await directCandidates(ref).catch(async () => [await directUrl(ref)]);
+    let url = candidates[0];
     const expected = Number(ref.size) || 0;
     /* Encoding needs the source plus the output plus room for the encoder's
-       own scratch files, so require ~2.2x the file and never drop below 1 GB. */
-    const needed = Math.max(expected * 2.2, 1024 ** 3);
+       own scratch files, so require ~2.2x the file and never drop below 1 GB.
+       A copy job only needs the file once. */
+    const needed = job.noCompress
+      ? Math.max(expected * 1.2, 512 * 1024 ** 2)
+      : Math.max(expected * 2.2, 1024 ** 3);
+
+    let free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+    if (free < needed) {
+      // Finished files that are already on a host are expendable: their links
+      // are safe in the ledger, and their bytes are not needed here any more.
+      const made = await reclaimSpace(needed);
+      free = made.free;
+      if (made.reclaimed) {
+        console.log(`[space] reclaimed ${formatSize(made.reclaimed)} to make room`);
+      }
+    }
     if (free < needed) {
       throw Object.assign(
         new Error(
-          `Not enough disk space: ${formatGb(free)} free, about ${formatGb(needed)} needed for this file.`,
+          `Not enough disk space: ${formatGb(free)} free, about ${formatGb(needed)} needed for this file. ` +
+            'Finished videos whose share link is ready can be removed (they are already on the host).',
         ),
         { code: 'NO_DISK' },
       );
@@ -618,20 +787,48 @@ async function fetchThenCompress(job, ref) {
       },
     };
 
-    /* A host that refuses plain requests (hotlink protection, a bot challenge,
-       a player-only signed URL) is retried through a real browser before the
-       job is allowed to fail. */
-    const attempt = await downloadWithFallback({
-      url,
-      pageUrl: job.url || url,
-      destPath: paths.source,
-      download: (target, dest, options) => sources.downloadHttp(target, dest, options),
-      capture,
-      options: downloadOptions,
-      /* fileditch's signed links expire in about half an hour — shorter than a
-         queue wait — so fetch a fresh one before giving up. */
-      refresh: () => directUrl(ref),
-    });
+    /* Try each candidate in turn: a stale signed link costs a request, not a
+       job. Only the failures that another URL could fix are retried. */
+    let attempt = null;
+    const tried = [];
+    while (!attempt && candidates.length) {
+      const candidate = candidates.shift();
+      tried.push(candidate);
+      try {
+        const info = await sources.downloadHttp(candidate, paths.source, downloadOptions);
+        attempt = { usedBrowser: false, url: (info && info.url) || candidate, filename: (info && info.filename) || null };
+      } catch (err) {
+        if (!RECOVERABLE.has(err.code)) throw err;
+        let host = 'that host';
+        try {
+          host = new URL(candidate).host;
+        } catch {
+          /* keep the generic wording */
+        }
+        console.log(`[job ${job.id}] ${err.code} from ${host} — trying the next route`);
+        jobsStore.updateJob(job, { stage: 'The usual link failed — trying another route' });
+      }
+    }
+
+    /* Still nothing? A host that refuses plain requests (hotlink protection, a
+       bot challenge, a player-only signed URL) is retried through a real
+       browser before the job is allowed to fail. */
+    if (!attempt) {
+      attempt = await downloadWithFallback({
+        url: tried[tried.length - 1] || url,
+        pageUrl: job.url || url,
+        destPath: paths.source,
+        download: (target, dest, options) => sources.downloadHttp(target, dest, options),
+        capture,
+        options: downloadOptions,
+        /* fileditch's signed links expire in about half an hour — shorter than a
+           queue wait — so fetch a fresh one before giving up. */
+        refresh: async () => {
+          const fresh = await directCandidates(ref).catch(() => []);
+          return fresh.find((candidate) => !tried.includes(candidate)) || null;
+        },
+      });
+    }
     if (attempt.usedBrowser) {
       job.browserFetched = true;
     }
@@ -717,8 +914,12 @@ function pumpQueue() {
         finishedThisSession += 1;
         updateQueuePositions();
         pumpQueue();
-        // Nothing left to do: let the machine go if the user asked for that.
-        if (!queue.length && activeCount === 0) autoStop.schedule('queue finished');
+        // Nothing left to do: mail the links, then let the machine go if the
+        // user asked for that.
+        if (!queue.length && activeCount === 0) {
+          if (AUTO_EMAIL) emailLinks({ reason: 'The queue is finished.' }).catch(() => {});
+          autoStop.schedule('queue finished');
+        }
       });
   }
   updateQueuePositions();
@@ -734,8 +935,11 @@ function startCompression(job) {
 
 async function saveRequestToFile(req, destPath, { maxBytes = MAX_UPLOAD_BYTES } = {}) {
   // Leave room for the encoded output next to the source.
-  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
   const declared = Number(req.headers['content-length'] || 0);
+  let free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  if (declared && declared * 1.5 > free) {
+    free = (await reclaimSpace(declared * 1.5)).free;
+  }
   if (declared && declared * 1.5 > free) {
     throw Object.assign(new Error('This server does not have enough free disk space for that file.'), {
       code: 'NO_DISK',
@@ -781,6 +985,7 @@ async function adoptUpload(tmpPath, fields) {
     name: fields.name,
     presetId: fields.presetId,
     targetMb: fields.targetMb,
+    noCompress: fields.noCompress,
   });
   const paths = jobsStore.jobPaths(job);
 
@@ -817,6 +1022,7 @@ app.get('/api/health', async (req, res) => {
     ytdlpVersion: ytdlp?.version || null,
     hosters: hosters.describeProviders(),
     autoHost: AUTO_HOST,
+    email: notify.describe(),
     browserHosters: ['gofile', 'pixeldrain'],
   });
 });
@@ -877,12 +1083,56 @@ app.post('/api/probe', async (req, res) => {
 });
 
 /** List the actual files behind a share link (gofile folder, turbo.cr page, …). */
+/**
+ * Fill in the size of files a share page lists but does not measure.
+ *
+ * "3 files found" is not enough to choose from when one is 200 MB and another
+ * is 4 GB. A HEAD request (or a one-byte range GET) is enough, and a host that
+ * refuses it simply leaves the size unknown — the answer is never delayed by
+ * more than the deadline below.
+ */
+async function withSizes(result, { timeoutMs = 7000, limit = 12 } = {}) {
+  if (!result || !result.files || !result.files.length) return result;
+  const targets = result.files.filter((file) => !file.size).slice(0, limit);
+  if (!targets.length) return result;
+
+  const work = Promise.all(
+    targets.map(async (file) => {
+      const ref = file.ref || {};
+      // Use the URL already in hand: minting a fresh signed link just to weigh
+      // the file would make the picker slow and burn a token.
+      const direct = /^https?:/i.test(ref.url || '') && !signedish(ref.url) ? ref.url : null;
+      const url = direct || (await directUrl(ref).catch(() => null));
+      if (!url) return;
+      const probe = await sources
+        .probeRemote(url, { timeoutMs: 4000, headers: ref.referer ? { referer: ref.referer } : {} })
+        .catch(() => null);
+      if (probe && probe.reachable && probe.contentLength) file.size = probe.contentLength;
+    }),
+  );
+
+  await Promise.race([work, new Promise((resolve) => setTimeout(resolve, timeoutMs))]);
+  return result;
+}
+
+/** A fileditch signed path or any opaque token: not worth a HEAD on its own. */
+function signedish(url) {
+  try {
+    const last = new URL(url).pathname.split('/').filter(Boolean).pop() || '';
+    return last.length > 24 && /^[A-Za-z0-9_-]+$/.test(last);
+  } catch {
+    return false;
+  }
+}
+
 app.post('/api/resolve', async (req, res) => {
   const url = sources.normalizeUrl(req.body?.url);
   if (!url) return fail(res, 400, 'BAD_URL', 'That does not look like a valid link.');
   if (sources.isBlockedHost(url)) return fail(res, 400, 'BLOCKED_HOST', 'That address is not allowed.');
   try {
-    const result = await fileBehindUrl(url, await resolve(url));
+    const result = await withSizes(await fileBehindUrl(url, await resolve(url)), {
+      timeoutMs: Number(process.env.SIZE_PROBE_MS) || 7000,
+    });
     return res.json({
       resolver: result.resolver,
       title: result.title || null,
@@ -922,6 +1172,7 @@ app.post('/api/jobs', async (req, res) => {
   const source = body.source || 'url';
   const presetId = String(body.presetId || 'balanced');
   const targetMb = Number(body.targetMb) > 0 ? Number(body.targetMb) : null;
+  const noCompress = Boolean(body.noCompress);
   const hostOrder = Array.isArray(body.hostOrder)
     ? body.hostOrder.map((id) => String(id).toLowerCase()).filter((id) => hosters.PROVIDERS[id])
     : [];
@@ -936,6 +1187,7 @@ app.post('/api/jobs', async (req, res) => {
       url: body.pageUrl ? String(body.pageUrl) : null,
       presetId,
       targetMb,
+      noCompress,
       name: body.name,
       ref,
       hostOrder,
@@ -946,7 +1198,7 @@ app.post('/api/jobs', async (req, res) => {
   }
 
   if (source === 'sample') {
-    const job = jobsStore.createJob({ source: 'sample', name: 'squeeze-sample', presetId, targetMb });
+    const job = jobsStore.createJob({ source: 'sample', name: 'squeeze-sample', presetId, targetMb, noCompress });
     const paths = jobsStore.jobPaths(job);
     ensureSample()
       .then((samplePath) => fsp.copyFile(samplePath, paths.source))
@@ -990,7 +1242,7 @@ app.post('/api/jobs', async (req, res) => {
         'This server cannot extract platform links. Retrying through your browser instead.',
       );
     }
-    const job = jobsStore.createJob({ source: 'ytdlp', url, presetId, targetMb, name: body.name, hostOrder });
+    const job = jobsStore.createJob({ source: 'ytdlp', url, presetId, targetMb, name: body.name, hostOrder, noCompress });
     jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading from the platform' });
     sources
       .downloadPlatform(url, job.dir, {
@@ -1100,9 +1352,9 @@ app.post('/api/jobs', async (req, res) => {
     hostOrder,
     presetId,
     targetMb,
+    noCompress,
     name: body.name || file.name,
     ref: file.ref,
-    hostOrder,
   });
   res.status(201).json({ job: jobsStore.publicView(job) });
   fetchThenCompress(job, file.ref);
@@ -1190,7 +1442,11 @@ app.post('/api/upload/init', async (req, res) => {
   if (size > MAX_UPLOAD_BYTES) {
     return fail(res, 413, 'TOO_BIG', `Files up to ${MAX_UPLOAD_MB} MB are supported.`);
   }
-  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  let free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  if (size && size * 1.5 > free) {
+    // Old finished files are already on a host: their links survive without them.
+    free = (await reclaimSpace(size * 1.5)).free;
+  }
   if (size && size * 1.5 > free) {
     return fail(res, 507, 'NO_DISK', 'This server does not have enough free disk space for that file.');
   }
@@ -1209,6 +1465,7 @@ app.post('/api/upload/init', async (req, res) => {
       size,
       presetId: String(body.presetId || 'balanced'),
       targetMb: Number(body.targetMb) > 0 ? Number(body.targetMb) : null,
+      noCompress: Boolean(body.noCompress),
       url: body.url ? String(body.url).slice(0, 2000) : null,
       chunks: 0,
       createdAt: Date.now(),
@@ -1294,6 +1551,7 @@ app.post('/api/upload/finish/:id', async (req, res) => {
       url: entry.meta.url,
       presetId: entry.meta.presetId,
       targetMb: entry.meta.targetMb,
+      noCompress: entry.meta.noCompress,
     });
     res.status(201).json({ job: jobsStore.publicView(job) });
   } catch (err) {
@@ -1318,6 +1576,7 @@ app.post('/api/upload', async (req, res) => {
       name: req.query.name ? String(req.query.name) : null,
       presetId: presets,
       targetMb: Number(req.query.targetMb) > 0 ? Number(req.query.targetMb) : null,
+      noCompress: req.query.noCompress === '1' || req.query.noCompress === 'true',
     });
     res.status(201).json({ job: jobsStore.publicView(job) });
   } catch (err) {
@@ -1474,10 +1733,34 @@ app.get('/api/jobs/:id/thumb', (req, res) => {
   res.sendFile(thumb);
 });
 
+const CONTENT_TYPES = {
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
+  '.ts': 'video/mp2t',
+};
+const contentTypeFor = (name) => CONTENT_TYPES[path.extname(String(name)).toLowerCase()] || 'video/mp4';
+
 function serveOutput(req, res, disposition) {
   const job = jobsStore.getJob(req.params.id);
   if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
   const { output } = jobsStore.jobPaths(job);
+  /* The file was here and was deleted on purpose: the bytes are on the host,
+     which is the point of the disk policy. Say that instead of "not ready". */
+  if (job.localDeleted || (['done', 'hosted'].includes(job.status) && !fs.existsSync(output))) {
+    if (job.hostedUrl) {
+      return fail(
+        res,
+        410,
+        'DELETED_AFTER_UPLOAD',
+        `The local copy was deleted to free space — the file is on ${job.hostProvider || 'the host'}: ${job.hostedUrl}`,
+      );
+    }
+    return fail(res, 410, 'GONE', 'The local copy of this file is gone.');
+  }
   if (!['done', 'hosting', 'hosted'].includes(job.status) || !fs.existsSync(output)) {
     return fail(res, 409, 'NOT_READY', 'This file is not ready yet.');
   }
@@ -1485,7 +1768,9 @@ function serveOutput(req, res, disposition) {
     output,
     {
       headers: {
-        'Content-Type': 'video/mp4',
+        'Content-Type': /\.[a-z0-9]+$/i.test(job.outputName || '')
+          ? contentTypeFor(job.outputName)
+          : 'video/mp4',
         'Content-Disposition': `${disposition}; filename="${job.outputName}"`,
       },
     },
@@ -1556,6 +1841,22 @@ async function allLinks() {
 
 app.get('/api/links', async (req, res) => {
   res.json({ links: await allLinks() });
+});
+
+/**
+ * Mail the links. Without SMTP configured this answers with a mailto: URL
+ * instead of failing — a machine with no credentials can still get the links
+ * out, the user's own mail client just does the sending.
+ */
+app.post('/api/links/email', async (req, res) => {
+  const to = String(req.body?.to || '').trim() || undefined;
+  if (to && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) {
+    return fail(res, 400, 'BAD_EMAIL', 'That does not look like an email address.');
+  }
+  const result = await emailLinks({ to, force: true, reason: 'Sent from the app.' });
+  if (result.sent) return res.json({ ok: true, ...result });
+  if (result.needsConfig) return res.status(200).json({ ok: false, ...result });
+  return res.status(502).json({ ok: false, error: result.error || 'The mail could not be sent.' });
 });
 
 app.get('/api/links.txt', async (req, res) => {

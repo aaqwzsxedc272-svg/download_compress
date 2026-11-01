@@ -1031,3 +1031,40 @@ a { color: inherit; text-decoration: none; }
   .header-meta { gap: 6px; }
   #diskText { font-size: 11.5px; }
 }
+
+/* "just download" turns the encoder off; the knobs that no longer apply fade
+   rather than disappear, so the composer keeps its shape. */
+.control-group.is-off,
+.segmented.is-off,
+.select.is-off,
+input.is-off {
+  opacity: 0.42;
+  pointer-events: none;
+}
+
+.composer-mode-note {
+  margin: 10px 2px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--accent);
+}
+
+.picker-mode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 2px 2px;
+}
+
+.picker-mode .toggle { font-size: 13px; }
+
+.picker-mode-hint {
+  font-size: 12px;
+  color: var(--dim);
+  flex: 1 1 260px;
+}
+
+@media (max-width: 640px) {
+  .picker-mode-hint { flex-basis: 100%; }
+}

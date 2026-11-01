@@ -120,6 +120,8 @@ function createJob(fields = {}) {
     name: fields.name || null,
     presetId: fields.presetId || 'balanced',
     targetMb: fields.targetMb || null,
+    /* "Just download": fetch the file and hand it back untouched, no encode. */
+    noCompress: Boolean(fields.noCompress),
     ref: fields.ref || null,
     /* Preferred upload hosts for this job, in order; empty means the server's
        default chain. */
@@ -190,6 +192,8 @@ function publicView(job) {
     scaledTo: job.scaledTo || null,
     outputSize: job.outputSize || null,
     usedOriginal: Boolean(job.usedOriginal),
+    noCompress: Boolean(job.noCompress),
+    localDeleted: Boolean(job.localDeleted),
     downloadSpeed: job.downloadSpeed || null,
     downloadEta: job.downloadEta || null,
     projection: job.projection || null,

@@ -16,6 +16,15 @@
 
 const { spawn } = require('node:child_process');
 
+/* Work that has to happen before the machine goes away (mailing the links).
+   It gets a bounded amount of time, then the stop runs anyway. */
+let beforeStop = null;
+const BEFORE_STOP_TIMEOUT_MS = Number(process.env.BEFORE_STOP_TIMEOUT_SECONDS || 45) * 1000;
+
+function setBeforeStop(fn) {
+  beforeStop = typeof fn === 'function' ? fn : null;
+}
+
 const state = {
   enabled: process.env.AUTO_STOP_WHEN_IDLE === '1',
   delaySeconds: Math.max(10, Number(process.env.AUTO_STOP_DELAY_SECONDS) || 120),
@@ -59,10 +68,22 @@ function cancel(reason) {
   return true;
 }
 
-function runStop() {
+async function runStop() {
   state.pendingAt = null;
   state.timer = null;
   state.lastStopAt = Date.now();
+
+  if (beforeStop) {
+    try {
+      await Promise.race([
+        Promise.resolve(beforeStop()),
+        new Promise((resolve) => setTimeout(resolve, BEFORE_STOP_TIMEOUT_MS)),
+      ]);
+    } catch (err) {
+      console.error('[auto-stop] pre-stop step failed:', err.message);
+    }
+  }
+
   console.log(`[auto-stop] running: ${command.command}`);
   try {
     const child = spawn(command.command, {
@@ -112,4 +133,4 @@ function status() {
   };
 }
 
-module.exports = { status, enable, schedule, cancel, configured, command, state };
+module.exports = { status, enable, schedule, cancel, configured, command, setBeforeStop, state };

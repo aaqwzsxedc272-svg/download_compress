@@ -157,7 +157,7 @@ async function downloadPlatform(url, destDir, { onProgress, timeoutMs = 8 * 60 *
 /* --------------------------------------------------------- direct http GET */
 
 /** Cheap reachability check from the server. Never throws. */
-async function probeRemote(url, { timeoutMs = 6000 } = {}) {
+async function probeRemote(url, { timeoutMs = 6000, headers: extraHeaders = {} } = {}) {
   if (isBlockedHost(url)) return { reachable: false, status: 0, error: 'blocked-host' };
   const attempt = async (method, headers) => {
     const controller = new AbortController();
@@ -171,9 +171,9 @@ async function probeRemote(url, { timeoutMs = 6000 } = {}) {
   };
 
   try {
-    let res = await attempt('HEAD', { 'user-agent': UA });
+    let res = await attempt('HEAD', { 'user-agent': UA, ...extraHeaders });
     if (!res.ok || !res.headers.get('content-length')) {
-      res = await attempt('GET', { 'user-agent': UA, range: 'bytes=0-0' });
+      res = await attempt('GET', { 'user-agent': UA, range: 'bytes=0-0', ...extraHeaders });
     }
     const type = res.headers.get('content-type') || '';
     const length = Number(res.headers.get('content-range')?.split('/')?.[1] || res.headers.get('content-length') || 0);

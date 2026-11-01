@@ -86,7 +86,8 @@ Squeeze detects it at startup and reports it on `/api/health`.
 | **pixeldrain.com** | yes | serves its API with open CORS, so the browser can read files directly |
 | **turbo.cr** | server only | share pages are signed via `api/sign`; the CDN allows no cross-origin reads |
 | **bunkr** | server only | follows the signed-CDN flow; rotates domains, often bot-protected |
-| **filester.me** | server only | public metadata + share-page scrape; behind DDoS-Guard |
+| **filester.me** | server only | public metadata + share-page scrape; behind DDoS-Guard; takes the file's real name from the page, not the CDN's UUID |
+| **fileditch** (`fileditch.st`, `theditch.st`, `fileditchfiles.me`) | server only | follows the page's minted download anchor; the signed link lives ~26 minutes, so a fresh one is minted at fetch time and the player URL is the backup route |
 | direct `.mp4` / `.webm` | yes | no resolution needed |
 | any page with a video | yes | `og:video`, `<video>`, `<source>`, JSON-LD |
 
@@ -107,12 +108,17 @@ real end-to-end encode, then explains what that combination means.
    - `pixeldrain.com/u|l/{id}` → file info / list
    - `bunkr.*` `/f|v|i|d|a/{id}` → signed CDN URL (albums expand to files)
    - `filester.me/d/{slug}` → public metadata, then share-page scrape
+   - `fileditch.st/{id}` / `theditch.st/{id}` / a bare `fileditchfiles.me/...` path → the
+     page's `⬇ Download` anchor (a freshly signed link), with the player URL as a fallback
    - a URL that ends in a video extension → used directly
    - anything else → the page is fetched and scanned for a video URL
 2. **Fetch it**, in whichever of these can reach the file:
    - the server downloads it itself (fastest),
    - `yt-dlp` extracts it for the platforms it supports,
    - or **your browser** fetches the bytes and streams them to the encoder.
+   The name shown is the one on the page, not the one in the URL: a CDN that calls the file
+   `e78f1c92-7cbd-4065-84a0-36d240d61814.mkv` while the page says `Kate Dalia - Lazy Day Off.mp4`
+   gets the page's name, and `Content-Disposition` wins over both.
 3. **Encode it** with libx264 (quality-first: slow-ish preset, low CRF, audio stream-copied
    when it is already AAC, never upscaled). A re-encode that would be bigger than the
    original is discarded and the original is shared instead.
@@ -157,6 +163,21 @@ path produced 1280×720 at CRF 24, 15% smaller, prediction within 0.5% of the re
 Fixed-size requests ("fit in N MB") are still supported: the encoder runs two passes so the bits
 land where the detail is. Audio is copied untouched whenever the source is already AAC under
 192 kbps, so nothing is spent re-encoding it.
+
+## Just download it (no re-encoding)
+
+Not every link needs a smaller file. Some hosts are fast from the server and slow from a
+laptop, and the point is simply to get the bytes. *Skip the encoder → Just download it* in the
+composer (or the same switch in the file picker) hands the original back untouched:
+
+- Nothing is re-encoded. An MP4 is served exactly as it arrived; an MKV/MOV/WEBM is losslessly
+  re-wrapped to MP4 (`-c copy`, `+faststart`) so it plays everywhere — not a single pixel is
+  touched, and the job says so.
+- The file keeps the host's real name and extension, and the media type is set from that
+  extension rather than guessed.
+- Disk need drops from ~2.2× the file to ~1.2×, because there is no encoder scratch space.
+- It can still be uploaded to a host and still appears in the links panel, so a slow-source
+  download also survives the machine stopping.
 
 ## Hosts used for the output
 
@@ -215,13 +236,22 @@ fly deploy
 | `MAX_UPLOAD_MB` | `6144` | Largest accepted video, in megabytes |
 | `MAX_CONCURRENT` | `1` | Simultaneous encodes (one per CPU core is a good rule) |
 | `ALLOW_PRIVATE_HOSTS` | off | Permit `127.0.0.1` / metadata addresses (tests only) |
+| `KEEP_LOCAL_AFTER_UPLOAD` | off | Set `1` to keep the compressed file on disk after it is hosted |
+| `SMTP_HOST` / `SMTP_PORT` | — / `587` | Mail server for the share links (`465` = implicit TLS) |
+| `SMTP_USER` / `SMTP_PASS` | — | Login; for Gmail use an **app password**, spaces are ignored |
+| `SMTP_FROM` | `SMTP_USER` | Envelope sender |
+| `NOTIFY_EMAIL` | `aaqwzsxedc272@gmail.com` | Where the links are mailed |
+| `AUTO_EMAIL` | on | Mails the new links when the queue drains; `0` disables |
+| `BEFORE_STOP_TIMEOUT_SECONDS` | `45` | How long an auto-stop waits for the last mail to leave |
+| `SIZE_PROBE_MS` | `7000` | Timeout for probing the size of files behind a link |
 
 By default loopback, `169.254.169.254` and `metadata.google.internal` are refused, so the
 app cannot be used to probe the box it runs on.
 
 ## Encoding notes
 
-- Video: `libx264`, `-preset veryfast`, CRF 24–31 depending on preset, `yuv420p`, `+faststart`
+- Video: `libx264`, `-preset veryfast`, CRF 19–26 depending on preset (never above 26),
+  `yuv420p`, `+faststart`
   so the file starts playing while it downloads.
 - The preset caps the **shorter** side, so portrait phone video stays portrait (`1080×1920` at
   "720p" becomes `405×720`).
@@ -272,6 +302,32 @@ closed tab, a restarted server or a stopped machine. `GET /api/links` returns th
 starting the server at all. Pick the host in *Upload to* (Auto, or a specific one); the choice is
 remembered and sent with every job.
 
+## Getting the link without watching the tab
+
+Starting a queue and closing the laptop is the normal way to use this, so the links have to
+leave the machine on their own:
+
+- **The mail goes out when the queue drains** — the same moment auto-stop would take the page
+  away. It lists every link hosted since the last mail with the size change
+  (`508 MB → 341 MB (−33%) · on pixeldrain`), and `data/links.tsv` where the whole list lives.
+- **Before the machine stops itself**, the mail is flushed first (the stop waits up to
+  `BEFORE_STOP_TIMEOUT_SECONDS`), so `Stop the machine` cannot outrun it.
+- **Email them to me** in the links panel sends the whole list on demand.
+- Without SMTP the app does not pretend: the button opens a `mailto:` with every link already
+  written into it, and the panel says mail is not set up.
+
+Gmail needs an app password, not the account password: enable 2-step verification, create one at
+<https://myaccount.google.com/apppasswords>, then
+
+```
+SMTP_HOST=smtp.gmail.com SMTP_PORT=587 \
+SMTP_USER=you@gmail.com SMTP_PASS='abcd efgh ijkl mnop' \
+NOTIFY_EMAIL=aaqwzsxedc272@gmail.com npm start
+```
+
+`npm run test:notify` runs a real SMTP conversation against a fake server (greeting, STARTTLS,
+login, envelope, base64 body) — no account needed.
+
 ## When a host refuses
 
 Some hosts answer a plain request with a challenge page instead of bytes — fileditch 403s,
@@ -305,14 +361,23 @@ it; starting a new job cancels it too.
 
 ## Disk space
 
-A video needs roughly **three times its own size** free while it encodes: the source, the
-output, and the encoder's scratch files. A 4 GB 4K file therefore wants ~12 GB free.
+A video needs roughly **twice its own size** free while it encodes: the source, the output,
+and the encoder's scratch files. A 4 GB 4K file therefore wants ~9 GB free (a *just download*
+job needs ~1.2×, and never less than 512 MB).
 
-- The source is deleted the moment the output is complete, so a finished job costs only the
-  compressed file.
+- **Once a file is on the host, its local copy is deleted.** The share link is in `data/links.tsv`
+  by then, so nothing is lost — the bytes already have a home. A 7 MB encode frees 7 MB the
+  moment the upload finishes, and the app says how much it freed. Set
+  `KEEP_LOCAL_AFTER_UPLOAD=1` to keep the local copies (handy when you want to download straight
+  from the machine).
+- **Deleting after upload is not the only reclaim.** Before a job starts, if the disk is tight,
+  the oldest jobs that are already hosted are cleared to make room — again, only files whose
+  links are already recorded.
 - A failed job deletes its partial source and output immediately.
 - Before a job starts the server checks free space and refuses (with the numbers) rather than
-  dying half way through with `No space left on device`.
+  dying half way through with `No space left on device`; the message names what can be freed.
+- Downloading a file that was already deleted answers `410` with the share link instead of
+  pretending the file is still there.
 - `npm run disk` reports total/used/free and the largest jobs; `npm run disk -- --clean` deletes
   finished and failed jobs and the temp directory.
 - `/api/health` returns `freeGb`, so a monitor can watch it.
@@ -355,7 +420,8 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
-- `npm run test:resolve` — 19 resolver tests against stubbed APIs (real response shapes).
+- `npm run test:resolve` — 26 resolver tests against stubbed APIs (real response shapes),
+  including the page-title naming rule and fileditch's minted-link/player routes.
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
 - `npm run test:estimate` — the quality rules and the size prediction: a dense 1080p file is
@@ -365,10 +431,18 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:encode` — an MKV whose audio the MP4 muxer refuses: the normal plan fails, the
   forgiving retry succeeds, and the error carries the one ffmpeg line a person can act on.
 - `npm run test:ledger` — share links survive a restart, duplicates and mangled names.
+- `npm run test:notify` — a full SMTP conversation against a fake server: login, envelope,
+  base64 body, the `mailto:` fallback and a refused password.
+- `npm run test:ui` — the browser code in jsdom: the disk pill, the presets, "just download"
+  greying the encoder controls, the size list in the picker, the per-picker switch sending
+  `noCompress`, and the email button (needs `npm i --no-save jsdom`, skips without it).
+- `npm run test:space` — the space policy end to end: a hosted job's files are deleted,
+  the link survives, the download route answers `410`, and `KEEP_LOCAL_AFTER_UPLOAD=1` keeps
+  everything.
 - `npm run test:durability` — a job finishes with nobody watching, and its link survives the
   server being killed and restarted.
 - `npm run test:resume` — an encode killed at 6% finishes after a restart (takes ~5 minutes).
-- `npm run smoke` — 56 end-to-end checks: sample, upload, browser relay, target size, range
+- `npm run smoke` — 61 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
   chunk and an out-of-order chunk), and every rejection path. Starts its own
   server and a fake external host on a spare port.

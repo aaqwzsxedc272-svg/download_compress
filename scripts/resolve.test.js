@@ -8,7 +8,14 @@
  */
 
 const assert = require('node:assert');
-const { resolve, directUrl, extractVideoUrls } = require('../shared/resolve');
+const {
+  resolve,
+  directUrl,
+  directCandidates,
+  extractVideoUrls,
+  pageDisplayName,
+  preferPageName,
+} = require('../shared/resolve');
 
 let passed = 0;
 let failed = 0;
@@ -229,6 +236,100 @@ const GOFILE_FOLDER = {
     });
     const result = await resolve('https://filester.me/d/aBcDeFg');
     assert.equal(result.files[0].ref.url, 'https://dl.filester.me/x/clip.mp4');
+  });
+
+  await test('the page name beats the uuid the cdn calls the file', async () => {
+    stubFetch((url) => {
+      if (url.includes('u1.filester.me')) return { status: 401, body: { success: false } };
+      return {
+        raw:
+          '<title>Kate Dalia - Lazy Day Off.mp4 | Filester</title>' +
+          '<video src="https://dl.filester.me/x/e78f1c92-7cbd-4065-84a0-36d240d61814.mkv"></video>',
+        type: 'text/html',
+      };
+    });
+    const result = await resolve('https://filester.me/d/aBcDeFg');
+    assert.equal(result.files[0].name, 'Kate Dalia - Lazy Day Off.mp4', JSON.stringify(result.files[0].name));
+    /* The url is still the uuid; only the name changed. */
+    assert.match(result.files[0].ref.url, /e78f1c92/);
+  });
+
+  await test('a readable cdn name is left alone', async () => {
+    stubFetch((url) => {
+      if (url.includes('u1.filester.me')) return { status: 401, body: { success: false } };
+      return {
+        raw: '<title>holiday.mp4</title><video src="https://dl.filester.me/x/Sunset-Drive-1080p.mp4"></video>',
+        type: 'text/html',
+      };
+    });
+    const result = await resolve('https://filester.me/d/aBcDeFg');
+    assert.equal(result.files[0].name, 'Sunset-Drive-1080p.mp4');
+  });
+
+  console.log('fileditch');
+
+  await test('a download anchor is followed and deduped against the player', async () => {
+    /* The shape fileditch really serves: one minted anchor plus the player. */
+    const signed = Buffer.from('1793509933:pZQFcRjiXh9:36884/b78/WlVHBYDPhhHcSTmGUcvy.mp4')
+      .toString('base64url');
+    const player = 'https://fileditchvids.st/b78/WlVHBYDPhhHcSTmGUcvy.mp4';
+    stubFetch(() => ({
+      raw:
+        '<title>WlVHBYDPhhHcSTmGUcvy.mp4</title>' +
+        `<video src="${player}"></video>` +
+        `<a href="https://lumistretcheseverymorning.xyz/${signed}">⬇ Download</a>`,
+      type: 'text/html',
+    }));
+    const result = await resolve('https://fileditch.st/qhygxukd');
+    assert.equal(result.resolver, 'fileditch');
+    assert.equal(result.files.length, 1, JSON.stringify(result.files.map((f) => f.name)));
+    assert.match(result.files[0].ref.url, /lumistretcheseverymorning/, result.files[0].ref.url);
+    assert.equal(result.files[0].name, 'WlVHBYDPhhHcSTmGUcvy.mp4');
+  });
+
+  await test('the player page itself is offered when the signed link fails', async () => {
+    const signed = Buffer.from('1793509933:pZQFcRjiXh9:36884/b78/abc.mp4').toString('base64url');
+    const player = 'https://fileditchvids.st/b78/abc.mp4';
+    stubFetch(() => ({
+      raw:
+        `<video src="${player}"></video>` +
+        `<a href="https://lumistretcheseverymorning.xyz/${signed}">Download</a>`,
+      type: 'text/html',
+    }));
+    const result = await resolve('https://fileditch.st/qhygxukd');
+    const routes = await directCandidates(result.files[0].ref);
+    assert.ok(routes.length >= 2, `expected several routes, got ${JSON.stringify(routes)}`);
+    assert.match(routes[0], /lumistretcheseverymorning/);
+    assert.ok(routes.some((route) => route.includes('fileditchvids.st')), JSON.stringify(routes));
+  });
+
+  await test('a bare cdn path is resolved through the page, never fetched as a file', async () => {
+    const signed = Buffer.from('1793509933:pZQFcRjiXh9:36884/b78/abc.mp4').toString('base64url');
+    stubFetch(() => ({
+      raw:
+        '<video src="https://fileditchvids.st/b78/abc.mp4"></video>' +
+        `<a href="https://lumistretcheseverymorning.xyz/${signed}">Download</a>`,
+      type: 'text/html',
+    }));
+    const result = await resolve('https://fileditchfiles.me/b78/abc.mp4');
+    assert.equal(result.resolver, 'fileditch');
+    assert.equal(result.files.length, 1);
+    assert.ok(!/fileditchfiles\.me$/.test(result.files[0].ref.url), result.files[0].ref.url);
+  });
+
+  console.log('page titles');
+
+  await test('reads og:title, title and h1, and strips the site suffix', async () => {
+    assert.equal(pageDisplayName('<meta property="og:title" content="Clip One.mp4">'), 'Clip One.mp4');
+    assert.equal(pageDisplayName('<title>Clip Two.mkv | Filester</title>'), 'Clip Two.mkv');
+    assert.equal(pageDisplayName('<h1>Clip Three.mp4</h1>'), 'Clip Three.mp4');
+    assert.equal(pageDisplayName('<title>Filester — free file host</title>'), null);
+  });
+
+  await test('a uuid is generated, a real name is not', () => {
+    assert.equal(preferPageName('e78f1c92-7cbd-4065-84a0-36d240d61814.mkv', 'Real Name.mkv'), 'Real Name.mkv');
+    assert.equal(preferPageName('holiday.mp4', 'Other.mp4'), 'holiday.mp4');
+    assert.equal(preferPageName('abc.mp4', null), 'abc.mp4');
   });
 
   console.log('pixeldrain');

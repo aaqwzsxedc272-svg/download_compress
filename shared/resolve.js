@@ -486,10 +486,15 @@
       if (!res.ok) throw new ResolveError(`filester answered HTTP ${res.status}.`, 'FILESTER_FAILED');
       const html = await res.text();
       let urls = extractVideoUrls(html, url);
+      const displayName = pageDisplayName(html);
       if (!urls.length) {
         const viaBrowser = await pageBrowserFiles(url);
         if (viaBrowser && viaBrowser.length) {
-          return { resolver: 'filester', title: null, files: viaBrowser };
+          const named = viaBrowser.map((file, index) => ({
+            ...file,
+            name: index === 0 ? preferPageName(file.name, displayName) : file.name,
+          }));
+          return { resolver: 'filester', title: displayName, files: named };
         }
         throw new ResolveError(
           'filester refused a plain request (DDoS-Guard) and the browser found no video either. Open the link, download the file and drop it here.',
@@ -498,21 +503,25 @@
       }
       return {
         resolver: 'filester',
-        title: null,
-        files: urls.map((videoUrl) => ({
-          id: videoUrl,
-          name: (() => {
-            try {
-              return decodeURIComponent(new URL(videoUrl).pathname.split('/').pop() || 'video.mp4');
-            } catch {
-              return 'video.mp4';
-            }
-          })(),
-          size: 0,
-          mime: '',
-          kind: 'video',
-          ref: { resolver: 'direct', url: videoUrl },
-        })),
+        title: displayName,
+        files: urls.map((videoUrl, index) => {
+          let urlName = 'video.mp4';
+          try {
+            urlName = decodeURIComponent(new URL(videoUrl).pathname.split('/').pop() || 'video.mp4');
+          } catch {
+            /* keep default */
+          }
+          /* The CDN calls it a UUID; the page knows what it really is. */
+          const name = index === 0 ? preferPageName(urlName, displayName) : urlName;
+          return {
+            id: videoUrl,
+            name,
+            size: 0,
+            mime: '',
+            kind: 'video',
+            ref: { resolver: 'direct', url: videoUrl, name, page: url, referer: url },
+          };
+        }),
       };
     },
     async direct(ref) {
@@ -603,6 +612,82 @@
 
   /* ----------------------------------------------------------- generic pages */
 
+
+/** The file name inside a page title, junk and site suffix removed. */
+const NAME_WITH_EXT = /^(.*?\.(?:mp4|m4v|mkv|mov|avi|webm|flv|wmv|mpg|mpeg|m2ts|mts|ts|3gp))(?![a-z0-9])/i;
+
+/**
+ * The name a person sees on a share page.
+ *
+ * CDNs love handing out a UUID ("e78f1c92-7cbd-4065-84a0-36d240d61814.mkv")
+ * while the page itself says "Kate Dalia - Lazy Day Off.mp4". The page wins:
+ * it is the only place the real name exists. Falls back through og:title,
+ * <title>, <h1> and a few JSON fields, and strips site suffixes like "| Filester".
+ */
+function pageDisplayName(html) {
+  if (!html) return null;
+  const candidates = [];
+  const push = (value) => {
+    if (!value) return;
+    const text = String(value)
+      .replace(/&amp;/g, '&')
+      .replace(/&#0?39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text && text.length <= 180) candidates.push(text);
+  };
+
+  const meta = (prop) => {
+    const re = new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]*>`, 'i');
+    const tag = re.exec(html);
+    if (!tag) return null;
+    const content = /content=["']([^"']+)["']/i.exec(tag[0]);
+    return content ? content[1] : null;
+  };
+
+  push(meta('og:title'));
+  push(meta('twitter:title'));
+  push((/<title[^>]*>([\s\S]{1,200}?)<\/title>/i.exec(html) || [])[1]);
+  push((/<h1[^>]*>([\s\S]{1,200}?)<\/h1>/i.exec(html) || [])[1]);
+  for (const key of ['name', 'filename', 'fileName', 'title']) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"([^"]{3,180})"`, 'i');
+    const m = re.exec(html);
+    if (m) push(m[1]);
+  }
+
+  /* A title is usually "<file name> | <site>" or "<file name> - <site>", so
+     take everything up to the file extension and throw the decoration away.
+     Pages that carry only a plain title ("Filester — free file host") yield
+     nothing, which is correct: there is no file name to be found there. */
+  for (const text of candidates) {
+    const match = NAME_WITH_EXT.exec(text);
+    if (!match) continue;
+    const name = match[1].replace(/^[\s"'|·•—–-]+/, '').replace(/\s+/g, ' ').trim();
+    if (name && name.length <= 160) return name;
+  }
+  return null;
+}
+
+/** Does this name look like a machine made it (uuid, hash, no words)? */
+function looksGenerated(name) {
+  const base = String(name || '').replace(/\.[a-z0-9]{2,5}$/i, '');
+  if (!base) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(base)) return true;
+  if (/^[0-9a-f]{16,}$/i.test(base)) return true;
+  if (/^[A-Za-z0-9_-]{20,}$/.test(base) && !/[aeiou]{2}/i.test(base)) return true;
+  return base.length <= 12 && /^[0-9a-z_-]+$/i.test(base) && !/\s/.test(base) && /^[0-9]/.test(base);
+}
+
+/** The name to use for a file: the page's, when the URL only offers a token. */
+function preferPageName(urlName, pageName) {
+  if (!pageName) return urlName;
+  if (!urlName) return pageName;
+  if (looksGenerated(urlName) && !looksGenerated(pageName)) return pageName;
+  return urlName;
+}
+
   function extractVideoUrls(html, baseUrl) {
     const found = [];
     const push = (raw) => {
@@ -670,9 +755,11 @@
   const FILEDITCH_HOST = new RegExp(
     `(^|\\.)(${[
       'fileditch\\.com',
+      'fileditch\\.st',
       'fileditchfiles\\.me',
       'fileditchvids\\.st',
       'theditch\\.st',
+      'theditch\\.com',
       'deltabit\\.co',
       'new\\.fileditch\\.com',
       ...fileditchHosts.map((host) => host.replace(/\./g, '\\.')),
@@ -763,7 +850,12 @@
     };
   }
 
-  /** Fetch a fileditch page and return a freshly signed download link. */
+  /**
+   * Fetch a fileditch page and return every URL that might serve the file, best
+   * first. The signed link is the intended one, but their proxies are flaky
+   * enough that the player URL itself (with its fdrh token) is worth a try
+   * before giving up and opening a browser.
+   */
   async function fileditchMint(pageUrl, wantPath) {
     const res = await fetchWithTimeout(pageUrl, {
       headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml' },
@@ -774,21 +866,49 @@
     const base = res.url || pageUrl;
     const { download, players } = fileditchLinks(html, base);
 
+    /* The signed link is the intended route; the player URL that carries the
+       same file path is the backup when their proxy misbehaves. */
+    const pathOf = (link) => {
+      const payload = signedPayload(link);
+      if (payload) return payload.path;
+      try {
+        return decodeURIComponent(new URL(link).pathname).replace(/^\/+/, '');
+      } catch {
+        return '';
+      }
+    };
     const score = (link) => {
       const payload = signedPayload(link);
       if (!wantPath) return payload ? 2 : 1;
-      return payload && payload.path.endsWith(wantPath) ? 3 : 0;
+      const path = pathOf(link);
+      if (!path.endsWith(wantPath)) return 0;
+      return payload ? 3 : 2;
     };
-    const best = [...download, ...players]
+    const ranked = [...download, ...players]
       .map((link) => ({ link, score: score(link) }))
       .filter((entry) => entry.score > 0)
-      .sort((a, b) => b.score - a.score)[0];
-    if (best) return { url: best.link, html, base };
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.link);
+    /* The page we just loaded is the player URL, token and all; it is the same
+       backend that the signed link proxies to. A share page (no file
+       extension) is not a route to the bytes, so it does not count. */
+    let baseIsFile = false;
+    try {
+      baseIsFile = VIDEO_EXT.test(new URL(base).pathname);
+    } catch {
+      /* no base */
+    }
+    if (baseIsFile && !ranked.includes(base)) ranked.push(base);
+
+    if (ranked.length) return { url: ranked[0], links: ranked, html, base };
 
     // No link at all: the page might itself be a player whose media URL is only
     // visible to a real browser.
     const viaBrowser = await pageBrowserFiles(base);
-    if (viaBrowser && viaBrowser.length) return { url: viaBrowser[0].ref.url, html, base, viaBrowser: true };
+    if (viaBrowser && viaBrowser.length) {
+      const links = viaBrowser.map((file) => file.ref.url).filter(Boolean);
+      return { url: links[0], links, html, base, viaBrowser: true };
+    }
     throw new ResolveError('fileditch did not expose a download link on that page.', 'FILEDITCH_NO_LINK');
   }
 
@@ -887,26 +1007,42 @@
       return { resolver: 'fileditch', title: meta.name, files };
     },
     /**
-     * Called at download time. A signed link lives about half an hour, which is
-     * shorter than a queue wait, so always ask the page for a fresh one.
+     * Every URL worth trying, best first, freshly minted.
+     *
+     * A signed link lives about half an hour — shorter than a queue wait — so
+     * nothing is reused from resolve time. When the page cannot be reached the
+     * stored link is still worth one attempt.
      */
-    async direct(ref) {
+    async candidates(ref) {
       const signed = signedPayload(ref.url);
       const filePath = (ref.path || (signed && signed.path) || '').replace(/^\/+/, '');
       const page = ref.page && !signedPayload(ref.page) ? ref.page : null;
-      /* Always mint a fresh link when there is a page to ask: the stored one is
-         signed and usually a few minutes from expiring. */
+      const out = [];
+
       if (page) {
         try {
           const fresh = await fileditchMint(page, filePath || null);
-          return fresh.url;
+          out.push(...fresh.links);
         } catch {
-          /* page gone: the stored link may still be alive */
+          /* page gone: fall back to what we stored */
         }
       }
-      if (ref.url && !ref.url.match(/^\/[^/]/)) return ref.url;
-      if (filePath) return (await fileditchMint(pageForPath(filePath), filePath)).url;
-      throw new ResolveError('fileditch did not give us a download link.', 'FILEDITCH_NO_LINK');
+      if (!out.length && filePath) {
+        try {
+          const fresh = await fileditchMint(pageForPath(filePath), filePath);
+          out.push(...fresh.links);
+        } catch {
+          /* nothing minted */
+        }
+      }
+      if (ref.url && /^https?:/i.test(ref.url)) out.push(ref.url);
+
+      const unique = [...new Set(out.filter(Boolean))];
+      if (!unique.length) throw new ResolveError('fileditch did not give us a download link.', 'FILEDITCH_NO_LINK');
+      return unique;
+    },
+    async direct(ref) {
+      return (await fileditch.candidates(ref))[0];
     },
   };
 
@@ -952,6 +1088,7 @@
         );
       }
 
+      const displayName = pageDisplayName(html);
       const files = urls.slice(0, 10).map((videoUrl, index) => {
         let name = 'video.mp4';
         try {
@@ -961,6 +1098,7 @@
         } catch {
           /* keep default */
         }
+        if (index === 0) name = preferPageName(name, displayName);
         return {
           id: videoUrl,
           name,
@@ -1016,6 +1154,25 @@
     // Nothing recognised the link at all: let the caller probe it before guessing.
     if (!matched && !allowPage) return null;
     throw firstError || new ResolveError('Could not find a video behind that link.', 'NO_VIDEO_FOUND');
+  }
+
+  /**
+   * Every URL that might serve this file, best first.
+   *
+   * Most resolvers have exactly one. fileditch has several because its signed
+   * links rot and its proxies are temperamental, so a download tries them in
+   * order instead of failing on the first.
+   */
+  async function directCandidates(ref) {
+    if (!ref || !ref.resolver) throw new ResolveError('Missing file reference.', 'BAD_REF');
+    const resolver = RESOLVERS.find((r) => r.id === ref.resolver);
+    if (!resolver) throw new ResolveError(`Unknown resolver ${ref.resolver}.`, 'BAD_REF');
+    if (typeof resolver.candidates === 'function') {
+      const list = await resolver.candidates(ref);
+      if (list && list.length) return [...new Set(list.map((url) => String(url).trim()).filter(Boolean))];
+    }
+    const url = await directUrl(ref);
+    return [url];
   }
 
   /** Resolve a file reference to a URL that can be downloaded right now. */
@@ -1088,7 +1245,11 @@
   return {
     resolve,
     directUrl,
+    directCandidates,
     extractVideoUrls,
+    pageDisplayName,
+    preferPageName,
+    looksGenerated,
     RESOLVERS,
     ResolveError,
     isVideo,

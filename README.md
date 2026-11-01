@@ -243,7 +243,16 @@ fly deploy
 | `ENV_FILE` | `./.env` | Where the `.env` is read from |
 | `NOTIFY_EMAIL` | `aaqwzsxedc272@gmail.com` | Where the links are mailed |
 | `AUTO_EMAIL` | on | Mails the new links when the queue drains; `0` disables |
+| `AUTO_PUBLISH` | on | Posts the links to the first working sink when the queue drains; `0` disables |
+| `PUBLISH` | auto | `gist,webhook,ntfy,repo,paste` in the order you want; `off` disables |
+| `PUBLISH_WEBHOOK` | — | JSON POST target (Discord, Slack, n8n, …) |
+| `PUBLISH_NTFY` | — | ntfy topic for a phone notification |
+| `PUBLISH_REPO` | off | `1` commits `LINKS.md` to the repo and pushes it |
+| `PUBLISH_REPO_DIR` | this repo | where `LINKS.md` is committed |
+| `PUBLISH_PASTE` | off | `1` posts the links to an anonymous paste service |
+| `NTFY_URL` / `PASTE_URL` | `ntfy.sh` / `0x0.st` | Self-hosted alternatives |
 | `BEFORE_STOP_TIMEOUT_SECONDS` | `45` | How long an auto-stop waits for the last mail to leave |
+| `HOSTING_WAIT_SECONDS` | `900` | How long the queue waits for uploads before posting/mailing the links |
 | `SIZE_PROBE_MS` | `7000` | Timeout for probing the size of files behind a link |
 
 By default loopback, `169.254.169.254` and `metadata.google.internal` are refused, so the
@@ -311,6 +320,8 @@ leave the machine on their own:
 - **The mail goes out when the queue drains** — the same moment auto-stop would take the page
   away. It lists every link hosted since the last mail with the size change
   (`508 MB → 341 MB (−33%) · on pixeldrain`), and `data/links.tsv` where the whole list lives.
+  The upload runs *behind* the encoder, so "drained" waits for it: the links are only posted and
+  mailed once they actually exist (up to `HOSTING_WAIT_SECONDS`).
 - **Before the machine stops itself**, the mail is flushed first (the stop waits up to
   `BEFORE_STOP_TIMEOUT_SECONDS`), so `Stop the machine` cannot outrun it.
 - **Email them to me** in the links panel sends the whole list on demand.
@@ -357,6 +368,47 @@ loopback by default so a public instance cannot probe its own network.
 login, envelope, base64 body) — no account needed. `npm run test:mail` proves the one-time part:
 `.env` parsing and precedence, `data/mail.json` surviving a restart with `0600` permissions and
 never handing the password back, and a running server picking up new settings without a restart.
+
+## Getting the links with no setup at all
+
+Email is the most private route but needs an app password. If all you want is *the link,
+somewhere you can read it*, there are cheaper ones. On every run — including the moment
+auto-stop is about to take the machine away — the links are pushed to the first of these that
+works, and each one needs either nothing or a single line:
+
+| Route | Setup | You read it in |
+| --- | --- | --- |
+| console banner | none | the terminal, and `data/links.tsv` — always printed, always there |
+| **GitHub gist** | none in a Codespace (`gh` is logged in) | a gist URL that never changes, updated in place |
+| **webhook** | `PUBLISH_WEBHOOK=<url>` | Discord / Slack / n8n / your own server |
+| **ntfy** | `PUBLISH_NTFY=<topic>` | a push notification on your phone, no account |
+| **LINKS.md** | `PUBLISH_REPO=1` | your repository on GitHub, from any device |
+| paste | `PUBLISH_PASTE=1` | an anonymous URL (`0x0.st`, `paste.rs`) |
+
+The floor costs nothing and needs no configuration: every finished queue prints
+
+```
+────────────────────────────────────────────────────────────────
+  2 share links ready
+  The queue is finished.
+────────────────────────────────────────────────────────────────
+  Kate Dalia - Lazy Day Off.mp4
+  https://pixeldrain.com/u/aaaaaaaaaaaa
+
+  Also on the page (/api/links), in data/links.tsv and at /api/links.txt.
+```
+
+and they are on the page and in `data/links.tsv` either way. `npm run links` prints them from a
+terminal without starting the server.
+
+`PUBLISH=gist,webhook` picks the sinks and their order; `PUBLISH=off` disables the step, as does
+`AUTO_PUBLISH=0`. `GET /api/publish` reports which sinks this machine can actually use and the
+last URL handed out; `POST /api/links/publish` does it on demand — that is the **Post them**
+button next to the links.
+
+A gist or a repo needs the token to carry the right permission; when it does not, the app says
+exactly what GitHub answered (`HTTP 403: Resource not accessible by integration`) and moves on to
+the next sink rather than pretending it published.
 
 ## When a host refuses
 
@@ -463,6 +515,10 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:ledger` — share links survive a restart, duplicates and mangled names.
 - `npm run test:notify` — a full SMTP conversation against a fake server: login, envelope,
   base64 body, the `mailto:` fallback and a refused password.
+- `npm run test:publish` — the no-setup routes: the console floor, a gist created once and
+  updated afterwards (URL stays the same), a token that cannot make gists reported honestly,
+  webhook/ntfy/paste payloads, `LINKS.md` committed and pushed to a real (throwaway) remote, and
+  `PUBLISH=off` publishing nothing. The `gh` binary is faked, so no account is needed.
 - `npm run test:mail` — the one-time mail setup: `.env` parsing and precedence, `data/mail.json`
   surviving a restart with `0600` permissions, the password never returned, and a running server
   sending a test mail the moment the form is saved.

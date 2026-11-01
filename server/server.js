@@ -18,6 +18,7 @@ const autoStop = require('./autostop');
 const ledger = require('./ledger');
 const notify = require('./notify');
 const mailsettings = require('./mailsettings');
+const publish = require('./publish');
 const { chooseCrf } = require('./estimate');
 const {
   PRESET_LIST,
@@ -422,7 +423,7 @@ async function compressJob(job) {
   // The point of the app is the link, not the local file: hand it to a host now.
   if (AUTO_HOST) {
     const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
-    if (free > outStat.size * 3) hostJob(job, { order: job.hostOrder }).catch(() => {});
+    if (free > outStat.size * 3) trackHosting(hostJob(job, { order: job.hostOrder }));
   }
 }
 
@@ -612,15 +613,55 @@ async function emailLinks({ to, force = false, reason } = {}) {
   return emailInFlight;
 }
 
+/**
+ * Get the links somewhere they can be read later, with whatever this machine
+ * already has: a gist, a webhook, a phone notification, or just the console.
+ * Always prints the banner first — that costs nothing and works everywhere.
+ */
+async function publishLinks({ reason, quiet = false } = {}) {
+  const links = await allLinks();
+  if (!links.length) return { ok: false, reason: 'nothing-to-publish' };
+  publish.banner(links, { reason });
+  return publish.publish(links, { reason, quiet });
+}
+
+/**
+ * Uploads are started, not awaited, by the encoder: the job is "done" the
+ * moment the file is compressed, and the upload runs behind it. The queue is
+ * therefore not really finished until those uploads are — otherwise the links
+ * would be mailed and posted before they exist, and the one run where nobody is
+ * watching would be the run that loses them.
+ */
+const hostingInFlight = new Set();
+function trackHosting(promise) {
+  const tracked = Promise.resolve(promise).catch(() => {});
+  hostingInFlight.add(tracked);
+  tracked.finally(() => hostingInFlight.delete(tracked));
+  return tracked;
+}
+async function waitForHosting() {
+  if (!hostingInFlight.size) return;
+  const cap = (Number(process.env.HOSTING_WAIT_SECONDS) || 900) * 1000;
+  const all = Promise.all([...hostingInFlight].map((promise) => promise.catch(() => {})));
+  await Promise.race([all, new Promise((resolve) => setTimeout(resolve, cap))]);
+}
+
 /* The queue draining is the moment the links are all final — and the moment
-   auto-stop would take the page away — so that is when the mail goes out. */
+   auto-stop would take the page away — so that is when they leave the machine. */
 const AUTO_EMAIL = process.env.AUTO_EMAIL !== '0';
+/* AUTO_PUBLISH=0 turns the gist/webhook/ntfy/paste step off; the console banner
+   and data/links.tsv are not affected. */
+const AUTO_PUBLISH = process.env.AUTO_PUBLISH !== '0';
 /* Delete the encoded file once the host has it. The link is what was asked for;
    the bytes are still on the host. KEEP_LOCAL_AFTER_UPLOAD=1 to keep them. */
 const DELETE_AFTER_UPLOAD = process.env.KEEP_LOCAL_AFTER_UPLOAD !== '1';
 autoStop.setBeforeStop(async () => {
-  if (!AUTO_EMAIL) return;
-  await emailLinks({ reason: 'This machine has finished and is about to switch itself off.' });
+  const reason = 'This machine has finished and is about to switch itself off.';
+  /* A upload may still be running; a link that has not been minted cannot be
+     mailed, so give it its time (the stop has its own timeout). */
+  await waitForHosting();
+  if (AUTO_PUBLISH) await publishLinks({ reason }).catch(() => {});
+  if (AUTO_EMAIL) await emailLinks({ reason });
 });
 
 const FRIENDLY = {
@@ -919,11 +960,18 @@ function pumpQueue() {
         finishedThisSession += 1;
         updateQueuePositions();
         pumpQueue();
-        // Nothing left to do: mail the links, then let the machine go if the
-        // user asked for that.
+        // Nothing left to do: let the uploads finish, then post and mail the
+        // links, then let the machine go if the user asked for that.
         if (!queue.length && activeCount === 0) {
-          if (AUTO_EMAIL) emailLinks({ reason: 'The queue is finished.' }).catch(() => {});
-          autoStop.schedule('queue finished');
+          (async () => {
+            await waitForHosting();
+            /* Something may have been queued while the upload ran. */
+            if (queue.length || activeCount) return;
+            const reason = 'The queue is finished.';
+            if (AUTO_PUBLISH) await publishLinks({ reason }).catch(() => {});
+            if (AUTO_EMAIL) await emailLinks({ reason }).catch(() => {});
+            autoStop.schedule('queue finished');
+          })().catch(() => {});
         }
       });
   }
@@ -1028,6 +1076,7 @@ app.get('/api/health', async (req, res) => {
     hosters: hosters.describeProviders(),
     autoHost: AUTO_HOST,
     email: notify.describe(),
+    publish: await publish.describe(),
     browserHosters: ['gofile', 'pixeldrain'],
   });
 });
@@ -1941,6 +1990,24 @@ app.post('/api/email/test', async (req, res) => {
   } catch (err) {
     res.status(502).json({ ok: false, error: err.message });
   }
+});
+
+/* ------------------------------------------------- where the links go (cheap) */
+/* No SMTP needed: a gist, a webhook, a phone notification, or a paste. */
+
+app.get('/api/publish', async (req, res) => {
+  res.json({ publish: await publish.describe() });
+});
+
+app.post('/api/links/publish', async (req, res) => {
+  const result = await publishLinks({ reason: 'Posted from the app.' });
+  if (result.ok) return res.json({ ok: true, ...result });
+  const code = result.reason === 'nothing-to-publish' ? 200 : 502;
+  return res.status(code).json({ ok: false, ...result, publish: await publish.describe() });
+});
+
+app.get('/api/publish/settings', async (req, res) => {
+  res.json({ publish: await publish.describe() });
 });
 
 app.get('/api/links.txt', async (req, res) => {

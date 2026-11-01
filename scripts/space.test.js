@@ -25,6 +25,7 @@ const os = require('node:os');
 
 const PORT = 3191;
 const HOSTER_PORT = 3192;
+const HOOK_PORT = 3193; // stands in for a webhook the links are posted to
 const ROOT = path.join(__dirname, '..');
 const DATA_DIR = path.join(os.tmpdir(), `squeeze-space-${Date.now()}`);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -66,6 +67,21 @@ async function waitForStatus(id, statuses, timeoutMs = 180000) {
   throw new Error(`job ${id} timed out in state ${last && last.status}`);
 }
 
+/** A stand-in for a webhook (Discord, n8n, …): records what it was sent. */
+function fakeHook() {
+  const hits = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      hits.push(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  return { server, hits };
+}
+
 /** A stand-in for pixeldrain that accepts the upload and hands back an id. */
 function fakeHoster() {
   const uploads = new Map();
@@ -101,6 +117,7 @@ async function startApp(extraEnv = {}) {
       PIXELDRAIN_API_BASE: `http://127.0.0.1:${HOSTER_PORT}`,
       AUTO_HOST: '1',
       AUTO_EMAIL: '0',
+      PUBLISH_WEBHOOK: `http://127.0.0.1:${HOOK_PORT}/hook`,
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -144,7 +161,9 @@ async function jobFiles(jobId) {
 async function main() {
   await fs.rm(DATA_DIR, { recursive: true, force: true });
   const hoster = fakeHoster();
+  const hook = fakeHook();
   await new Promise((resolve) => hoster.server.listen(HOSTER_PORT, '127.0.0.1', resolve));
+  await new Promise((resolve) => hook.server.listen(HOOK_PORT, '127.0.0.1', resolve));
 
   let app = null;
   try {
@@ -175,6 +194,22 @@ async function main() {
 
     const download = await fetch(`${BASE}/api/jobs/${job.id}/download`);
     check('the download route answers 410/404, not a broken file', [404, 410].includes(download.status), String(download.status));
+
+    /* The upload runs behind the encoder, so the queue "drains" before the link
+       exists. The links must still be posted — and posted only once there is a
+       real URL in them. */
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline && !hook.hits.some((hit) => hit.includes(view.hostedUrl))) {
+      await sleep(500);
+    }
+    const posted = hook.hits.find((hit) => hit.includes(view.hostedUrl));
+    check('the link is posted automatically once the upload finishes', Boolean(posted));
+    if (posted) {
+      const payload = JSON.parse(posted);
+      check('the post happens after the link exists', !/undefined|null\/u\//.test(payload.text), payload.text.slice(0, 80));
+      check('and names the reason', /queue is finished/.test(payload.text));
+    }
+    check('nothing was posted before there was a link', hook.hits.length === 1, `${hook.hits.length} post(s)`);
 
     const links = await (await fetch(`${BASE}/api/links`)).json();
     check(
@@ -212,6 +247,7 @@ async function main() {
   } finally {
     await stopApp(app);
     hoster.server.close();
+    hook.server.close();
     await fs.rm(DATA_DIR, { recursive: true, force: true }).catch(() => {});
   }
 

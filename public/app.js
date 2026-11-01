@@ -175,7 +175,10 @@ function cardFor(id, job = {}) {
 function updateCard(entry, job) {
   const previous = entry.data || {};
   entry.data = job;
-  if (job.status === 'hosted' && previous.status !== 'hosted') scheduleResultsRefresh();
+  if (job.status === 'hosted' && previous.status !== 'hosted') {
+    scheduleResultsRefresh();
+    loadPublishInfo();
+  }
   const el = entry.el;
   const name = job.name || (job.url ? basename(job.url) : 'Video');
   $('[data-field="name"]', el).textContent = name;
@@ -1820,6 +1823,112 @@ async function emailLinks() {
   }
 }
 
+/* -------------------------------------------------- posting the links */
+
+/**
+ * Where the links go without email: a gist, a webhook, an ntfy topic or a
+ * paste. The button only appears when the server found a sink that works, so it
+ * never offers something that cannot succeed.
+ */
+function renderPublish(info) {
+  const note = $('#publishNote');
+  const button = $('#publishLinks');
+  if (!note || !button) return;
+  const ready = (info?.sinks || []).filter((sink) => sink.ready && sink.inChain);
+  const last = info?.last;
+
+  if (!ready.length) {
+    button.hidden = true;
+    if (last?.url) {
+      note.hidden = false;
+      note.textContent = '';
+      const label = document.createElement('span');
+      label.textContent = 'Last posted to ';
+      const anchor = document.createElement('a');
+      anchor.href = last.url;
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.textContent = last.url;
+      note.append(label, anchor);
+    } else {
+      note.hidden = true;
+    }
+    return;
+  }
+
+  button.hidden = false;
+  button.title = `Posts every saved link to ${ready.map((sink) => sink.label).join(' or ')}`;
+  note.hidden = false;
+  note.textContent = '';
+  if (last?.url) {
+    const label = document.createElement('span');
+    label.textContent = 'Already posted to ';
+    const anchor = document.createElement('a');
+    anchor.href = last.url;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    anchor.textContent = last.url;
+    note.append(label, anchor);
+  } else {
+    note.textContent = `Ready to post them to ${ready.map((sink) => sink.label).join(' or ')} on every run.`;
+  }
+}
+
+async function loadPublishInfo() {
+  try {
+    const { publish: info } = await api('/api/publish');
+    state.publish = info;
+    renderPublish(info);
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+async function postLinks() {
+  const button = $('#publishLinks');
+  if (!button || button.disabled) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Posting…';
+  try {
+    const result = await api('/api/links/publish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (result.ok) {
+      button.textContent = 'Posted';
+      showAlert(
+        result.url ? `The links are at ${result.url}` : `The links went out via ${result.label}.`,
+        'ok',
+        { timeout: 8000, href: result.url || null, hrefLabel: result.url ? 'Open them' : undefined },
+      );
+      await loadPublishInfo();
+    } else if (result.reason === 'nothing-to-publish') {
+      button.textContent = 'Nothing yet';
+      showAlert('There are no saved links to post yet.', 'ok', { timeout: 5000 });
+    } else {
+      throw new Error(
+        (result.tried || []).map((entry) => entry.error || entry.skipped).filter(Boolean).join(' · ') ||
+          'No place to post the links was available.',
+      );
+    }
+  } catch (err) {
+    showAlert(err.message, 'error');
+    button.textContent = original;
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      if (button.textContent !== original) {
+        setTimeout(() => {
+          button.textContent = original;
+        }, 3000);
+      }
+    }, 0);
+  }
+}
+
 /* ------------------------------------------------------------ mail setup */
 
 /** Paint what the server says about mail into the panel and the results note. */
@@ -1974,6 +2083,7 @@ async function boot() {
   }
 
   $('#emailLinks')?.addEventListener('click', emailLinks);
+  $('#publishLinks')?.addEventListener('click', postLinks);
 
   const mailForm = $('#mailForm');
   mailForm?.addEventListener('submit', async (event) => {
@@ -2056,6 +2166,7 @@ async function boot() {
   await refreshStatus();
   await loadMailSettings();
   await loadResults();
+  await loadPublishInfo();
   setInterval(refreshStatus, Number(localStorage.getItem('squeeze.statusMs')) || 15000);
   setInterval(loadResults, 30000);
 

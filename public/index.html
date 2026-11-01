@@ -132,6 +132,7 @@
       <h2 class="results-title">Your links</h2>
       <div class="results-tools">
         <button class="ghost" id="copyAllLinks" type="button">Copy all links</button>
+        <button class="ghost" id="publishLinks" type="button" hidden>Post them</button>
         <button class="ghost" id="emailLinks" type="button">Email them to me</button>
         <button class="ghost" id="saveLinks" type="button">Save links file</button>
         <button class="ghost" id="toggleResults" type="button">Hide</button>
@@ -143,6 +144,7 @@
     <p class="results-hint results-sub" id="linksNote">
       They are also in <a href="/api/links.txt" target="_blank" rel="noopener">links.txt</a> — plain text, one link per line.
     </p>
+    <p class="results-hint results-sub" id="publishNote" hidden></p>
     <p class="results-hint results-sub" id="emailNote" hidden>
       Mail is not set up on this server yet — the button opens your own mail app with the links already in it.
     </p>

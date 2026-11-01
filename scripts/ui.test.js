@@ -71,6 +71,8 @@ async function boot({
   email = { ok: true, sent: true, count: 1, to: 'aaqwzsxedc272@gmail.com' },
   resolved = null,
   mailSettings = { configured: false, to: 'aaqwzsxedc272@gmail.com', port: 587, hasPassword: false, source: 'none' },
+  publishInfo = { chain: [], disabled: true, sinks: [], last: null },
+  publishResult = { ok: true, sink: 'gist', label: 'GitHub gist', url: 'https://gist.github.com/x/deadbeef', count: 1 },
 } = {}) {
   const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
   const dom = new JSDOM(html, {
@@ -101,6 +103,8 @@ async function boot({
           }
         : { settings: mailSettings };
     } else if (target.includes('/api/email/test')) body = { ok: true, to: 'aaqwzsxedc272@gmail.com' };
+    else if (target.includes('/api/links/publish')) body = publishResult;
+    else if (target.includes('/api/publish')) body = { publish: publishInfo };
     else if (target.includes('/api/links')) body = links;
     else if (target.includes('/api/resolve') && resolved) body = resolved;
     else if (target.includes('/api/jobs') && init.method === 'POST') body = { job: { id: 'job1', status: 'queued' } };
@@ -283,6 +287,38 @@ async function boot({
     }
     if (!doc.getElementById('emailNote').hidden) throw new Error('the fallback note is still showing');
     if (doc.getElementById('mailPass').value !== '') throw new Error('the password is left in the field');
+  });
+
+  console.log('posting the links without email');
+
+  await test('with no sink available the post button stays hidden', async () => {
+    const sixth = await boot({ links: LINKS, publishInfo: { chain: [], disabled: true, sinks: [], last: null } });
+    if (!sixth.doc.getElementById('publishLinks').hidden) throw new Error('offered a button that cannot work');
+  });
+
+  await test('a ready sink is offered and posting reports the URL', async () => {
+    const seventh = await boot({
+      links: LINKS,
+      publishInfo: {
+        chain: ['gist'],
+        disabled: false,
+        sinks: [{ id: 'gist', label: 'GitHub gist', ready: true, detail: 'gh is logged in', inChain: true }],
+        last: null,
+      },
+      publishResult: { ok: true, sink: 'gist', label: 'GitHub gist', url: 'https://gist.github.com/aaq/deadbeef', count: 1 },
+    });
+    const doc = seventh.doc;
+    const button = doc.getElementById('publishLinks');
+    if (button.hidden) throw new Error('a working sink is not offered');
+    if (!/GitHub gist/.test(doc.getElementById('publishNote').textContent)) {
+      throw new Error(`note says "${doc.getElementById('publishNote').textContent}"`);
+    }
+    button.dispatchEvent(new seventh.window.Event('click'));
+    await new Promise((resolve) => seventh.window.setTimeout(resolve, 80));
+    const post = seventh.calls.find((call) => call.url.endsWith('/api/links/publish'));
+    if (!post || post.init.method !== 'POST') throw new Error('nothing was posted');
+    const alert = doc.getElementById('alert');
+    if (!/gist\.github\.com/.test(alert.textContent)) throw new Error(`alert says "${alert.textContent}"`);
   });
 
   console.log('');

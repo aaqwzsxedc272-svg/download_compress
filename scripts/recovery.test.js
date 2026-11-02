@@ -27,6 +27,7 @@ const ROOT = path.join(__dirname, '..');
 const PORT = 3225;
 const HOSTER_PORT = 3226;
 const SOURCE_PORT = 3227;
+const FAST_PORT = 3229;
 const HOOK_PORT = 3228; // stands in for the Discord webhook the links go to
 const BASE = `http://127.0.0.1:${PORT}`;
 const DATA_DIR = path.join(os.tmpdir(), `squeeze-recovery-${Date.now()}`);
@@ -51,10 +52,11 @@ async function waitFor(predicate, { timeoutMs = 180000, intervalMs = 250 } = {})
   return null;
 }
 
-function startServer() {
+function startServer(extraEnv = {}) {
   const proc = spawn(process.execPath, [path.join(ROOT, 'server', 'server.js')], {
     env: {
       ...process.env,
+      ...extraEnv,
       PORT: String(PORT),
       DATA_DIR,
       MAX_CONCURRENT: '1',
@@ -93,16 +95,30 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
 
 /* A source host that hands the file out slowly, so there is a real window in
    which to stop the machine — exactly what a big file on a slow host does. */
-function slowSource(file) {
+function slowSource(file, { delayMs = 120 } = {}) {
   /* Every request is recorded, with a Range header when the app resumes: that
      is the evidence that the file was not downloaded twice. */
   const requests = [];
+  let bytesServed = 0;
   const server = http.createServer(async (req, res) => {
-    if (!req.url.startsWith('/slow.mp4')) return res.writeHead(404).end();
+    /* /slow.mp4 trickles, /fast.mp4 does not: the same server stands in for a
+       slow host and a quick one. */
+    if (!/^\/(slow|fast)\.mp4/.test(req.url)) return res.writeHead(404).end();
     try {
       const size = (await fsp.stat(file)).size;
       const range = req.headers.range || null;
-      requests.push({ range, at: Date.now() });
+      requests.push({ method: req.method, range, at: Date.now() });
+      /* A real host answers HEAD with headers and no body; streaming the file
+         on a HEAD would make the app look like it downloaded it twice. */
+      if (req.method === 'HEAD') {
+        res.writeHead(200, {
+          'content-type': 'video/mp4',
+          'content-length': String(size),
+          'accept-ranges': 'bytes',
+          'content-disposition': 'attachment; filename="Slow Download.mp4"',
+        });
+        return res.end();
+      }
       let start = 0;
       const status = range ? 206 : 200;
       if (range) {
@@ -126,8 +142,9 @@ function slowSource(file) {
       const stream = fs.createReadStream(file, { start, highWaterMark: 256 * 1024 });
       for await (const chunk of stream) {
         if (res.destroyed) return;
+        bytesServed += chunk.length;
         res.write(chunk);
-        await sleep(120);
+        if (delayMs) await sleep(delayMs);
       }
       res.end();
     } catch (err) {
@@ -137,6 +154,7 @@ function slowSource(file) {
     }
   });
   server.requests = requests;
+  server.bytes = () => bytesServed;
   return server;
 }
 
@@ -202,6 +220,11 @@ function slowSource(file) {
     });
     check('it is really downloading', Boolean(midway), midway ? `${Math.round(midway.progress * 100)}%` : 'never started');
 
+    /* The file is still arriving, so there is nothing complete to hand over:
+       a truncated MP4 must never be offered as the download. */
+    const early = await fetch(`${BASE}/api/jobs/${downloading}/original/slow.mp4`);
+    check('a half-downloaded file is not handed out as if it were whole', early.status === 409, String(early.status));
+
     // The machine stops in the middle of the download.
     server.kill('SIGKILL');
     await sleep(600);
@@ -221,6 +244,22 @@ function slowSource(file) {
       ['fetching', 'queued', 'compressing', 'done', 'hosted'].includes(after?.status),
       after?.status,
     );
+
+    /* What the user actually does after a crash: pastes the same link again.
+       That must continue this job — not download and encode the file twice. */
+    const repeat = await (
+      await fetch(`${BASE}/api/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: sourceUrl, presetId: 'small', source: 'url' }),
+      })
+    ).json();
+    check(
+      'the same link sent again continues the job that is already going',
+      repeat.job?.id === downloading,
+      `${repeat.job?.id} vs ${downloading}`,
+    );
+    check('and says so instead of pretending it started something new', Boolean(repeat.reused), repeat.reused || 'no field');
 
     const finishedDownload = await waitFor(async () => {
       const job = await getJob(downloading);
@@ -297,6 +336,22 @@ function slowSource(file) {
       return job && job.status === 'compressing' ? job : null;
     });
     check('it reaches the encoder', Boolean(treating), treating?.stage || 'never started');
+
+    /* "Just download it" is only useful if the bytes are actually there to
+       send: this is the route the page points the browser at. */
+    const originalNow = await fetch(`${BASE}/api/jobs/${running.id}/original/clip.mp4`);
+    const originalLength = originalNow.ok ? Buffer.from(await originalNow.arrayBuffer()).length : 0;
+    check('the untouched download can be fetched while it is being encoded', originalNow.ok, `${originalNow.status}`);
+    check(
+      'and it is the whole file, byte for byte',
+      originalLength > 0 && originalLength === treating.sourceBytes,
+      `${originalLength} vs ${treating.sourceBytes}`,
+    );
+    check(
+      'it arrives as a download with its own name',
+      /attachment/.test(originalNow.headers.get('content-disposition') || ''),
+      originalNow.headers.get('content-disposition') || 'no header',
+    );
 
     const switched = await fetch(`${BASE}/api/jobs/${running.id}/keep-original`, { method: 'POST' });
     const switchedBody = await switched.json().catch(() => ({}));
@@ -393,6 +448,89 @@ function slowSource(file) {
       Boolean(postedEarly),
       `${hookHits.length} post(s)`,
     );
+
+    /* ---------------------------------------------------------------- 4 */
+    /* The story as it was reported: a long encode, the machine stops, the user
+       comes back two hours later and pastes the same link again. That must
+       continue the job — not download the file again and start encoding at 0%.
+
+       RESUME_INTERRUPTED=0 is deliberate: automatic pickup is switched off, so
+       only the re-sent link can restart the work. */
+    server.kill('SIGKILL');
+    await sleep(600);
+    const segmented = { SEGMENT_SECONDS: '2', SEGMENT_MIN_SECONDS: '1', RESUME_INTERRUPTED: '0' };
+    server = startServer(segmented);
+    await ready();
+
+    const fast = slowSource(sample, { delayMs: 0 });
+    await new Promise((resolve) => fast.listen(FAST_PORT, '127.0.0.1', resolve));
+    const fastUrl = `http://127.0.0.1:${FAST_PORT}/fast.mp4`;
+    const post = async () =>
+      (
+        await fetch(`${BASE}/api/jobs`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ url: fastUrl, presetId: 'small', source: 'url' }),
+        })
+      ).json();
+
+    const begun = await post();
+    const longJob = begun.job?.id;
+    check('a long encode starts', Boolean(longJob), begun.error || '');
+    const parts = await waitFor(
+      async () => {
+        const state = JSON.parse(
+          await fsp.readFile(path.join(DATA_DIR, 'jobs', longJob, 'segments.json'), 'utf8').catch(() => '{}'),
+        );
+        return state.done && state.done.length >= 2 ? state : null;
+      },
+      { timeoutMs: 240000 },
+    );
+    check('it is really encoding in parts', Boolean(parts), parts ? `${parts.done.length}/${parts.total}` : 'never started');
+
+    const servedBefore = fast.bytes();
+    server.kill('SIGKILL');
+    await sleep(700);
+
+    /* Nothing is picked up on its own here — the user has to ask again. */
+    server = startServer(segmented);
+    await ready();
+    const dropped = await getJob(longJob);
+    check('after the crash the job is waiting, not finished', dropped?.status === 'error', dropped?.status);
+    check('and nothing restarted it by itself', dropped?.resumed !== true, String(dropped?.resumed));
+
+    const replay = await post();
+    check('pasting the same link again continues that job', replay.job?.id === longJob, `${replay.job?.id} vs ${longJob}`);
+    check('and it is called a resume, not a new run', replay.reused === 'resumed', replay.reused || 'no field');
+
+    const picked = await waitFor(
+      async () => {
+        const current = await getJob(longJob);
+        return current && current.resumeFrom !== null && current.resumeFrom > 0 ? current : null;
+      },
+      { timeoutMs: 60000 },
+    );
+    check(
+      'the parts encoded before the crash are used again',
+      Boolean(picked),
+      picked ? `${Math.round(picked.resumeFrom * 100)}% already encoded` : 'started from zero',
+    );
+    check(
+      'the file is not downloaded a second time',
+      fast.bytes() - servedBefore < 64 * 1024,
+      `${Math.round((fast.bytes() - servedBefore) / 1024)} KB after the restart`,
+    );
+
+    const longDone = await waitFor(
+      async () => {
+        const current = await getJob(longJob);
+        return current && ['done', 'hosted', 'error'].includes(current.status) ? current : null;
+      },
+      { timeoutMs: 300000 },
+    );
+    check('and it finishes', ['done', 'hosted'].includes(longDone?.status), longDone?.error || longDone?.status);
+    fast.close();
+
   } finally {
     if (server) server.kill('SIGKILL');
     if (source) source.close();

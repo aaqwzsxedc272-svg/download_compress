@@ -1626,6 +1626,104 @@ const ALLOWED_REF_RESOLVERS = new Set([
  * Create a job.
  * body: { source: 'url'|'ref'|'upload'|'sample', url?, ref?, name?, presetId?, targetMb? }
  */
+/* ------------------------------------------------------- one job per video */
+
+/* A job this server is actively working on: pasting the same link again must
+   attach to it, not start a second copy of the same download. */
+const ACTIVE_STATUSES = new Set(['queued', 'fetching', 'uploading', 'awaiting-upload', 'compressing', 'hosting']);
+
+/**
+ * A stable identity for "the same video".
+ *
+ * A signed fileditch link is a new URL every half hour, so the URL cannot be
+ * the identity — the path behind it can. Everything else falls back to the
+ * normalised link (a direct file, or the page the file was picked from).
+ */
+function reuseKey({ url, ref, name }) {
+  const filePath = ref && typeof ref.path === 'string' ? ref.path.trim().replace(/^\/+/, '') : '';
+  if (filePath) return `path:${filePath}`;
+  /* A folder page can hold several videos, so the page alone is not the file:
+     the name the picker offered is. Two files from one gofile folder must not
+     be mistaken for each other. */
+  const page = jobUrl(url);
+  if (page) return `page:${page}|${String(name || '').toLowerCase()}`;
+  if (ref && ref.url) return `file:${ref.url}`;
+  return null;
+}
+
+function jobUrl(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(String(value));
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * The unfinished job for this video, if there is one.
+ *
+ * The two failures this prevents are the ones a crash actually causes: the same
+ * link pasted twice runs two encoders over one file, and the same link pasted
+ * after a restart throws away gigabytes that were already on disk.
+ */
+function findReusable({ url, ref, name, presetId, targetMb, noCompress }) {
+  const key = reuseKey({ url, ref, name });
+  if (!key) return null;
+  for (const job of jobsStore.listJobs()) {
+    if (!job || !job.dir) continue;
+    /* A finished job is a result, not work: asking for the same video again
+       with the same settings is a legitimate new request. */
+    if (['done', 'hosted'].includes(job.status)) continue;
+    if (String(job.presetId || 'balanced') !== presetId) continue;
+    if ((Number(job.targetMb) || null) !== (targetMb || null)) continue;
+    if (Boolean(job.noCompress) !== Boolean(noCompress)) continue;
+    if (reuseKey({ url: job.url, ref: job.ref, name: job.name }) !== key) continue;
+    return job;
+  }
+  return null;
+}
+
+/**
+ * Take an old job over rather than starting from zero.
+ *
+ * Returns 'running' when the job never stopped, 'resumed' when it was picked up
+ * again, and null when there is nothing worth keeping on disk (a link that
+ * failed before a single byte arrived).
+ */
+async function adoptJob(job, ref) {
+  if (ACTIVE_STATUSES.has(job.status)) return 'running';
+
+  const paths = jobsStore.jobPaths(job);
+  const bytes = fs.existsSync(paths.source) ? fs.statSync(paths.source).size : 0;
+  const parts = await segments.read(job.dir).catch(() => null);
+  const keptParts = parts && Array.isArray(parts.done) ? parts.done.length : 0;
+  if (!bytes && !keptParts) return null;
+
+  jobsStore.updateJob(job, {
+    status: 'queued',
+    stage: bytes
+      ? 'Picking up the earlier run — the download is still on disk'
+      : `Picking up the earlier run — ${keptParts} part(s) already encoded`,
+    progress: 0,
+    error: null,
+    interrupted: false,
+    resumed: true,
+  });
+  job.resumed = true;
+  console.log(
+    `[job ${job.id}] the same link was sent again — continuing it ` +
+      `(${bytes ? `${formatSize(bytes)} downloaded` : 'no source yet'}, ${keptParts} part(s) kept)`,
+  );
+  /* fetchThenCompress skips the transfer when the whole file is already here,
+     resumes it from the fragment when it is not, and hands over to the encoder
+     — which reuses the parts that were finished. */
+  fetchThenCompress(job, ref || job.ref);
+  return 'resumed';
+}
+
 app.post('/api/jobs', async (req, res) => {
   const body = req.body || {};
   const source = body.source || 'url';
@@ -1641,9 +1739,22 @@ app.post('/api/jobs', async (req, res) => {
     if (!ref || typeof ref !== 'object' || !ALLOWED_REF_RESOLVERS.has(String(ref.resolver))) {
       return fail(res, 400, 'BAD_REF', 'That file reference is not valid.');
     }
+    const pageUrl = body.pageUrl ? String(body.pageUrl) : null;
+    const revisit = findReusable({
+      url: pageUrl,
+      ref,
+      name: body.name || ref.name,
+      presetId,
+      targetMb,
+      noCompress,
+    });
+    if (revisit) {
+      const how = await adoptJob(revisit, ref);
+      if (how) return res.status(200).json({ job: jobsStore.publicView(revisit), reused: how });
+    }
     const job = jobsStore.createJob({
       source: 'link',
-      url: body.pageUrl ? String(body.pageUrl) : null,
+      url: pageUrl,
       presetId,
       targetMb,
       noCompress,
@@ -1805,6 +1916,22 @@ app.post('/api/jobs', async (req, res) => {
 
   const file = resolved.files.find((f) => f.kind === 'video') || resolved.files[0];
   if (!file) return fail(res, 422, 'NO_VIDEO_FOUND', 'No video was found behind that link.');
+
+  /* The same link, sent again — after a crash, or from a second tab. Continue
+     the job that is already holding this video instead of downloading and
+     encoding it a second time. */
+  const revisit = findReusable({
+    url,
+    ref: file.ref,
+    name: body.name || file.name,
+    presetId,
+    targetMb,
+    noCompress,
+  });
+  if (revisit) {
+    const how = await adoptJob(revisit, file.ref);
+    if (how) return res.status(200).json({ job: jobsStore.publicView(revisit), reused: how });
+  }
 
   const job = jobsStore.createJob({
     source: 'url',
@@ -2208,6 +2335,25 @@ const CONTENT_TYPES = {
 };
 const contentTypeFor = (name) => CONTENT_TYPES[path.extname(String(name)).toLowerCase()] || 'video/mp4';
 
+/**
+ * A Content-Disposition that survives a real file name.
+ *
+ * `filename` is the plain ASCII fallback; `filename*` carries the UTF-8 name, so
+ * "Vidéo d'été.mp4" arrives with its accents instead of turning into an
+ * underscore soup — and a quote or a newline in a name cannot break the header.
+ */
+const rfc5987 = (value) =>
+  encodeURIComponent(String(value)).replace(
+    /['()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+
+function dispositionFor(kind, name) {
+  const clean = String(name || 'video.mp4').replace(/[\r\n]/g, ' ');
+  const fallback = clean.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return `${kind}; filename="${fallback}"; filename*=UTF-8''${rfc5987(clean)}`;
+}
+
 function serveOutput(req, res, disposition) {
   const job = jobsStore.getJob(req.params.id);
   if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
@@ -2235,7 +2381,7 @@ function serveOutput(req, res, disposition) {
         'Content-Type': /\.[a-z0-9]+$/i.test(job.outputName || '')
           ? contentTypeFor(job.outputName)
           : 'video/mp4',
-        'Content-Disposition': `${disposition}; filename="${job.outputName}"`,
+        'Content-Disposition': dispositionFor(disposition, job.outputName || job.name),
       },
     },
     (err) => {
@@ -2499,6 +2645,48 @@ app.get('/api/results.txt', (req, res) => {
    is what the browser shows. The bare form still works for old links. */
 app.get('/api/jobs/:id/preview/:name?', (req, res) => serveOutput(req, res, 'inline'));
 app.get('/api/jobs/:id/download/:name?', (req, res) => serveOutput(req, res, 'attachment'));
+
+/**
+ * The untouched download, handed straight to the browser.
+ *
+ * "Just download it" used to only *decide* not to encode: the file then had to
+ * finish downloading and be copied, and the user had to find a second button.
+ * This is the bytes that are already on this machine, sent as they are — which
+ * is all that was ever asked for.
+ */
+app.get('/api/jobs/:id/original/:name?', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  const { source } = jobsStore.jobPaths(job);
+  const name = job.name || 'original.mp4';
+  if (!fs.existsSync(source)) {
+    return fail(res, 409, 'ORIGINAL_NOT_READY', 'Nothing has been downloaded for this file yet.');
+  }
+  if (!jobsStore.publicView(job).originalReady) {
+    const total = Number(job.downloadTotal) || 0;
+    const got = fs.statSync(source).size;
+    return fail(
+      res,
+      409,
+      'ORIGINAL_NOT_READY',
+      total
+        ? `Still downloading — ${formatSize(got)} of ${formatSize(total)} so far. It starts saving on its own when it is complete.`
+        : 'Still downloading — it starts saving on its own when it is complete.',
+    );
+  }
+  res.sendFile(
+    source,
+    {
+      headers: {
+        'Content-Type': contentTypeFor(name),
+        'Content-Disposition': dispositionFor('attachment', name),
+      },
+    },
+    (err) => {
+      if (err && !res.headersSent) fail(res, 500, 'SEND_FAILED', 'Could not send the file.');
+    },
+  );
+});
 
 /**
  * "Just download it" for a file that is already here or on its way.

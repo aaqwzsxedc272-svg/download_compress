@@ -79,6 +79,8 @@ async function boot({
     settings: { hasWebhook: false, webhook: null, ntfy: null, paste: false, repo: false, saved: false },
   },
   publishResult = { ok: true, sink: 'gist', label: 'GitHub gist', url: 'https://gist.github.com/x/deadbeef', count: 1 },
+  /* What the server answers to "just download it" — a view of the same job. */
+  keepOriginal = { job: { id: 'job1', status: 'queued' } },
 } = {}) {
   const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
   const dom = new JSDOM(html, {
@@ -129,6 +131,7 @@ async function boot({
     else if (target.includes('/api/publish')) body = { publish: { ...publishInfo, settings: liveSettings } };
     else if (target.includes('/api/links')) body = links;
     else if (target.includes('/api/resolve') && resolved) body = resolved;
+    else if (target.includes('/keep-original')) body = keepOriginal;
     else if (target.includes('/api/jobs') && init.method === 'POST') body = { job: { id: 'job1', status: 'queued' } };
     else if (target.includes('/api/jobs')) body = { jobs: [] };
     return {
@@ -524,6 +527,146 @@ async function boot({
     if (!/being picked up/.test(note.textContent)) throw new Error(`note says "${note.textContent}"`);
     window.__app.renderRecovery({ resumedSinceStart: 0, interruptedNow: 0 });
     if (!note.hidden) throw new Error('the note stays after a clean start');
+  });
+
+  console.log('a finished file can actually be taken home');
+
+  await test('a hosted file still offers its download, not only "Details"', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    window.EventSource = class { close() {} };
+    window.__app.trackJob({
+      id: 'jobHosted',
+      status: 'hosted',
+      progress: 1,
+      name: 'Holiday.mp4',
+      source: 'url',
+      hasFile: true,
+      hostedUrl: 'https://pixeldrain.com/u/abc123',
+      hostProvider: 'pixeldrain',
+    });
+    const card = doc.querySelector('[data-job-id="jobHosted"]');
+    const links = [...card.querySelectorAll('.job-actions a')];
+    const download = links.find((item) => /Download$/.test(item.textContent.trim()));
+    if (!download) throw new Error(`no download on a hosted card: ${links.map((l) => l.textContent).join(', ')}`);
+    if (!/\/api\/jobs\/jobHosted\/download/.test(download.getAttribute('href'))) {
+      throw new Error(`download points at ${download.getAttribute('href')}`);
+    }
+    if (!links.some((item) => item.textContent === 'Details')) throw new Error('no way to the share link');
+  });
+
+  await test('a deleted local copy points at the host instead of a dead button', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    window.EventSource = class { close() {} };
+    window.__app.trackJob({
+      id: 'jobGone',
+      status: 'hosted',
+      progress: 1,
+      name: 'Holiday.mp4',
+      source: 'url',
+      hasFile: false,
+      localDeleted: true,
+      hostedUrl: 'https://pixeldrain.com/u/abc123',
+      hostProvider: 'pixeldrain',
+    });
+    const card = doc.querySelector('[data-job-id="jobGone"]');
+    const links = [...card.querySelectorAll('.job-actions a')];
+    if (links.some((item) => /\/api\/jobs\/jobGone\/download/.test(item.getAttribute('href') || ''))) {
+      throw new Error('a button that answers 410 was left on the card');
+    }
+    const remote = links.find((item) => /Download from pixeldrain/.test(item.textContent));
+    if (!remote) throw new Error(`no link to the uploaded copy: ${links.map((l) => l.textContent).join(', ')}`);
+    if (remote.getAttribute('href') !== 'https://pixeldrain.com/u/abc123') {
+      throw new Error(`points at ${remote.getAttribute('href')}`);
+    }
+  });
+
+  console.log('the file itself, not just the decision');
+
+  await test('"just download it" starts saving the file immediately when it is whole', async () => {
+    const app = await boot({
+      keepOriginal: {
+        job: { id: 'jobWhole', status: 'compressing', name: 'Holiday.mp4', originalReady: true, originalName: 'Holiday.mp4' },
+      },
+    });
+    const { window, doc } = app;
+    window.EventSource = class { close() {} };
+    window.__app.trackJob({
+      id: 'jobWhole',
+      status: 'compressing',
+      progress: 0.2,
+      name: 'Holiday.mp4',
+      source: 'url',
+      hasFile: false,
+      originalReady: false,
+    });
+    const card = doc.querySelector('[data-job-id="jobWhole"]');
+    const button = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Just download it');
+    if (!button) throw new Error('no \u201cJust download it\u201d button');
+
+    /* The browser's own download is an anchor click; record it instead of
+       letting jsdom try to navigate. */
+    const saved = [];
+    const realClick = window.HTMLAnchorElement.prototype.click;
+    window.HTMLAnchorElement.prototype.click = function record() {
+      saved.push(this.getAttribute('href'));
+    };
+    try {
+      button.dispatchEvent(new window.Event('click'));
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+    } finally {
+      window.HTMLAnchorElement.prototype.click = realClick;
+    }
+    if (!saved.length) throw new Error('pressing it saved nothing \u2014 the file has to arrive, not just the promise of it');
+    if (!/\/api\/jobs\/jobWhole\/original\/Holiday\.mp4$/.test(saved[0])) throw new Error(`saved from ${saved[0]}`);
+  });
+
+  await test('a file that is still downloading starts saving on its own when it lands', async () => {
+    const app = await boot({
+      keepOriginal: {
+        job: { id: 'jobLate', status: 'fetching', name: 'Big.mkv', originalReady: false, originalBytes: 12 * 1024 ** 2 },
+      },
+    });
+    const { window, doc } = app;
+    window.EventSource = class { close() {} };
+    window.__app.trackJob({
+      id: 'jobLate',
+      status: 'fetching',
+      progress: 0.4,
+      name: 'Big.mkv',
+      source: 'url',
+      hasFile: false,
+      originalReady: false,
+    });
+    const card = doc.querySelector('[data-job-id="jobLate"]');
+    const button = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Just download it');
+    const saved = [];
+    const realClick = window.HTMLAnchorElement.prototype.click;
+    window.HTMLAnchorElement.prototype.click = function record() {
+      saved.push(this.getAttribute('href'));
+    };
+    try {
+      button.dispatchEvent(new window.Event('click'));
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+      if (saved.length) throw new Error('half a download was handed to the browser');
+      /* The download finishes while the tab is still open. */
+      window.__app.trackJob({
+        id: 'jobLate',
+        status: 'compressing',
+        progress: 0.1,
+        name: 'Big.mkv',
+        source: 'url',
+        hasFile: false,
+        originalReady: true,
+        originalName: 'Big.mkv',
+      });
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+    } finally {
+      window.HTMLAnchorElement.prototype.click = realClick;
+    }
+    if (!saved.length) throw new Error('the file landed and nothing was saved');
+    if (!/\/api\/jobs\/jobLate\/original\/Big\.mkv$/.test(saved[0])) throw new Error(`saved from ${saved[0]}`);
   });
 
   console.log('');

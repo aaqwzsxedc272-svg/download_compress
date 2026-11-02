@@ -20,6 +20,9 @@ const state = {
   serverHostTried: new Set(),
   browserHostTried: new Set(),
   jobs: new Map(), // id -> { el, data, es }
+  /* Jobs where "Just download it" was pressed before the file was whole: the
+     browser starts saving on its own the moment the download completes. */
+  waitingOriginal: new Set(),
   mail: null,
   busy: 0,
 };
@@ -175,6 +178,13 @@ function cardFor(id, job = {}) {
 function updateCard(entry, job) {
   const previous = entry.data || {};
   entry.data = job;
+  /* "Just download it" was pressed while the transfer was still running: the
+     moment the last byte lands, save it — nobody should have to watch a
+     progress bar to press the same button twice. */
+  if (state.waitingOriginal.has(job.id) && job.originalReady) {
+    state.waitingOriginal.delete(job.id);
+    startOriginalDownload(job);
+  }
   if (job.status === 'hosted' && previous.status !== 'hosted') {
     scheduleResultsRefresh();
     loadPublishInfo();
@@ -384,8 +394,20 @@ function updateCard(entry, job) {
       keep.disabled = true;
       keep.textContent = 'Keeping the original…';
       try {
-        await api(`/api/jobs/${job.id}/keep-original`, { method: 'POST' });
-        showAlert('Okay — this file will be handed back as downloaded, without re-encoding.', 'ok');
+        const { job: after } = await api(`/api/jobs/${job.id}/keep-original`, { method: 'POST' });
+        /* The point of the button is the file, not the decision: if the download
+           is already whole, the browser starts saving it right now. */
+        if (after && after.originalReady) {
+          startOriginalDownload(after);
+          showAlert('Saving the original now — no re-encoding, no waiting for the encoder.', 'ok');
+        } else {
+          state.waitingOriginal.add(job.id);
+          const got = after && after.originalBytes ? formatBytes(after.originalBytes) : '';
+          showAlert(
+            `The encode is stopped. ${got ? `${got} downloaded so far — ` : ''}the file starts saving on its own the moment the download is complete.`,
+            'ok',
+          );
+        }
       } catch (err) {
         showAlert(`Could not switch this file: ${err.message}`, 'error');
         keep.disabled = false;
@@ -395,13 +417,7 @@ function updateCard(entry, job) {
     actions.append(keep);
   }
 
-  if (job.status === 'hosted' && job.hasFile) {
-    const play = document.createElement('a');
-    play.className = 'btn';
-    play.href = `/j/${job.id}`;
-    play.textContent = 'Details';
-    actions.append(play);
-  } else if (job.status === 'done' && job.hasFile) {
+  if (job.status === 'done' && job.hasFile) {
     const share = document.createElement('button');
     share.type = 'button';
     share.className = 'btn download';
@@ -430,12 +446,29 @@ function updateCard(entry, job) {
     actions.append(share);
   }
 
-  if (job.status === 'done' && job.hasFile) {
-    const dl = document.createElement('a');
-    dl.className = 'btn download';
-    dl.href = job.downloadPath || `/api/jobs/${job.id}/download`;
-    dl.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> Download`;
-    actions.append(dl);
+  /* A finished file should be savable whatever happened next. A hosted job used
+     to offer only "Details", so the one thing a person wants at the end of all
+     this — the video — was nowhere on the card. */
+  if (['done', 'hosted'].includes(job.status)) {
+    if (job.hasFile) {
+      const dl = document.createElement('a');
+      dl.className = 'btn download';
+      dl.href = job.downloadPath || `/api/jobs/${job.id}/download`;
+      dl.title = 'From this server — the fastest copy, no host in the middle.';
+      dl.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> Download`;
+      actions.append(dl);
+    } else if (job.localDeleted && job.hostedUrl) {
+      /* The local copy was deleted to free space on purpose: point at the copy
+         that does exist rather than leave a button that answers 410. */
+      const remote = document.createElement('a');
+      remote.className = 'btn download';
+      remote.href = job.hostedUrl;
+      remote.target = '_blank';
+      remote.rel = 'noopener';
+      remote.textContent = `Download from ${job.hostProvider || 'the host'}`;
+      remote.title = 'The copy on this server was deleted to free space; this is the uploaded one.';
+      actions.append(remote);
+    }
 
     const play = document.createElement('a');
     play.className = 'btn';
@@ -449,6 +482,39 @@ function updateCard(entry, job) {
   remove.textContent = 'Remove';
   remove.addEventListener('click', () => removeJob(job.id));
   actions.append(remove);
+}
+
+/**
+ * Save the untouched download to the user's computer.
+ *
+ * A real anchor click, not a fetch: the browser then owns the transfer, shows
+ * it in its own download list, and a 2 GB file does not have to pass through
+ * the page's memory first.
+ */
+function startOriginalDownload(job) {
+  const name = job.originalName || job.name || 'original.mp4';
+  const link = document.createElement('a');
+  link.href = `/api/jobs/${encodeURIComponent(job.id)}/original/${encodeURIComponent(name)}`;
+  link.download = name;
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+/**
+ * The server answers a link it already has with the running job instead of a
+ * second copy. Say which of the two happened, so "nothing new appeared" is not
+ * confused with "nothing happened".
+ */
+function noteReuse(reused) {
+  if (!reused) return;
+  if (reused === 'running') {
+    showAlert('That link is already running here — showing the run in progress instead of starting a second copy.', 'ok');
+  } else {
+    showAlert('Picked up the earlier run of this link where it stopped — the download and the encoded parts were kept.', 'ok');
+  }
 }
 
 function trackJob(job) {
@@ -1024,7 +1090,7 @@ function clearPicker() {
 async function startPickerFile(file, { pageUrl, mode, noCompress = false }) {
   if (mode === 'server') {
     const opts = currentOptions();
-    const { job } = await api('/api/jobs', {
+    const { job, reused } = await api('/api/jobs', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -1037,6 +1103,7 @@ async function startPickerFile(file, { pageUrl, mode, noCompress = false }) {
         ...(noCompress ? { noCompress: true } : {}),
       }),
     });
+    noteReuse(reused);
     return job;
   }
   const direct = await window.SqueezeResolve.directUrl(file.ref);
@@ -1445,7 +1512,8 @@ async function handleLink(raw) {
   const file = files[0];
   let job;
   if (resolved.mode === 'server') {
-    ({ job } = await api('/api/jobs', {
+    let reused;
+    ({ job, reused } = await api('/api/jobs', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -1457,6 +1525,7 @@ async function handleLink(raw) {
         ...currentOptions(),
       }),
     }));
+    noteReuse(reused);
   } else {
     const direct = await window.SqueezeResolve.directUrl(file.ref);
     job = await relayBytes(direct, { pageUrl: url, filename: file.name });

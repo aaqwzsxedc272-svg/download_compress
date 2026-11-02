@@ -200,6 +200,16 @@ composer (or the same switch in the file picker) hands the original back untouch
   bytes back (re-wrapping the container only when that is lossless). Nothing is restarted: the
   file goes straight on to a share link, and it says *Downloaded as-is* instead of
   *Compressed*.
+- **Pressing it saves the file immediately**, not just the decision. If the download is already
+  whole, the browser starts receiving it at once from `GET /api/jobs/:id/original/<name>` — a
+  real download (its own progress, resumable, in the browser's download list), not a fetch held
+  in the page's memory. If the file is still arriving, the page says how much is there and starts
+  the download by itself the moment the last byte lands; half a video is never handed over,
+  because a truncated MP4 does not play.
+- **A finished file can be taken home from its card**, in any end state: the local copy while it
+  is still there (the fastest download — no host in the middle), or the uploaded link once the
+  local copy has been deleted to free space. A hosted job used to show only *Details*, and a
+  deleted one used to keep a button that answered `410`.
 
 ## Hosts used for the output
 
@@ -323,6 +333,7 @@ app cannot be used to probe the box it runs on.
 | `POST` | `/api/jobs/:id/host` | Upload the result to a free host |
 | `POST` | `/api/jobs/:id/hosted` | Attach a link obtained elsewhere (browser upload) |
 | `GET` | `/api/jobs/:id/download` | The compressed MP4 |
+| `GET` | `/api/jobs/:id/original` | The untouched download, for *Just download it* |
 | `DELETE` | `/api/jobs/:id` | Cancel / delete a job |
 
 `POST /api/resolve` returns `{ resolver, title, files: [{ name, size, mime, kind, ref }] }`.
@@ -621,7 +632,8 @@ the encode carries on. Two things follow from that, and both are tested rather t
 
   The page says so too: a restart shows *“This machine stopped before, so 2 files were picked up
   where they left off”*, and each resumed card is tagged *picked up after a restart*. Set
-  `RESUME_INTERRUPTED=0` to opt out.
+  `RESUME_INTERRUPTED=0` to opt out, and `KEEP_UNFINISHED_HOURS` (24) sets how long a job's
+  working files are kept while it is unfinished.
 ### A long encode resumes where it stopped, not at the beginning
 
 Restarting a two-hour encode from zero is the difference between "I lost ten minutes" and "I lost
@@ -646,6 +658,16 @@ The cost is a couple of percent of file size (each part starts a fresh encode), 
 however long the machine had already spent. Short files (<4 min), `targetMb` jobs (two passes
 cannot be split) and `SEGMENTED=0` keep the single-pass, whole-file encode.
 
+**Pasting the same link again continues that job.** This is what people actually do after a
+crash — they come back, paste the link, and expect their file to carry on. It used to start a
+second job beside the first: two downloads of the same gigabytes, two encoders on one file, and
+the visible result was *"the compression started from scratch"*. Now the server recognises the
+video (the stable path behind a signed fileditch link, or the page plus the file's name) and
+returns the **existing** job instead — the running one, or the one left behind, which is resumed
+with its fragment and its finished parts. Same link, same preset: one job. A different preset is
+a genuinely different request, and a finished job is a result, not work, so both still start
+fresh. The page says which of the two happened.
+
 **The download resumes too.** A 2 GB file arriving at 60% when the machine dies used to be thrown
 away and fetched again — the most expensive thing to lose, because it is pure network time. The
 fragment is kept, its size and the URL are recorded the moment the host answers, and the next run
@@ -655,6 +677,10 @@ and the download starts clean instead of producing a corrupt video. If the host 
 answers `200` with the whole file, which is handled as a normal restart. The card says *Continuing
 the download from 640 MB* and marks the file *download continued where it stopped*.
 
+- **Unfinished work is kept for a day, not three hours.** A job that never finished is not
+  "old": its directory holds the half-downloaded source and the parts already encoded, which is
+  exactly what makes a second attempt cheap. Finished jobs are still swept after 3 hours;
+  unfinished ones get `KEEP_UNFINISHED_HOURS` (24 by default).
 - **The two things that can still be lost** are the encoder's *remaining* time (never the whole
   job) and a finished file that was never uploaded, if the container itself is deleted. GitHub
   Codespaces deletes a stopped codespace after 30 days; that is the only deadline that matters,
@@ -736,7 +762,7 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:mail` — the one-time mail setup: `.env` parsing and precedence, `data/mail.json`
   surviving a restart with `0600` permissions, the password never returned, and a running server
   sending a test mail the moment the form is saved.
-- `npm run test:ui` — the browser code in jsdom: the disk pill, the presets, "just download"
+- `npm run test:ui` — 22 checks of the browser code in jsdom: the disk pill, the presets, "just download"
   greying the encoder controls, the size list in the picker, the per-picker switch sending
   `noCompress`, the email button, the webhook panel, and a running job's card showing its link,
   the name its browser tab will carry, and its own "Just download it" button (needs
@@ -752,9 +778,12 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:segments` — 18 checks: the parts cover the file exactly, a real encode is killed
   mid-way, the parts from before the crash are reused (their mtimes prove it), and the joined
   file is as long as the source with its audio.
-- `npm run test:recover` — 27 checks: a download cut in half resumes, a job left mid-upload is
-  uploaded again, "just download it" pressed mid-encode returns the original byte for byte, and a
-  finished file's link is posted before the queue has drained.
+- `npm run test:recover` — 42 checks: a download cut in half resumes, the same link sent again
+  continues that job instead of starting a second one, a job left mid-upload is uploaded again, a
+  crash mid-encode is picked up by re-pasting the link (the parts from before are reused and not a
+  byte is downloaded again), "just download it" pressed mid-encode returns the original byte for
+  byte from `/api/jobs/:id/original`, a half-downloaded file is refused rather than handed over
+  truncated, and a finished file's link is posted before the queue has drained.
 - `npm run smoke` — 61 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
   chunk and an out-of-order chunk), and every rejection path. Starts its own

@@ -12,6 +12,10 @@ const TMP_DIR = path.join(DATA_DIR, 'tmp');
 const UPLOADS_DIR = path.join(TMP_DIR, 'uploads');
 
 const MAX_AGE_MS = 3 * 60 * 60 * 1000; // finished jobs are cleared after 3h
+/* Unfinished work is kept far longer: it is the only copy of a file the user
+   has already waited for. Coming back the next morning should still find the
+   download and the encoded parts where they were left. */
+const KEEP_UNFINISHED_MS = Number(process.env.KEEP_UNFINISHED_HOURS || 24) * 60 * 60 * 1000;
 const STORE_PATH = path.join(DATA_DIR, 'jobs.json');
 const MAX_RECORDS = 300;
 
@@ -64,7 +68,12 @@ async function init() {
   const entries = await fsp.readdir(JOBS_DIR).catch(() => []);
   for (const name of entries) {
     const job = jobs.get(name);
-    if (!job || now - job.createdAt > MAX_AGE_MS) {
+    /* A job that never finished is not "old": it is unfinished. Its directory
+       holds the half-downloaded source and the parts already encoded, which is
+       exactly what makes a second attempt cheap. */
+    const unfinished = job && (job.interrupted || !['done', 'hosted', 'error'].includes(job.status));
+    const limit = unfinished ? KEEP_UNFINISHED_MS : MAX_AGE_MS;
+    if (!job || now - job.createdAt > limit) {
       await fsp.rm(path.join(JOBS_DIR, name), { recursive: true, force: true }).catch(() => {});
       if (job) jobs.delete(name);
     }
@@ -182,6 +191,33 @@ function setViewHook(fn) {
   viewHook = typeof fn === 'function' ? fn : null;
 }
 
+/** Bytes of the original download on disk (0 when there is none yet). */
+function sourceBytesOf(job) {
+  try {
+    return fs.statSync(path.join(job.dir, 'source')).size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * True when the source file is complete: the whole download is on disk, so it
+ * can be handed to the browser instead of the encode's output.
+ *
+ * A file being written cannot be served — a truncated MP4 does not play — so a
+ * transfer that is still running is reported as not ready, and the page waits
+ * for it rather than saving half a video.
+ */
+function sourceIsWhole(job) {
+  const bytes = sourceBytesOf(job);
+  if (!bytes) return false;
+  const total = Number(job.downloadTotal) || 0;
+  if (total > 0) return bytes >= total;
+  /* No size was ever reported: the only proof the transfer finished is that
+     the job moved past it. A failed download is not "whole". */
+  return ['compressing', 'awaiting-upload', 'done', 'hosting', 'hosted'].includes(job.status);
+}
+
 function publicView(job) {
   const view = {
     id: job.id,
@@ -221,6 +257,12 @@ function publicView(job) {
     hasThumb: fs.existsSync(path.join(job.dir, 'thumb.jpg')),
     hasFile:
       ['done', 'hosting', 'hosted'].includes(job.status) && fs.existsSync(jobsStorePath(job)),
+    /* The untouched download. "Just download it" hands this back, so the page
+       has to know whether it is already whole — and the job card can offer the
+       original before the encode finishes. */
+    originalBytes: sourceBytesOf(job),
+    originalReady: sourceIsWhole(job),
+    originalName: job.name || 'original.mp4',
     hosting: Boolean(job.hosting),
     /* True once the queue picked this up after the machine stopped. */
     resumed: Boolean(job.resumed),

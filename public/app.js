@@ -25,6 +25,11 @@ const state = {
   waitingOriginal: new Set(),
   mail: null,
   busy: 0,
+  /* the storage panel: last report, which tab, and its refresh timer */
+  storage: null,
+  usage: null,
+  storageTab: 'storage',
+  storageTimer: null,
 };
 
 const BROWSER_HOST_LIMIT = 1.5 * 1024 ** 3;
@@ -1740,6 +1745,641 @@ function renderHostChoices(providers) {
   if (!list.length) pick.disabled = true;
 }
 
+/* ------------------------------------------------- storage and usage panels */
+
+/**
+ * The storage panel: everything the machine is holding, by owner, with a way to
+ * download or delete each piece.
+ *
+ * The header only had room for "12.6 GB free", which does not answer the two
+ * questions that matter when a Codespace is full — *what is using it* and *can
+ * I get rid of that without losing my video*. This panel does, and it is the
+ * same data `npm run disk` prints.
+ */
+const STORAGE_PANEL_ID = 'storagePanel';
+
+function storagePanelEl() {
+  return document.getElementById(STORAGE_PANEL_ID);
+}
+
+function closeStoragePanel() {
+  const panel = storagePanelEl();
+  if (!panel) return;
+  panel.remove();
+  document.removeEventListener('keydown', onStorageKey);
+  state.storageTimer = null;
+}
+
+function onStorageKey(event) {
+  if (event.key === 'Escape') closeStoragePanel();
+}
+
+/** Build the shell once per open, then fill it in. */
+function buildStoragePanel(tab) {
+  closeStoragePanel();
+  const overlay = document.createElement('div');
+  overlay.id = STORAGE_PANEL_ID;
+  overlay.className = 'sheet-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', 'Storage and session');
+
+  const sheet = document.createElement('section');
+  sheet.className = 'sheet card';
+
+  const head = document.createElement('div');
+  head.className = 'sheet-head';
+  const title = document.createElement('div');
+  title.innerHTML =
+    '<div class="sheet-title">Storage &amp; session</div>' +
+    '<div class="sheet-sub">What this machine is holding, and what is left of the month.</div>';
+  head.append(title);
+
+  const tools = document.createElement('div');
+  tools.className = 'sheet-tools';
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'btn tiny';
+  refresh.id = 'storageRefresh';
+  refresh.textContent = 'Refresh';
+  refresh.addEventListener('click', () => loadStoragePanel());
+  tools.append(refresh);
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'btn tiny';
+  close.id = 'storageClose';
+  close.textContent = 'Close';
+  close.addEventListener('click', closeStoragePanel);
+  tools.append(close);
+  head.append(tools);
+  sheet.append(head);
+
+  const tabs = document.createElement('div');
+  tabs.className = 'sheet-tabs';
+  for (const [id, label] of [
+    ['storage', 'Storage'],
+    ['usage', 'Session & limits'],
+  ]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sheet-tab';
+    button.dataset.tab = id;
+    button.textContent = label;
+    button.setAttribute('aria-selected', String(id === tab));
+    button.addEventListener('click', () => setStorageTab(id));
+    tabs.append(button);
+  }
+  sheet.append(tabs);
+
+  const body = document.createElement('div');
+  body.className = 'sheet-body';
+  body.id = 'storageBody';
+  sheet.append(body);
+
+  overlay.append(sheet);
+  document.body.append(overlay);
+
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) closeStoragePanel();
+  });
+  document.addEventListener('keydown', onStorageKey);
+  setStorageTab(tab);
+  return body;
+}
+
+function setStorageTab(tab) {
+  state.storageTab = tab;
+  for (const button of document.querySelectorAll('.sheet-tab')) {
+    button.setAttribute('aria-selected', String(button.dataset.tab === tab));
+  }
+  const body = document.getElementById('storageBody');
+  if (body) body.dataset.tab = tab;
+  renderStorageBody();
+}
+
+async function openStoragePanel(tab = 'storage') {
+  const body = buildStoragePanel(tab);
+  body.innerHTML = '<p class="sheet-loading">Reading the disk…</p>';
+  await loadStoragePanel();
+  /* While the panel is open, a job finishing or a file being deleted changes
+     the numbers; a slow refresh keeps the panel honest without a manual
+     button press. Cleared when the panel closes. */
+  if (state.storageTimer) clearInterval(state.storageTimer);
+  state.storageTimer = setInterval(() => {
+    if (!storagePanelEl()) {
+      clearInterval(state.storageTimer);
+      state.storageTimer = null;
+      return;
+    }
+    loadStoragePanel();
+  }, 15000);
+}
+
+async function loadStoragePanel() {
+  if (!storagePanelEl()) return;
+  try {
+    const [data, usage] = await Promise.all([api('/api/storage'), api('/api/usage')]);
+    state.storage = data;
+    state.usage = usage.usage || usage;
+  } catch (err) {
+    const body = document.getElementById('storageBody');
+    if (body) body.innerHTML = `<p class="sheet-error">Could not read the disk: ${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  renderStorageBody();
+  renderUsagePill(state.usage);
+}
+
+function renderStorageBody() {
+  const body = document.getElementById('storageBody');
+  if (!body || !state.storage) return;
+  body.innerHTML = '';
+  if (state.storageTab === 'usage') {
+    body.append(...renderUsagePanel(state.usage));
+  } else {
+    body.append(...renderStoragePane(state.storage));
+  }
+}
+
+const escapeHtml = (value) =>
+  String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[char]));
+
+function bytesText(bytes) {
+  if (!bytes && bytes !== 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = Math.abs(bytes);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const digits = value >= 100 || unit === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${bytes < 0 ? '-' : ''}${value.toFixed(digits)} ${units[unit]}`;
+}
+
+function durationText(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m ${total % 60}s`;
+  /* "Resets in 680h" is a number nobody can picture; days are what a calendar
+     is made of. */
+  if (total >= 48 * 3600) {
+    const days = Math.round(total / 86400);
+    return `${days} day${days === 1 ? '' : 's'}`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+/** A labelled bar, the one piece of UI both tabs use. */
+function usageBar({ label, used, total, percent, note, tone = 'accent' }) {
+  const wrap = document.createElement('div');
+  wrap.className = 'meter';
+  const head = document.createElement('div');
+  head.className = 'meter-head';
+  head.innerHTML = `<span>${escapeHtml(label)}</span><span class="meter-value"></span>`;
+  head.querySelector('.meter-value').textContent = total ? `${used} / ${total}` : String(used);
+  wrap.append(head);
+
+  const bar = document.createElement('div');
+  bar.className = 'meter-bar';
+  const fill = document.createElement('span');
+  const pct = Math.max(0, Math.min(100, Number(percent) || 0));
+  fill.style.width = `${pct}%`;
+  fill.className = `meter-fill ${tone === 'danger' ? 'is-critical' : ''} ${pct >= 80 ? 'is-high' : ''}`;
+  bar.append(fill);
+  wrap.append(bar);
+
+  if (note) {
+    const foot = document.createElement('div');
+    foot.className = 'meter-note';
+    foot.textContent = note;
+    wrap.append(foot);
+  }
+  return wrap;
+}
+
+function renderStoragePane(data) {
+  const nodes = [];
+  const totals = data.totals || {};
+  const disk = data.disk || {};
+
+  const summary = document.createElement('div');
+  summary.className = 'sheet-summary';
+  const freePct = disk.totalBytes ? Math.round((disk.freeBytes / disk.totalBytes) * 100) : null;
+  summary.append(
+    usageBar({
+      label: 'This machine',
+      used: bytesText(disk.usedBytes),
+      total: bytesText(disk.totalBytes),
+      percent: freePct == null ? 0 : 100 - freePct,
+      tone: freePct != null && freePct < 10 ? 'danger' : 'accent',
+      note: `${bytesText(disk.freeBytes)} free (${freePct == null ? '?' : freePct}%) · Squeeze is using ${bytesText(totals.squeezeBytes)} of it`,
+    }),
+  );
+  nodes.push(summary);
+
+  /* Where the space went, as rows rather than a bar: the point is not the
+     proportion, it is which line can be made smaller. */
+  const breakdown = document.createElement('div');
+  breakdown.className = 'sheet-block';
+  breakdown.innerHTML = '<h3>What is taking the room</h3>';
+  const list = document.createElement('div');
+  list.className = 'ssize-list';
+  const rows = [
+    ...(data.breakdown || []).map((row) => ({ ...row, kind: 'data' })),
+    ...(data.extras || []).map((row) => ({ ...row, kind: 'extra' })),
+    { label: 'Everything else on the machine', bytes: totals.restOfMachineBytes, kind: 'rest' },
+  ];
+  for (const row of rows) {
+    const line = document.createElement('div');
+    line.className = 'ssize-row';
+    line.innerHTML =
+      `<span class="ssize-label">${escapeHtml(row.label)}</span>` +
+      `<span class="ssize-bytes">${bytesText(row.bytes)}</span>`;
+    if (row.kind === 'extra') line.querySelector('.ssize-label').title = 'Part of the project, not your videos';
+    list.append(line);
+  }
+  breakdown.append(list);
+  nodes.push(breakdown);
+
+  /* The files themselves. */
+  const jobsBlock = document.createElement('div');
+  jobsBlock.className = 'sheet-block';
+  const jobsHead = document.createElement('div');
+  jobsHead.className = 'sheet-block-head';
+  jobsHead.innerHTML = `<h3>Files (${(data.jobs || []).length})</h3>`;
+  const cleanTools = document.createElement('div');
+  cleanTools.className = 'sheet-tools';
+  for (const [what, label, confirmText] of [
+    ['tmp', 'Delete temp uploads', 'Delete the temporary upload folder? Nothing with a result lives there.'],
+    ['finished', 'Delete finished files', 'Delete the files of finished jobs? Anything already uploaded keeps its share link; a file with no share link is kept.'],
+    ['all', 'Delete everything', 'Delete every file and job on this machine? Share links already recorded in links.tsv stay, but local copies are gone for good.'],
+  ]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `btn tiny ${what === 'all' ? 'danger' : ''}`;
+    button.dataset.clean = what;
+    button.textContent = label;
+    button.addEventListener('click', () => {
+      if (!window.confirm(confirmText)) return;
+      cleanStorage(what,boolFromAll(what));
+    });
+    cleanTools.append(button);
+  }
+  jobsHead.append(cleanTools);
+  jobsBlock.append(jobsHead);
+
+  if (!(data.jobs || []).length) {
+    const empty = document.createElement('p');
+    empty.className = 'sheet-empty';
+    empty.textContent = 'No video files on this machine right now.';
+    jobsBlock.append(empty);
+  }
+
+  for (const job of data.jobs || []) {
+    jobsBlock.append(storageJobRow(job));
+  }
+  nodes.push(jobsBlock);
+
+  const note = document.createElement('p');
+  note.className = 'sheet-note';
+  const limits = data.limits || {};
+  note.innerHTML =
+    `Files are removed automatically: a job's local copy ${Number(limits.hostedLocalMinutes) || 120} minutes ` +
+    `after it gets a share link, finished jobs after ${Number(limits.finishedMinutes) || 180} minutes, ` +
+    `unfinished ones after ${Number(limits.unfinishedHours) || 24} hours. ` +
+    '<strong>Pin</strong> keeps a job until you unpin it.';
+  nodes.push(note);
+  return nodes;
+}
+
+/** "Delete everything" needs force; the others do not. */
+function boolFromAll(what) {
+  return what === 'all';
+}
+
+/** Job statuses in words a person reads without decoding them. */
+const STATUS_WORDS = {
+  queued: 'queued',
+  fetching: 'downloading',
+  uploading: 'uploading',
+  'awaiting-upload': 'waiting for a file',
+  compressing: 'encoding',
+  hosting: 'uploading the result',
+  done: 'ready',
+  hosted: 'share link ready',
+  error: 'failed',
+};
+
+function storageJobRow(job) {
+  const row = document.createElement('div');
+  row.className = 'storage-job';
+  row.dataset.jobId = job.id;
+
+  const head = document.createElement('div');
+  head.className = 'storage-job-head';
+  const name = document.createElement('div');
+  name.className = 'storage-job-name';
+  name.innerHTML =
+    `<span class="storage-name"></span><span class="storage-status"></span>`;
+  name.querySelector('.storage-name').textContent = job.name;
+  const status = name.querySelector('.storage-status');
+  status.textContent = job.active ? STATUS_WORDS[job.status] || 'working now' : STATUS_WORDS[job.status] || String(job.status || '');
+  status.className = `storage-status is-${job.status}${job.active ? ' is-active' : ''}`;
+  head.append(name);
+
+  const size = document.createElement('div');
+  size.className = 'storage-job-size';
+  size.textContent = bytesText(job.bytes);
+  head.append(size);
+  row.append(head);
+
+  const files = document.createElement('div');
+  files.className = 'storage-files';
+  for (const file of job.files) {
+    const line = document.createElement('div');
+    line.className = 'storage-file';
+    line.dataset.part = file.part;
+
+    const label = document.createElement('div');
+    label.className = 'storage-file-label';
+    /* The note is visible, not a tooltip: "this copy is a spare" and "the only
+       copy until it is uploaded" are the reason to press Delete or not, and a
+       reason nobody can see is a reason nobody has. */
+    label.innerHTML =
+      `<span class="sf-name">${escapeHtml(file.label)}</span>` +
+      `<span class="sf-size">${bytesText(file.bytes)}</span>` +
+      (file.note ? `<span class="sf-note">${escapeHtml(file.note)}</span>` : '');
+    line.append(label);
+
+    const actions = document.createElement('div');
+    actions.className = 'storage-file-actions';
+    if (file.download) {
+      const link = document.createElement('a');
+      link.className = 'btn tiny';
+      link.href = file.download;
+      link.textContent = file.part === 'source' ? 'Download original' : 'Download';
+      actions.append(link);
+    }
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn tiny danger';
+    remove.textContent = 'Delete';
+    remove.title = file.note || 'Delete this file';
+    remove.disabled = job.active && file.part !== 'thumb';
+    remove.addEventListener('click', () => {
+      const onlyCopy = file.part === 'output' && !job.hostedUrl;
+      const question = onlyCopy
+        ? `"${job.name}" has no share link yet, so this compressed file is the only copy. Delete it anyway?`
+        : `Delete “${file.label}” (${bytesText(file.bytes)}) from "${job.name}"?`;
+      if (!window.confirm(question)) return;
+      deleteStoragePart(job.id, file.part, file.label);
+    });
+    actions.append(remove);
+    line.append(actions);
+    files.append(line);
+  }
+  row.append(files);
+
+  const foot = document.createElement('div');
+  foot.className = 'storage-job-foot';
+  const auto = document.createElement('span');
+  auto.className = 'storage-auto';
+  if (job.pinLocal) auto.textContent = 'Pinned — the sweeper will not remove it.';
+  else if (job.autoDeletesInSeconds != null && !job.active) auto.textContent = `Removed automatically in ${durationText(job.autoDeletesInSeconds)}.`;
+  else if (job.active) auto.textContent = 'In use — files are kept until it finishes.';
+  else auto.textContent = 'Kept.';
+  foot.append(auto);
+
+  const pin = document.createElement('button');
+  pin.type = 'button';
+  pin.className = 'btn tiny';
+  pin.dataset.pin = job.id;
+  pin.textContent = job.pinLocal ? 'Unpin' : 'Pin';
+  pin.title = job.pinLocal ? 'Let the sweeper delete it when the time comes' : 'Keep this job’s files until you unpin them';
+  pin.addEventListener('click', () => pinStorageJob(job.id, !job.pinLocal));
+  foot.append(pin);
+  row.append(foot);
+  return row;
+}
+
+async function deleteStoragePart(jobId, part, label) {
+  try {
+    const result = await api(`/api/storage/jobs/${encodeURIComponent(jobId)}/${encodeURIComponent(part)}`, {
+      method: 'DELETE',
+    });
+    showAlert(`Deleted ${label.toLowerCase()} — ${bytesText(result.freedBytes)} freed.`, 'ok');
+    await loadStoragePanel();
+    await refreshStatus();
+  } catch (err) {
+    showAlert(`Could not delete that file: ${err.message}`, 'error');
+  }
+}
+
+async function cleanStorage(what, force = false) {
+  try {
+    const result = await api('/api/storage/clean', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ what, force }),
+    });
+    const kept = (result.kept || []).length;
+    showAlert(
+      `Freed ${bytesText(result.freedBytes)}${result.removedJobs ? ` · ${result.removedJobs} job(s) removed` : ''}` +
+        `${kept ? ` · ${kept} kept (see the panel)` : ''}.`,
+      'ok',
+    );
+    await loadStoragePanel();
+    await refreshStatus();
+  } catch (err) {
+    showAlert(`Could not clean up: ${err.message}`, 'error');
+  }
+}
+
+async function pinStorageJob(jobId, pinned) {
+  try {
+    await api(`/api/jobs/${encodeURIComponent(jobId)}/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pinned }),
+    });
+    await loadStoragePanel();
+  } catch (err) {
+    showAlert(`Could not ${pinned ? 'pin' : 'unpin'} that job: ${err.message}`, 'error');
+  }
+}
+
+/** Session, month and the storage allowance, with the honest caveat. */
+function renderUsagePanel(usage) {
+  const nodes = [];
+  if (!usage) {
+    const missing = document.createElement('p');
+    missing.className = 'sheet-empty';
+    missing.textContent = 'The meter is not available yet.';
+    return [missing];
+  }
+  const month = usage.month || {};
+  const session = usage.session || {};
+  const store = usage.storage || {};
+  const settings = usage.settings || {};
+
+  const block = document.createElement('div');
+  block.className = 'sheet-block';
+  block.innerHTML = '<h3>GitHub Codespaces</h3>';
+
+  block.append(
+    usageBar({
+      label: `This month's compute (${month.key || '—'})`,
+      used: `${Number(month.coreHours || 0).toFixed(1)} core-hours`,
+      total: `${Number(month.quotaCoreHours || 0)}`,
+      percent: month.percent,
+      tone: Number(month.percent || 0) >= 80 ? 'danger' : 'accent',
+      note:
+        `About ${Number(month.machineHoursLeft || 0)} more hours of this ${Number(settings.cores) || '?'}-core machine. ` +
+        `Resets ${month.resetAt ? new Date(month.resetAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'monthly'}` +
+        `${month.resetsInHours != null ? ` (in ${durationText(month.resetsInHours * 3600)})` : ''}.`,
+    }),
+  );
+
+  block.append(
+    usageBar({
+      label: 'This month’s storage (average)',
+      used: `${Number(store.gbMonths || 0).toFixed(2)} GB-months`,
+      total: `${Number(store.quotaGb || 0)}`,
+      percent: store.percent,
+      note: `Holding ${bytesText(store.bytesNow)} right now · peak ${bytesText(store.peakBytes)}. Free again on the 1st.`,
+    }),
+  );
+
+  /* "Time left in this session" is really "time until GitHub decides nobody is
+     home": a codespace stops after a spell without activity, and that spell is
+     the clock. It resets whenever anything happens, which is why it is drawn as
+     a filling bar rather than a countdown that only ever goes down. */
+  const idleMinutes = Number(session.idleMinutes) || 30;
+  const idleLeft = Number(session.idleSecondsLeft) || 0;
+  const idleUsed = Math.max(0, idleMinutes * 60 - idleLeft);
+  block.append(
+    usageBar({
+      label: 'Session — until GitHub stops it for being idle',
+      used: `${durationText(idleLeft)} left`,
+      total: `${idleMinutes} min`,
+      percent: (idleUsed / (idleMinutes * 60)) * 100,
+      tone: idleLeft < 300 ? 'danger' : 'accent',
+      note: session.awake
+        ? 'The countdown restarted with the last activity — a running job counts as activity.'
+        : 'Nothing is happening: once this runs out, an idle codespace is stopped.',
+    }),
+  );
+
+  const sessionRow = document.createElement('div');
+  sessionRow.className = 'usage-session';
+  sessionRow.innerHTML =
+    '<div class="usage-session-main"></div><div class="usage-session-sub"></div>';
+  sessionRow.querySelector('.usage-session-main').textContent =
+    `This session: ${durationText(session.elapsedSeconds)} · ${Number(session.coreHours || 0).toFixed(2)} core-hours`;
+  sessionRow.querySelector('.usage-session-sub').textContent =
+    `${Number(settings.cores) || '?'}-core machine · started ${session.startedAt ? new Date(session.startedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '—'}`;
+  block.append(sessionRow);
+  nodes.push(block);
+
+  /* Where the numbers come from, and where the real ones are. */
+  const caveat = document.createElement('div');
+  caveat.className = 'sheet-block sheet-caveat';
+  caveat.innerHTML =
+    '<h3>Where these numbers come from</h3>' +
+    `<p>${escapeHtml(usage.meter?.note || '')}</p>` +
+    '<p class="muted">GitHub’s free allowance is <strong>monthly</strong> — 120 core-hours and 15 GB-months on Free, ' +
+    '180 on Pro — and it resets on the 1st. There is no weekly cap. ' +
+    'The authoritative figure is always <a href="https://github.com/settings/billing" target="_blank" rel="noopener">github.com/settings/billing</a>.</p>';
+  nodes.push(caveat);
+
+  const form = document.createElement('form');
+  form.className = 'usage-form sheet-block';
+  form.id = 'usageForm';
+  form.innerHTML =
+    '<h3>Your plan</h3>' +
+    '<div class="usage-grid">' +
+    '<label><span>Plan</span><select id="usagePlan"></select></label>' +
+    '<label><span>Core-hours per month</span><input id="usageCoreHours" type="number" min="1" step="1" /></label>' +
+    '<label><span>Storage GB-months</span><input id="usageStorageGb" type="number" min="1" step="1" /></label>' +
+    '<label><span>Idle stop after (minutes)</span><input id="usageIdle" type="number" min="1" step="1" /></label>' +
+    '</div>' +
+    '<div class="sheet-tools"><button class="btn primary" type="submit">Save</button>' +
+    '<span class="mail-status" id="usageStatus" role="status"></span></div>';
+  nodes.push(form);
+
+  /* Filled after the nodes are in the document, so a test can read them. */
+  setTimeout(() => {
+    const plan = document.getElementById('usagePlan');
+    if (!plan) return;
+    plan.innerHTML = '';
+    for (const item of settings.plans || []) {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `${item.label} (${item.coreHours} h · ${item.storageGb} GB)`;
+      plan.append(option);
+    }
+    plan.value = settings.plan || 'free';
+    document.getElementById('usageCoreHours').value = settings.quotaCoreHours || 120;
+    document.getElementById('usageStorageGb').value = settings.quotaStorageGb || 15;
+    document.getElementById('usageIdle').value = settings.idleMinutes || 30;
+    plan.addEventListener('change', () => {
+      const chosen = (settings.plans || []).find((item) => item.id === plan.value);
+      if (chosen) {
+        document.getElementById('usageCoreHours').value = chosen.coreHours;
+        document.getElementById('usageStorageGb').value = chosen.storageGb;
+      }
+    });
+    form.addEventListener('submit', saveUsageSettings);
+  }, 0);
+
+  return nodes;
+}
+
+async function saveUsageSettings(event) {
+  if (event) event.preventDefault();
+  const status = document.getElementById('usageStatus');
+  if (status) status.textContent = 'Saving…';
+  try {
+    const payload = {
+      plan: document.getElementById('usagePlan')?.value,
+      coreHours: Number(document.getElementById('usageCoreHours')?.value),
+      storageGb: Number(document.getElementById('usageStorageGb')?.value),
+      idleMinutes: Number(document.getElementById('usageIdle')?.value),
+    };
+    const { usage } = await api('/api/usage/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    state.usage = usage;
+    renderUsagePill(usage);
+    if (status) status.textContent = 'Saved.';
+    renderStorageBody();
+  } catch (err) {
+    if (status) status.textContent = err.message;
+  }
+}
+
+/** The header pill: how much of the month is gone, at a glance. */
+function renderUsagePill(usage) {
+  const pill = $('#usageBtn');
+  const text = $('#usageText');
+  if (!pill || !text || !usage || !usage.month) return;
+  const percent = Number(usage.month.percent) || 0;
+  text.textContent = `${Number(usage.month.machineHoursLeft || 0).toFixed(1)} h left`;
+  pill.classList.toggle('is-warn', percent >= 80 && percent < 95);
+  pill.classList.toggle('is-low', percent >= 95);
+  pill.title =
+    `${Number(usage.month.coreHours || 0).toFixed(1)} of ${usage.month.quotaCoreHours} core-hours used this month ` +
+    `(${percent}%) — about ${usage.month.machineHoursLeft} hours of this ${usage.settings.cores}-core machine. ` +
+    'Open for the full picture.';
+}
+
 function formatDisk(bytes) {
   if (!bytes && bytes !== 0) return '—';
   const gb = bytes / 1073741824;
@@ -1748,7 +2388,7 @@ function formatDisk(bytes) {
 
 /** Header pill: how much room the machine has left. */
 function renderDisk(disk) {
-  const pill = $('#diskPill');
+  const pill = $('#storageBtn');
   const text = $('#diskText');
   if (!pill || !text) return;
   if (!disk || !disk.totalBytes) {
@@ -1765,7 +2405,9 @@ function renderDisk(disk) {
     fill.classList.toggle('is-low', pct != null && pct < 15);
     fill.classList.toggle('is-critical', pct != null && pct < 7);
   }
-  pill.title = `${formatDisk(disk.usedBytes)} used · ${formatDisk(free)} free (${pct}%). ` +
+  pill.title =
+    `${formatDisk(disk.usedBytes)} used · ${formatDisk(free)} free (${pct}%). ` +
+    'Click to see what is using it — every file, with a download and a delete. ' +
     'A video needs about three times its own size while it encodes.';
   pill.classList.toggle('is-low', pct != null && pct < 15);
 }
@@ -1816,6 +2458,14 @@ async function refreshStatus() {
     renderStopBanner(health.autoStop);
     renderRecovery(health.recovery);
     if (health.autoStop) syncAutoStopToggle(health.autoStop);
+    /* The allowance pill is a second call, and it must never hold up the
+       disk pill if the meter is slow to answer. */
+    api('/api/usage')
+      .then(({ usage }) => {
+        state.usage = usage;
+        renderUsagePill(usage);
+      })
+      .catch(() => {});
   } catch {
     /* the server may be busy encoding; try again on the next tick */
   }
@@ -2354,6 +3004,9 @@ async function boot() {
     });
     syncComposerMode();
   }
+
+  $('#storageBtn')?.addEventListener('click', () => openStoragePanel('storage'));
+  $('#usageBtn')?.addEventListener('click', () => openStoragePanel('usage'));
 
   $('#emailLinks')?.addEventListener('click', emailLinks);
   $('#publishLinks')?.addEventListener('click', postLinks);

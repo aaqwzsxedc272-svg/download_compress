@@ -5,9 +5,13 @@
  *   npm run disk            # report
  *   npm run disk -- --clean # delete finished/failed jobs and stray files
  *
+ * The same facts are on the page behind the header's storage button, where
+ * every file can also be downloaded or deleted one at a time.
+ *
  * "Finished" means a job whose result either has a share link or has failed:
  * the compressed file is still downloadable until you clean, so nothing is
- * deleted while it is the only copy.
+ * deleted while it is the only copy — and a job that has been **pinned** in the
+ * page is never deleted here at all.
  */
 'use strict';
 
@@ -66,18 +70,30 @@ async function main() {
     console.log('  (no jobs yet)');
   }
 
+  /* The records live in one file, not in each job directory. */
+  let records = [];
+  try {
+    records = JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'jobs.json'), 'utf8'));
+  } catch {
+    /* no records: sizes are still worth printing */
+  }
+  const byId = new Map(records.map((job) => [job.id, job]));
+
   const rows = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const dir = path.join(jobsDir, entry.name);
     const size = await dirSize(dir);
-    let status = 'unknown';
-    try {
-      status = JSON.parse(await fsp.readFile(path.join(dir, 'job.json'), 'utf8')).status || status;
-    } catch {
-      /* no metadata */
-    }
-    rows.push({ id: entry.name, dir, size, status });
+    const record = byId.get(entry.name) || {};
+    rows.push({
+      id: entry.name,
+      dir,
+      size,
+      status: record.status || 'unknown',
+      name: record.name || null,
+      pinned: Boolean(record.pinLocal),
+      hosted: Boolean(record.hostedUrl),
+    });
   }
 
   rows.sort((a, b) => b.size - a.size);
@@ -85,7 +101,10 @@ async function main() {
   if (biggest.length) {
     console.log('\nLargest jobs:');
     for (const row of biggest) {
-      console.log(`  ${human(row.size).padStart(9)}  ${row.status.padEnd(10)} ${row.id}`);
+      console.log(
+        `  ${human(row.size).padStart(9)}  ${row.status.padEnd(10)} ${row.id}` +
+          `${row.pinned ? '  (pinned)' : ''}${row.name ? `  ${row.name}` : ''}`,
+      );
     }
     const jobBytes = rows.reduce((sum, row) => sum + row.size, 0);
     console.log(`\n  ${human(jobBytes)} across ${rows.length} job${rows.length === 1 ? '' : 's'}`);
@@ -107,12 +126,17 @@ async function main() {
     extraRows.forEach(([label, size]) => console.log(`  ${human(size).padStart(9)}  ${label}`));
   }
 
-  const finished = rows.filter((row) => ['done', 'hosted', 'error'].includes(row.status));
+  const finished = rows.filter((row) => ['done', 'hosted', 'error'].includes(row.status) && !row.pinned);
+  const pinned = rows.filter((row) => row.pinned);
   if (!clean) {
     console.log('\nReclaim space with:  npm run disk -- --clean');
+    console.log('Or open the page and press the disk pill: every file, with a download and a delete.');
     if (finished.length) {
       const bytes = finished.reduce((sum, row) => sum + row.size, 0);
       console.log(`  would free ${human(bytes)} from ${finished.length} finished job(s)`);
+    }
+    if (pinned.length) {
+      console.log(`  ${pinned.length} job(s) are pinned and would be kept: ${pinned.map((row) => row.id).join(', ')}`);
     }
     return;
   }

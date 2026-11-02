@@ -276,6 +276,10 @@ guess when the code is not a checkout.
 | `MAX_UPLOAD_MB` | `6144` | Largest accepted video, in megabytes |
 | `MAX_CONCURRENT` | `1` | Simultaneous encodes (one per CPU core is a good rule) |
 | `ALLOW_PRIVATE_HOSTS` | off | Permit `127.0.0.1` / metadata addresses (tests only) |
+| `HOSTED_LOCAL_KEEP_MINUTES` | 120 | How long a local copy stays after its upload finishes |
+| `FINISHED_KEEP_MINUTES` | 180 | How long a finished, unuploaded job stays |
+| `KEEP_UNFINISHED_HOURS` | 24 | How long an unfinished job's files are kept |
+| `CODESPACE_CORES` | detected | Cores for the allowance meter (core-hours = hours × cores) |
 | `KEEP_LOCAL_AFTER_UPLOAD` | off | Set `1` to keep the compressed file on disk after it is hosted |
 | `SMTP_HOST` / `SMTP_PORT` | — / `587` | Mail server for the share links (`465` = implicit TLS) |
 | `SMTP_USER` / `SMTP_PASS` | — | Login; for Gmail use an **app password**, spaces are ignored |
@@ -334,7 +338,13 @@ app cannot be used to probe the box it runs on.
 | `POST` | `/api/jobs/:id/hosted` | Attach a link obtained elsewhere (browser upload) |
 | `GET` | `/api/jobs/:id/download` | The compressed MP4 |
 | `GET` | `/api/jobs/:id/original` | The untouched download, for *Just download it* |
+| `POST` | `/api/jobs/:id/pin` | Keep this job's files through the sweeper: `{ pinned: true }` |
 | `DELETE` | `/api/jobs/:id` | Cancel / delete a job |
+| `GET` | `/api/storage` | Every file on the disk with its size, owner and deadline, plus the meter |
+| `DELETE` | `/api/storage/jobs/:id/:part` | Delete one file: `source`, `output`, `parts` or `thumb` |
+| `POST` | `/api/storage/clean` | `{ what: "tmp" \| "finished" \| "all", force? }` |
+| `GET` | `/api/usage` | The monthly allowance as far as this machine can measure it |
+| `POST` | `/api/usage/settings` | `{ plan, coreHours, storageGb, idleMinutes }` |
 
 `POST /api/resolve` returns `{ resolver, title, files: [{ name, size, mime, kind, ref }] }`.
 Pass a file's `ref` back as `source: "ref"` to compress exactly that file — signed links are
@@ -607,13 +617,64 @@ job needs ~1.2×, and never less than 512 MB).
   dying half way through with `No space left on device`; the message names what can be freed.
 - Downloading a file that was already deleted answers `410` with the share link instead of
   pretending the file is still there.
-- `npm run disk` reports total/used/free and the largest jobs; `npm run disk -- --clean` deletes
-  finished and failed jobs and the temp directory.
-- `/api/health` returns `freeGb`, so a monitor can watch it.
+- **The disk pill in the header is a button.** It opens a panel listing every file the machine is
+  holding — each job's original download, its compressed result, the parts kept for a resume, the
+  temp uploads, the sample clip — with the size of each, a **Download** link, a **Delete** button,
+  and how long it has left before the sweeper removes it by itself. `npm run disk` prints the same
+  facts in a terminal.
+- **Nothing is deleted while it is in use.** A job that is downloading or encoding refuses to lose
+  its source (`409`, with the reason), and the panel greys the button out. A compressed file with
+  no share link is the *only* copy, so deleting it asks first and says so.
+- **Pin** keeps a job's files through the sweeper until you unpin it. Under disk pressure the app
+  will then fail a new job with the numbers instead of quietly deleting a pinned file.
+- The bulk buttons are *Delete temp uploads*, *Delete finished files* (an unhosted result is kept —
+  only its source goes) and *Delete everything*, which asks first and reports exactly what it freed.
+- `/api/health` returns `freeGb`, so a monitor can watch it; `GET /api/storage` returns the whole
+  report the panel draws.
 
 GitHub Codespaces gives a 2-core machine **32 GB**, shared with `node_modules` (~150 MB),
 Playwright's Chromium (~450 MB) and the OS. That is comfortable for 1080p work and tight for a
 queue of 4K files: do them a few at a time.
+
+### How long files stay, and how to keep them
+
+| What | Removed by itself | Who decides |
+| --- | --- | --- |
+| temp uploads | 2 hours after they are abandoned | nobody; they are never a result |
+| a job's local copy, once it has a share link | `HOSTED_LOCAL_KEEP_MINUTES` (120) after the upload **finishes** | **Pin** stops it |
+| a finished job that was never uploaded | `FINISHED_KEEP_MINUTES` (180) | **Pin** stops it |
+| a job that never finished (half-download, half-encoded) | `KEEP_UNFINISHED_HOURS` (24) | resuming it |
+| the job's record and its place in the panel | 30 days after it was hosted | — |
+
+The clock for a hosted file starts when the upload finished, not when the job was created: a
+three-hour encode would otherwise lose its local copy the moment it became shareable. The panel
+shows the deadline per job ("Removed automatically in 1h 12m"), so nothing disappears by surprise.
+
+### How much of the month is left
+
+The header's second pill answers it — *"36.0 h left"* — and opens the **Session & limits** tab,
+which has three trackers:
+
+- **This month's compute**, against the free allowance (120 core-hours on GitHub Free, 180 on Pro).
+  The number that matters is *hours of this machine*, which is core-hours ÷ cores: a 2-core
+  codespace with 72 core-hours left has 36 hours of life.
+- **This month's storage**, in GB-months — an *average* over the month (one GB held for the whole
+  month is 1 GB-month), not the size on disk right now. The current size and the peak are shown
+  next to it.
+- **The session**, as time until GitHub stops an idle codespace (30 minutes by default), which is
+  the only clock a running session actually has.
+
+**These are a meter, not a reading, and the page says so.** GitHub does not publish a Codespace's
+remaining hours to the machine — there is no file, no environment variable and no API for it. So
+the app measures what it can: time this process was running × the cores it has, and the size of
+`data/` sampled every minute. It never counts time it was not running, which makes it a floor: the
+real figure is the same or higher. The authoritative number is always
+[billing](https://github.com/settings/billing), linked from the panel.
+
+The allowance is **monthly** and resets on the 1st (UTC); there is **no weekly cap**, which is why
+there is no weekly meter. Both quotas can be set by hand in the panel (`POST /api/usage/settings`)
+for a plan that is not one of GitHub's stock two, and past months are kept in `data/usage.json` so
+the panel can show a trend instead of forgetting everything on the 1st.
 
 ## Closing the tab, and machines that stop
 
@@ -762,10 +823,17 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:mail` — the one-time mail setup: `.env` parsing and precedence, `data/mail.json`
   surviving a restart with `0600` permissions, the password never returned, and a running server
   sending a test mail the moment the form is saved.
-- `npm run test:ui` — 22 checks of the browser code in jsdom: the disk pill, the presets, "just download"
+- `npm run test:storage` — 62 checks: the storage report adds up to the space the machine says is
+  used, a running job's files cannot be deleted, the only copy of a video needs `force`, deleting
+  frees exactly the file's size, a pinned job survives the bulk clean, and the meter is simulated
+  across a month boundary (2 core-hours per hour on 2 cores, GB-months as an average, a restart
+  that must not credit the hours it was not running, the quota and the month surviving a restart).
+- `npm run test:ui` — 33 checks of the browser code in jsdom: the disk pill, the presets, "just download"
   greying the encoder controls, the size list in the picker, the per-picker switch sending
   `noCompress`, the email button, the webhook panel, and a running job's card showing its link,
-  the name its browser tab will carry, and its own "Just download it" button (needs
+  the name its browser tab will carry, its own "Just download it" button, the storage panel
+  (opening, file rows, download links, the disabled delete on a running job, the only-copy warning,
+  pinning, the bulk clean) and the session/limits tab with its meter (needs
   `npm i --no-save jsdom`, skips without it).
 - `npm run test:space` — the space policy end to end: a hosted job's files are deleted,
   the link survives, the download route answers `410`, and `KEEP_LOCAL_AFTER_UPLOAD=1` keeps
@@ -795,6 +863,8 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Housekeeping
 
-Finished files are removed by a sweeper (everything older than 3 hours, finished jobs after
-45 minutes), and all working files are wiped on restart. Job IDs are random and unguessable;
-nothing is shared between visitors. Downloads also stop if free disk space gets tight.
+Files are removed by a sweeper on the schedule above (a local copy two hours after its upload, a
+finished job after three, an unfinished one after a day), and a **pinned** job is never swept.
+Everything is visible and deletable in the storage panel before that happens. Job IDs are random
+and unguessable; nothing is shared between visitors. Downloads also stop if free disk space gets
+tight.

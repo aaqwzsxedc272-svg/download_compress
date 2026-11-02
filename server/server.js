@@ -35,6 +35,8 @@ const hosters = require('./hosters');
 const sources = require('./sources');
 const { resolve, directUrl, directCandidates } = require('../shared/resolve');
 const browserhooks = require('./browserhooks');
+const storage = require('./storage');
+const usageFactory = require('./usage');
 
 /* gofile mints its API token in an obfuscated browser script, and Cloudflare
    pages build their download button in JavaScript, so a headless browser is the
@@ -761,7 +763,10 @@ async function reclaimSpace(neededBytes) {
   let count = 0;
   const candidates = jobsStore
     .listJobs()
-    .filter((job) => job.hostedUrl && !job.hosting)
+    /* Pinned files are not the sweeper's to delete, even under pressure: the
+       job fails with NO_DISK and says what to remove, which is a choice only
+       the person who pinned it can make. */
+    .filter((job) => job.hostedUrl && !job.hosting && !job.pinLocal)
     .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
 
   for (const job of candidates) {
@@ -1288,6 +1293,17 @@ function updateQueuePositions() {
 let heartbeatTimer = null;
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_SECONDS || 45) * 1000;
 
+/* How much of GitHub's free allowance this machine has used. It counts only
+   while this process is alive, so it understates rather than overstates — see
+   server/usage.js for why it cannot be a reading from GitHub. */
+const usage = usageFactory.createMeter({
+  dataDir: jobsStore.DATA_DIR,
+  cores: Number(process.env.CODESPACE_CORES) || undefined,
+});
+/* Anything a job does is activity: the meter's idle countdown restarts, and the
+   time is credited without waiting for the next minute. */
+jobsStore.bus.on('update', () => usage.touch());
+
 function startHeartbeat() {
   if (heartbeatTimer || !HEARTBEAT_MS) return;
   heartbeatTimer = setInterval(() => {
@@ -1459,6 +1475,77 @@ app.get('/api/health', async (req, res) => {
         .filter((job) => job.interrupted && !job.hostedUrl).length,
     },
   });
+});
+
+/* ------------------------------------------------------- storage and limits */
+
+/**
+ * Everything on the disk, who it belongs to, and what it is worth deleting.
+ *
+ * The page opens this behind the header's storage button; `npm run disk` prints
+ * the same facts in a terminal.
+ */
+app.get('/api/storage', async (req, res) => {
+  const report = await storage.describe({
+    dataDir: jobsStore.DATA_DIR,
+    jobsStore,
+    projectRoot: path.join(__dirname, '..'),
+  });
+  res.json({ ...report, usage: usage.describe() });
+});
+
+/** Delete one file of one job. The guard rails live in server/storage.js. */
+app.delete('/api/storage/jobs/:id/:part', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  const result = await storage.deletePart({ jobsStore, job, part: req.params.part });
+  if (!result.ok) return fail(res, result.code === 'NOT_FOUND' ? 404 : 409, result.code, result.message);
+  console.log(`[space] deleted ${req.params.part} of ${job.id} — freed ${formatSize(result.freed)}`);
+  jobsStore.updateJob(job, {});
+  return res.json({ ok: true, freedBytes: result.freed, job: jobsStore.publicView(job) });
+});
+
+/** Bulk housekeeping: temp uploads, finished jobs, or everything. */
+app.post('/api/storage/clean', async (req, res) => {
+  const what = String((req.body || {}).what || 'finished');
+  if (!['tmp', 'finished', 'all'].includes(what)) return fail(res, 400, 'BAD_WHAT', 'Choose tmp, finished or all.');
+  if (what === 'all' && !(req.body || {}).force) {
+    return fail(res, 400, 'NEED_FORCE', 'Deleting everything removes files that have no share link. Send force: true.');
+  }
+  const result = await storage.clean({
+    dataDir: jobsStore.DATA_DIR,
+    jobsStore,
+    what,
+    force: Boolean((req.body || {}).force),
+  });
+  console.log(`[space] clean ${what}: freed ${formatSize(result.freedBytes)}, ${result.removedJobs} job(s) removed`);
+  return res.json(result);
+});
+
+/**
+ * Pin a job's local files so the sweeper leaves them alone.
+ *
+ * The sweeper exists because a Codespace has 32 GB; the pin exists because a
+ * file someone is still using is not the sweeper's to delete.
+ */
+app.post('/api/jobs/:id/pin', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  const pinned = Boolean((req.body || {}).pinned);
+  jobsStore.updateJob(job, { pinLocal: pinned });
+  res.json({ ok: true, job: jobsStore.publicView(job) });
+});
+
+/**
+ * The monthly allowance, as far as this machine can measure it.
+ *
+ * GitHub does not hand a Codespace its remaining hours, so this is a meter and
+ * says so; the real figure is on the billing page, which is linked.
+ */
+app.get('/api/usage', (req, res) => res.json({ usage: usage.describe() }));
+
+app.post('/api/usage/settings', async (req, res) => {
+  await usage.setSettings(req.body || {});
+  res.json({ ok: true, settings: usage.describe().settings, usage: usage.describe() });
 });
 
 app.get('/api/presets', (req, res) => res.json({ presets: PRESET_LIST }));
@@ -2800,6 +2887,19 @@ async function main() {
         `while it encodes. Reclaim space with: npm run disk -- --clean`,
     );
   }
+  /* The allowance meter: sample the size of data/ once a minute and credit the
+     time to the month. It starts after the data directory exists. */
+  const meter = await usage.init();
+  if (meter.month.coreHours > 0) {
+    console.log(
+      `Usage: ${meter.month.coreHours} of ${meter.month.quotaCoreHours} core-hours this month ` +
+        `(~${meter.month.machineHoursLeft} h of this ${meter.settings.cores}-core machine left)`,
+    );
+  }
+  setInterval(async () => {
+    usage.tick(await storage.dirSize(jobsStore.DATA_DIR).catch(() => 0));
+  }, usageFactory.TICK_MS).unref();
+
   app.listen(PORT, '0.0.0.0');
   await resumeInterrupted();
   resumeHosting();

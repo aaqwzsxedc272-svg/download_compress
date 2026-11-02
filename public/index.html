@@ -19,9 +19,12 @@
     <span class="brand-name">Squeeze</span>
   </a>
   <div class="header-meta">
-    <span class="pill" id="diskPill" title="Free space on the machine doing the work">
+    <button class="pill pill-btn" id="storageBtn" type="button" title="What is on this machine's disk — open the storage panel">
       <span class="dot"></span><span id="diskText">disk …</span>
-    </span>
+    </button>
+    <button class="pill pill-btn" id="usageBtn" type="button" title="How much of GitHub's free allowance this machine has used">
+      <span class="pill-glyph" aria-hidden="true">◔</span><span id="usageText">usage …</span>
+    </button>
     <span class="pill" id="enginePill"><span class="dot"></span><span id="engineText">checking engine…</span></span>
   </div>
   <div class="disk-bar" id="diskBar" aria-hidden="true"><span class="disk-bar-fill" id="diskBarFill"></span></div>

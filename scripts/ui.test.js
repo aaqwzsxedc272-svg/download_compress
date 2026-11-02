@@ -65,6 +65,139 @@ const LINKS = {
   ],
 };
 
+const STORAGE = {
+  disk: { totalBytes: 32 * 1024 ** 3, freeBytes: 12 * 1024 ** 3, usedBytes: 20 * 1024 ** 3, percentFree: 38 },
+  totals: {
+    dataBytes: 6 * 1024 ** 3,
+    jobsBytes: 5.5 * 1024 ** 3,
+    otherDataBytes: 0.5 * 1024 ** 3,
+    projectBytes: 0.4 * 1024 ** 3,
+    homeBytes: 0.2 * 1024 ** 3,
+    extrasBytes: 0.6 * 1024 ** 3,
+    squeezeBytes: 6 * 1024 ** 3,
+    restOfMachineBytes: 13.4 * 1024 ** 3,
+  },
+  breakdown: [
+    { label: 'Videos (jobs)', bytes: 5.5 * 1024 ** 3, kind: 'jobs' },
+    { label: 'Temp uploads', bytes: 0.4 * 1024 ** 3, kind: 'tmp', deletable: true },
+    { label: 'Records (links, meter)', bytes: 4096, kind: 'records' },
+  ],
+  jobs: [
+    {
+      id: 'jobBig',
+      name: 'Holiday film.mp4',
+      status: 'hosted',
+      stage: 'Ready',
+      createdAt: Date.now(),
+      hostedUrl: 'https://pixeldrain.com/u/abc',
+      hostProvider: 'pixeldrain',
+      pinLocal: true,
+      active: false,
+      bytes: 4 * 1024 ** 3,
+      autoDeletesInSeconds: 3600,
+      files: [
+        {
+          part: 'source',
+          label: 'Original download',
+          bytes: 3 * 1024 ** 3,
+          download: '/api/jobs/jobBig/original/Holiday%20film.mp4',
+          note: 'kept so a resume does not download it again',
+        },
+        {
+          part: 'output',
+          label: 'Compressed result',
+          bytes: 1 * 1024 ** 3,
+          download: '/api/jobs/jobBig/download/Holiday%20film.mp4',
+          note: 'also uploaded — this copy is a spare',
+        },
+      ],
+    },
+    {
+      id: 'jobLive',
+      name: 'Long one.mp4',
+      status: 'compressing',
+      stage: 'Encoding',
+      createdAt: Date.now(),
+      hostedUrl: null,
+      pinLocal: false,
+      active: true,
+      bytes: 512 * 1024 ** 2,
+      autoDeletesInSeconds: null,
+      files: [
+        {
+          part: 'source',
+          label: 'Original download',
+          bytes: 512 * 1024 ** 2,
+          download: '/api/jobs/jobLive/original/Long%20one.mp4',
+          note: 'this file is in use',
+        },
+      ],
+    },
+  ],
+  extras: [{ label: 'Project (node_modules, ffmpeg)', bytes: 0.4 * 1024 ** 3, kind: 'project' }],
+  reclaimable: { finished: 4 * 1024 ** 3, hosted: 4 * 1024 ** 3, tmp: 0.4 * 1024 ** 3, sample: 0 },
+  limits: { hostedLocalMinutes: 120, finishedMinutes: 180, unfinishedHours: 24 },
+  at: Date.now(),
+};
+
+const USAGE = {
+  meter: {
+    source: 'local',
+    file: 'data/usage.json',
+    countsOnlyWhileRunning: true,
+    note:
+      'Measured by this app while it is running: time × cores, and the size of data/ sampled every minute. ' +
+      'GitHub does not publish remaining Codespaces hours to the machine, so this is a meter, not a reading.',
+  },
+  settings: {
+    plan: 'free',
+    planLabel: 'GitHub Free',
+    quotaCoreHours: 120,
+    quotaStorageGb: 15,
+    idleMinutes: 30,
+    cores: 2,
+    plans: [
+      { id: 'free', label: 'GitHub Free', coreHours: 120, storageGb: 15 },
+      { id: 'pro', label: 'GitHub Pro', coreHours: 180, storageGb: 20 },
+      { id: 'custom', label: 'Set by hand', coreHours: 120, storageGb: 15 },
+    ],
+  },
+  session: {
+    startedAt: Date.now() - 3600000,
+    elapsedSeconds: 3600,
+    coreHours: 2,
+    cores: 2,
+    idleMinutes: 30,
+    idleStopsAt: Date.now() + 1800000,
+    idleSecondsLeft: 1800,
+    awake: true,
+  },
+  month: {
+    key: '2026-11',
+    resetAt: Date.UTC(2026, 11, 1),
+    resetsInHours: 600,
+    hoursInMonth: 720,
+    coreHours: 48,
+    quotaCoreHours: 120,
+    remainingCoreHours: 72,
+    machineHoursLeft: 36,
+    percent: 40,
+    projectedCoreHours: 100,
+    sessions: 3,
+  },
+  storage: {
+    bytesNow: 6 * 1024 ** 3,
+    peakBytes: 8 * 1024 ** 3,
+    gbMonths: 3.2,
+    quotaGb: 15,
+    remainingGb: 11.8,
+    percent: 21.3,
+    projectedGbMonths: 6.4,
+  },
+  history: [],
+  at: Date.now(),
+};
+
 /** A DOM with app.js already running and fetch answering the read-only calls. */
 async function boot({
   links = LINKS,
@@ -81,6 +214,11 @@ async function boot({
   publishResult = { ok: true, sink: 'gist', label: 'GitHub gist', url: 'https://gist.github.com/x/deadbeef', count: 1 },
   /* What the server answers to "just download it" — a view of the same job. */
   keepOriginal = { job: { id: 'job1', status: 'queued' } },
+  storage = STORAGE,
+  usage = USAGE,
+  cleanResult = { ok: true, freedBytes: 2 * 1024 ** 3, removedJobs: 1, kept: [] },
+  deleteResult = { ok: true, freedBytes: 3 * 1024 ** 3, job: { id: 'jobBig' } },
+  usageSettings = null,
 } = {}) {
   const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
   const dom = new JSDOM(html, {
@@ -131,6 +269,12 @@ async function boot({
     else if (target.includes('/api/publish')) body = { publish: { ...publishInfo, settings: liveSettings } };
     else if (target.includes('/api/links')) body = links;
     else if (target.includes('/api/resolve') && resolved) body = resolved;
+    else if (target.includes('/api/storage/clean')) body = cleanResult;
+    else if (target.includes('/api/storage/jobs/') && init.method === 'DELETE') body = deleteResult;
+    else if (target.includes('/api/storage')) body = storage;
+    else if (target.includes('/api/usage/settings')) {
+      body = { ok: true, settings: usageSettings || usage.settings, usage };
+    } else if (target.includes('/api/usage')) body = { usage };
     else if (target.includes('/keep-original')) body = keepOriginal;
     else if (target.includes('/api/jobs') && init.method === 'POST') body = { job: { id: 'job1', status: 'queued' } };
     else if (target.includes('/api/jobs')) body = { jobs: [] };
@@ -667,6 +811,233 @@ async function boot({
     }
     if (!saved.length) throw new Error('the file landed and nothing was saved');
     if (!/\/api\/jobs\/jobLate\/original\/Big\.mkv$/.test(saved[0])) throw new Error(`saved from ${saved[0]}`);
+  });
+
+  console.log('storage and session');
+
+  await test('the disk pill is a button that opens the storage panel', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    const button = doc.getElementById('storageBtn');
+    if (!button) throw new Error('the disk pill is not a button');
+    if (button.tagName !== 'BUTTON') throw new Error(`the disk pill is a <${button.tagName.toLowerCase()}>`);
+    button.dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const panel = doc.getElementById('storagePanel');
+    if (!panel) throw new Error('clicking it opened nothing');
+    if (panel.getAttribute('role') !== 'dialog') throw new Error('the panel is not announced as a dialog');
+    if (!app.calls.some((entry) => entry.url.includes('/api/storage'))) throw new Error('the panel never asked the server what is on disk');
+  });
+
+  await test('the panel lists every job with its files, sizes and what they are', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    doc.getElementById('storageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const rows = doc.querySelectorAll('.storage-job');
+    if (rows.length !== STORAGE.jobs.length) throw new Error(`listed ${rows.length} of ${STORAGE.jobs.length} jobs`);
+    const first = doc.querySelector('[data-job-id="jobBig"]');
+    const text = first.textContent;
+    if (!/Holiday film\.mp4/.test(text)) throw new Error('the name is missing');
+    if (!/4\.00 GB/.test(text)) throw new Error(`the size is missing: ${text.slice(0, 120)}`);
+    if (!/Original download/.test(text) || !/Compressed result/.test(text)) throw new Error('the files are not split by kind');
+    if (!/also uploaded/.test(text)) throw new Error('a spare copy is not described');
+    /* Where the space went, and that the rows add up. */
+    const breakdown = doc.querySelector('.ssize-list').textContent;
+    for (const label of ['Videos (jobs)', 'Temp uploads', 'Project (node_modules, ffmpeg)', 'Everything else on the machine']) {
+      if (!breakdown.includes(label)) throw new Error(`breakdown is missing "${label}"`);
+    }
+  });
+
+  await test('a file can be downloaded from the panel, and a running one cannot be deleted', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    doc.getElementById('storageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+
+    const big = doc.querySelector('[data-job-id="jobBig"]');
+    const links = [...big.querySelectorAll('.storage-file-actions a')];
+    const original = links.find((link) => /Download original/.test(link.textContent));
+    if (!original) throw new Error('no download link for the original');
+    if (!/\/api\/jobs\/jobBig\/original\//.test(original.getAttribute('href'))) {
+      throw new Error(`it points at ${original.getAttribute('href')}`);
+    }
+    const compressed = links.find((link) => link.textContent === 'Download');
+    if (!compressed) throw new Error('no download link for the compressed file');
+
+    /* The job that is working right now: its delete buttons are disabled. */
+    const live = doc.querySelector('[data-job-id="jobLive"]');
+    const liveDeletes = [...live.querySelectorAll('.storage-file-actions button')];
+    if (!liveDeletes.length) throw new Error('no delete button at all');
+    if (!liveDeletes.every((button) => button.disabled)) throw new Error('a running job can be deleted from the panel');
+    if (!/In use/.test(live.textContent)) throw new Error('nothing says why it cannot be deleted');
+  });
+
+  await test('deleting a file asks first, then tells the server and reloads', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    const asked = [];
+    window.confirm = (message) => {
+      asked.push(message);
+      return true;
+    };
+    doc.getElementById('storageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+
+    const big = doc.querySelector('[data-job-id="jobBig"]');
+    const remove = [...big.querySelectorAll('.storage-file-actions button')].find((button) => button.textContent === 'Delete');
+    remove.dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+
+    if (!asked.length) throw new Error('it deleted without asking');
+    if (!/Original download/.test(asked[0])) throw new Error(`the question does not say what: ${asked[0]}`);
+    const call = app.calls.find((entry) => entry.url.includes('/api/storage/jobs/jobBig/') && entry.init.method === 'DELETE');
+    if (!call) throw new Error('the server was never told');
+    if (!/\/source$/.test(call.url)) throw new Error(`deleted ${call.url}`);
+    const alert = doc.getElementById('alert');
+    if (!/3\.00 GB freed/.test(alert.textContent)) throw new Error(`no report of what was freed: ${alert.textContent}`);
+  });
+
+  await test('deleting the only copy warns that it is the only copy', async () => {
+    const app = await boot({
+      storage: {
+        ...STORAGE,
+        jobs: [
+          {
+            ...STORAGE.jobs[0],
+            id: 'jobOnly',
+            hostedUrl: null,
+            files: [
+              {
+                part: 'output',
+                label: 'Compressed result',
+                bytes: 1024 ** 3,
+                download: '/api/jobs/jobOnly/download/x.mp4',
+                note: 'the only copy until it is uploaded',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const { window, doc } = app;
+    const asked = [];
+    window.confirm = (message) => {
+      asked.push(message);
+      return false;
+    };
+    doc.getElementById('storageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const remove = [...doc.querySelectorAll('.storage-file-actions button')].find((button) => button.textContent === 'Delete');
+    remove.dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 60));
+    if (!/only copy/.test(asked[0] || '')) throw new Error(`the warning does not mention the only copy: ${asked[0]}`);
+    /* Answering "no" must not call the server. */
+    if (app.calls.some((entry) => entry.url.includes('/api/storage/jobs/jobOnly') && entry.init.method === 'DELETE')) {
+      throw new Error('it deleted after being told not to');
+    }
+  });
+
+  await test('a job can be pinned so the sweeper leaves it alone', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    doc.getElementById('storageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const pinned = doc.querySelector('[data-job-id="jobBig"]');
+    const pin = pinned.querySelector('[data-pin]');
+    if (!pin) throw new Error('no pin button');
+    if (pin.textContent !== 'Unpin') throw new Error(`a pinned job offers "${pin.textContent}"`);
+    if (!/Pinned/.test(pinned.textContent)) throw new Error('nothing says it is pinned');
+    pin.dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const call = app.calls.find((entry) => entry.url.includes('/api/jobs/jobBig/pin') && entry.init.method === 'POST');
+    if (!call) throw new Error('the server was never told');
+    if (JSON.parse(call.init.body).pinned !== false) throw new Error('unpinning sent the wrong value');
+  });
+
+  await test('the bulk clean asks, sends what was asked for, and reports the result', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    const asked = [];
+    window.confirm = (message) => {
+      asked.push(message);
+      return true;
+    };
+    doc.getElementById('storageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const temp = doc.querySelector('[data-clean="tmp"]');
+    if (!temp) throw new Error('no button for the temp uploads');
+    temp.dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    const call = app.calls.find((entry) => entry.url.includes('/api/storage/clean'));
+    if (!call) throw new Error('nothing was sent');
+    if (JSON.parse(call.init.body).what !== 'tmp') throw new Error(`sent ${call.init.body}`);
+    if (!/Freed 2\.00 GB/.test(doc.getElementById('alert').textContent)) throw new Error('the result was not reported');
+    if (!asked.length) throw new Error('it cleaned without asking');
+  });
+
+  await test('the usage tab shows the month, the session and where the numbers come from', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    doc.getElementById('usageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const body = doc.getElementById('storageBody');
+    if (!body) throw new Error('the usage pill opened nothing');
+    if (body.dataset.tab !== 'usage') throw new Error(`opened on "${body.dataset.tab}"`);
+    const text = body.textContent;
+    if (!/48\.0 core-hours/.test(text)) throw new Error('the month used is missing');
+    if (!/120/.test(text)) throw new Error('the quota is missing');
+    if (!/36 more hours/.test(text)) throw new Error(`the machine-hours left is missing: ${text.slice(0, 200)}`);
+    if (!/3\.20 GB-months/.test(text)) throw new Error('the storage allowance is missing');
+    if (!/This session: 1h 0m/.test(text)) throw new Error('the session length is missing');
+    if (!/until GitHub stops it for being idle/i.test(text)) throw new Error('no tracker for the time left in the session');
+    if (!/30 min/.test(text)) throw new Error('the idle window is missing');
+    if (!/not a reading|meter/i.test(text)) throw new Error('it does not admit what it is');
+    if (!/monthly/i.test(text) || !/no weekly cap/i.test(text)) throw new Error('the monthly/weekly answer is missing');
+    const link = [...body.querySelectorAll('a')].find((a) => /settings\/billing/.test(a.getAttribute('href') || ''));
+    if (!link) throw new Error('no link to the real billing page');
+    const bars = body.querySelectorAll('.meter-fill');
+    if (bars.length < 2) throw new Error('no bars to read at a glance');
+  });
+
+  await test('the header pill says how many hours are left, not a bare count', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const text = doc.getElementById('usageText').textContent;
+    if (!/36\.0 h left/.test(text)) throw new Error(`the pill says "${text}"`);
+    const pill = doc.getElementById('usageBtn');
+    if (!/48\.0 of 120 core-hours/.test(pill.title)) throw new Error(`the tooltip says "${pill.title}"`);
+  });
+
+  await test('the plan can be changed from the panel and the new quota is used', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    doc.getElementById('usageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    const form = doc.getElementById('usageForm');
+    if (!form) throw new Error('no plan form');
+    const plan = doc.getElementById('usagePlan');
+    if (plan.options.length !== 3) throw new Error(`the plan list has ${plan.options.length} options`);
+    plan.value = 'pro';
+    plan.dispatchEvent(new window.Event('change'));
+    if (doc.getElementById('usageCoreHours').value !== '180') throw new Error('choosing Pro did not fill in its quota');
+    form.dispatchEvent(new window.Event('submit'));
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    const call = app.calls.find((entry) => entry.url.includes('/api/usage/settings'));
+    if (!call) throw new Error('the plan was not saved');
+    const sent = JSON.parse(call.init.body);
+    if (sent.plan !== 'pro' || sent.coreHours !== 180) throw new Error(`sent ${call.init.body}`);
+  });
+
+  await test('closing the panel stops it refreshing in the background', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    doc.getElementById('storageBtn').dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    doc.getElementById('storageClose').dispatchEvent(new window.Event('click'));
+    if (doc.getElementById('storagePanel')) throw new Error('the panel did not close');
+    if (app.window.__app.state.storageTimer) throw new Error('the refresh timer is still running');
   });
 
   console.log('');

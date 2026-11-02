@@ -249,6 +249,8 @@ function publicView(job) {
     downloadResumed: Boolean(job.downloadResumed),
     projection: job.projection || null,
     hostedUrl: job.hostedUrl || null,
+    /* Keep this job's files through the sweeper (the storage panel toggles it). */
+    pinLocal: Boolean(job.pinLocal),
     hostProvider: job.hostProvider || null,
     hostError: job.hostError || null,
     hostedBy: job.hostedBy || null,
@@ -292,22 +294,38 @@ async function removeJob(id) {
 
 const HOSTED_RECORD_MS = 30 * 24 * 60 * 60 * 1000; // a share link stays useful for a month
 
+/* How long the *local* copy lingers once a job no longer needs it. The app is
+   for saving a video to a computer, and a computer can be across the room: two
+   hours is long enough to arrive, short enough that a 32 GB Codespace does not
+   fill up. The storage panel shows the deadline for every file, and a pinned
+   job is never swept. */
+const HOSTED_LOCAL_MS = Number(process.env.HOSTED_LOCAL_KEEP_MINUTES || 120) * 60 * 1000;
+const FINISHED_MS = Number(process.env.FINISHED_KEEP_MINUTES || 180) * 60 * 1000;
+
 function sweep() {
   const now = Date.now();
   for (const job of jobs.values()) {
     const age = now - job.createdAt;
 
+    /* Pinned: the user asked for these files to stay. Disk pressure is handled
+       before a job starts (reclaimSpace), which also respects the pin. */
+    if (job.pinLocal) continue;
+
     if (job.hostedUrl) {
-      // The file lives on the host now, so only the local copy is expendable.
+      /* The file lives on the host now, so only the local copy is expendable.
+         The clock starts when the upload finished, not when the job was
+         created: a three-hour encode would otherwise have its local copy
+         deleted the moment it became shareable. */
+      const sinceHosted = now - (Number(job.hostedAt) || job.createdAt);
       if (age > HOSTED_RECORD_MS) removeJob(job.id);
-      else if (age > 30 * 60 * 1000) {
+      else if (sinceHosted > HOSTED_LOCAL_MS) {
         fsp.rm(job.dir, { recursive: true, force: true }).catch(() => {});
       }
       continue;
     }
 
     const finished = job.status === 'done' || job.status === 'error';
-    if (age > MAX_AGE_MS || (finished && age > 45 * 60 * 1000)) {
+    if (age > MAX_AGE_MS || (finished && age > FINISHED_MS)) {
       removeJob(job.id);
     }
   }

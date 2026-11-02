@@ -242,7 +242,21 @@ function filenameFromUrl(raw) {
 async function downloadHttp(
   url,
   destPath,
-  { onProgress, maxBytes = 1024 ** 3, idleTimeoutMs = 45_000, signal: outerSignal, extraHeaders = {} } = {},
+  {
+    onProgress,
+    maxBytes = 1024 ** 3,
+    idleTimeoutMs = 45_000,
+    signal: outerSignal,
+    extraHeaders = {},
+    /* Continue a download that was cut off (a crashed machine, a stopped
+       Codespace) instead of fetching the same gigabytes again. */
+    resumeFrom = 0,
+    expectTotal = 0,
+    /* Called as soon as the headers are in, before a single byte is written:
+       the size and URL have to be recorded *before* the transfer can be cut
+       off by a crash, or the next run has nothing to resume against. */
+    onStart = null,
+  } = {},
 ) {
   if (isBlockedHost(url)) {
     throw Object.assign(new Error('That address is not allowed.'), { code: 'BLOCKED_HOST' });
@@ -285,10 +299,11 @@ async function downloadHttp(
     /* no resolver module (standalone use): carry on without the cookie */
   }
 
+  const rangeHeaders = resumeFrom > 0 ? { range: `bytes=${Math.floor(resumeFrom)}-` } : {};
   let res;
   try {
     res = await fetch(url, {
-      headers: { ...browserHeaders(false), ...hostHeaders, ...extraHeaders },
+      headers: { ...browserHeaders(false), ...hostHeaders, ...extraHeaders, ...rangeHeaders },
       redirect: 'follow',
       signal: controller.signal,
     });
@@ -309,12 +324,32 @@ async function downloadHttp(
     throw Object.assign(new Error(`Could not reach ${new URL(url).hostname}.`), { code: 'UNREACHABLE' });
   }
 
+  /* A range the server did not honour comes back as 200 with the whole file;
+     that is not an error, it just means the download starts over. */
+  const partial = resumeFrom > 0 && res.status === 206;
+  if (partial) {
+    const contentRange = String(res.headers.get('content-range') || '');
+    const parsed = /bytes\s+(\d+)-(\d+)\/(\d+)/i.exec(contentRange);
+    const start = parsed ? Number(parsed[1]) : NaN;
+    const whole = parsed ? Number(parsed[3]) : 0;
+    /* The range has to start exactly where the fragment ends, and (when the
+       earlier run recorded it) belong to a file of the same size. A host that
+       mints a fresh URL for the same bytes passes this; a different file does
+       not. */
+    const wrongStart = Number.isFinite(start) && start !== Math.floor(resumeFrom);
+    const wrongSize = expectTotal > 0 && whole > 0 && whole !== expectTotal;
+    if (wrongStart || wrongSize) {
+      res.body?.cancel().catch(() => {});
+      clearTimeout(idle);
+      throw Object.assign(new Error('The host sent a different range than was asked for.'), { code: 'BAD_RANGE' });
+    }
+  }
   if (!res.ok || !res.body) {
     clearTimeout(idle);
     throw Object.assign(new Error(`The link returned HTTP ${res.status}.`), { code: 'BAD_STATUS' });
   }
 
-  const total = Number(res.headers.get('content-length') || 0);
+  const total = Number(res.headers.get('content-length') || 0) + (partial ? Math.floor(resumeFrom) : 0);
   const type = (res.headers.get('content-type') || '').toLowerCase();
   /* The host knows what the file is called; a signed CDN URL usually does not.
      Content-Disposition is the only place a name like "Holiday in Rome.mp4"
@@ -338,32 +373,62 @@ async function downloadHttp(
     });
   }
 
+  if (onStart) {
+    try {
+      onStart({ total, resumeFrom: partial ? Math.floor(resumeFrom) : 0, url: res.url || url, filename });
+    } catch {
+      /* a callback must never break a download */
+    }
+  }
+
   let received = 0;
+  const offset = partial ? Math.floor(resumeFrom) : 0;
   const body = Readable.fromWeb(res.body);
   body.on('data', (chunk) => {
     received += chunk.length;
     bump();
-    if (received > maxBytes) controller.abort();
-    if (onProgress) onProgress(received, total);
+    if (offset + received > maxBytes) controller.abort();
+    if (onProgress) onProgress(offset + received, total);
   });
 
+  /* A crash must not cost the bytes that already arrived, so the partial file
+     is left on disk on failure (it is what the next run resumes from). Only a
+     deliberate cancel, or a host that lied about the range, throws it away. */
+  let out;
   try {
-    await pipeline(body, fs.createWriteStream(destPath));
+    out = fs.createWriteStream(destPath, { flags: partial ? 'a' : 'w' });
+    await pipeline(body, out);
   } catch (err) {
-    await fsp.rm(destPath, { force: true }).catch(() => {});
+    if (!partial || outerSignal?.aborted) await fsp.rm(destPath, { force: true }).catch(() => {});
     if (outerSignal && outerSignal.aborted) {
       throw Object.assign(new Error('Download cancelled.'), { code: 'CANCELLED' });
     }
-    if (received > maxBytes) {
+    if (offset + received > maxBytes) {
       throw Object.assign(new Error('That file is larger than this server accepts.'), { code: 'TOO_BIG' });
     }
-    throw Object.assign(new Error('The download stopped before it finished.'), { code: 'DOWNLOAD_FAILED' });
+    const kept = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
+    throw Object.assign(
+      new Error(
+        kept
+          ? `The download stopped before it finished — ${Math.round(kept / 1048576)} MB are kept and it carries on from there.`
+          : 'The download stopped before it finished.',
+      ),
+      { code: 'DOWNLOAD_FAILED', keptBytes: kept },
+    );
   } finally {
     clearTimeout(idle);
     if (outerSignal) outerSignal.removeEventListener('abort', forwardAbort);
   }
 
-  return { bytes: received, contentType: type, filename, url: res.url || url };
+  const expected = expectTotal > 0 ? expectTotal : total;
+  return {
+    bytes: offset + received,
+    contentType: type,
+    filename,
+    url: res.url || url,
+    resumed: partial,
+    total: expected,
+  };
 }
 
 module.exports = {

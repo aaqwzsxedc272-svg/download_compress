@@ -317,6 +317,7 @@ function updateCard(entry, job) {
     }
   }
   if (job.source === 'relay') bits.push('via your browser');
+  if (job.downloadResumed) bits.push('download continued where it stopped');
   if (job.resumed) bits.push('picked up after a restart');
   metaEl.innerHTML = bits.join('<span style="opacity:.3">·</span>');
   metaEl.style.display = bits.length ? '' : 'none';
@@ -2378,6 +2379,23 @@ async function boot() {
     renderRecovery(health.recovery);
     if (!localStorage.getItem(STORAGE.preset) && health.defaultPreset) state.presetId = health.defaultPreset;
     renderPresets(health.presets);
+    /* Say which build this is: "am I running the fix?" stops being a guess. */
+    const build = document.getElementById('buildInfo');
+    if (build && health.version) {
+      const v = health.version;
+      const bits = [v.commit ? `build ${v.commit}` : 'build dev'];
+      if (v.features) {
+        bits.push(`resume ${v.features.resumableEncode ? '✓' : 'off'}`);
+        bits.push(`browser ${v.features.cloudflareBrowser ? '✓' : '—'}`);
+      }
+      build.textContent = bits.join(' · ');
+      build.title =
+        `Squeeze ${v.version || ''}${v.commit ? ` at ${v.commit}` : ''}\n` +
+        `resumable encode: ${v.features?.resumableEncode ? 'on' : 'off'}\n` +
+        `headless browser: ${v.browser && v.browser.available ? 'available' : (v.browser && v.browser.why) || 'not installed'}\n` +
+        `started: ${v.startedAt}`;
+    }
+
     const pill = $('#enginePill');
     pill.classList.add('is-ok');
     $('#engineText').textContent = health.platformDownloads

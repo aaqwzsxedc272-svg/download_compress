@@ -245,6 +245,14 @@ fly deploy
 > turbo.cr links fail with "this server has no internet route to …" while uploads work
 > normally. A normal deployment has full outbound access and resolves them directly.
 
+## Which build is this?
+
+`data/` survives a crash, so the first question after one is "am I running the fix?". The answer is
+in three places, all cheap: the console's second line (`Squeeze 1.0.0 · 19d1471 · resumable encode
+on · browser no`), the footer of the page (`build 19d1471 · resume ✓ · browser ✓`), and
+`GET /api/version`. The commit is read from `.git` at startup, and reports `null` rather than a
+guess when the code is not a checkout.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -510,6 +518,23 @@ npm run browser:install      # npm install --no-save playwright && npx playwrigh
 
 `/api/health` reports `browserAvailable`, so the page knows whether step 2 exists on this machine.
 
+### When a link still does not work: `npm run doctor`
+
+The app can only show one line of an error, and "it did not work" is not enough to tell a bot check
+from an expired link from a CDN that wants a cookie. So the whole path can be run on demand:
+
+```bash
+npm run doctor -- https://theditch.st/qhygxukd
+```
+
+It prints, in order: the build (`1.0.0 · 19d1471` — the first thing worth knowing after a crash),
+whether a browser is really usable *and where its binary is*, the plain request's status and
+Cloudflare headers, the title and whether that page was a challenge, what the resolver found and
+which cookies it holds, what every candidate URL answers to a one-byte `Range` request, and what a
+real browser sees. Then it says what the combination means. `GET /api/diagnose-link?url=…` returns
+the same thing as JSON, with `&format=text` for the block above. Signed tokens are redacted —
+they are short-lived credentials.
+
 `npm run test:fallback` covers the observe-the-media path against a fake host that refuses plain
 requests, and `npm run test:resolve` covers the Cloudflare path (challenge detected → browser
 asked → cookie carried → and a normal page never costs a browser).
@@ -572,7 +597,7 @@ the encode carries on. Two things follow from that, and both are tested rather t
 
   | Stopped while | What is on disk | What happens on the next start |
   | --- | --- | --- |
-  | downloading | a half-written `source` | the fragment is deleted and the file is fetched again, into the same job |
+  | downloading | a half-written `source` | the transfer continues from that byte with a `Range` request — not a second copy |
   | encoding | the whole `source`, **plus every part already encoded** | the encoder starts again on the *unfinished parts only* (see below) |
   | uploading | the finished `output.mp4` | it is uploaded again; the job is never marked failed |
   | done, posted | the ledger and the link | nothing to do — the link already works |
@@ -603,6 +628,15 @@ says *Encoding part 5 of 12 — resumable*, and after a restart *Picking up wher
 The cost is a couple of percent of file size (each part starts a fresh encode), which buys back
 however long the machine had already spent. Short files (<4 min), `targetMb` jobs (two passes
 cannot be split) and `SEGMENTED=0` keep the single-pass, whole-file encode.
+
+**The download resumes too.** A 2 GB file arriving at 60% when the machine dies used to be thrown
+away and fetched again — the most expensive thing to lose, because it is pure network time. The
+fragment is kept, its size and the URL are recorded the moment the host answers, and the next run
+asks for `Range: bytes=<size>-`. The host's `Content-Range` has to start exactly where the
+fragment ends and report the same total, so a link that now points at a different file is refused
+and the download starts clean instead of producing a corrupt video. If the host ignores ranges it
+answers `200` with the whole file, which is handled as a normal restart. The card says *Continuing
+the download from 640 MB* and marks the file *download continued where it stopped*.
 
 - **The two things that can still be lost** are the encoder's *remaining* time (never the whole
   job) and a finished file that was never uploaded, if the container itself is deleted. GitHub
@@ -658,8 +692,10 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
-- `npm run test:resolve` — 34 resolver tests against stubbed APIs (real response shapes),
-  including the three URL shapes a fileditch page hands out and the Cloudflare path,
+- `npm run test:resolve` — 37 resolver tests against stubbed APIs (real response shapes),
+  including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
+  reveals its download button to a browser, and the rule that a player page is never offered before
+  a minted link,
   including the page-title naming rule and fileditch's minted-link/player routes.
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
@@ -690,10 +726,12 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:durability` — a job finishes with nobody watching, and its link survives the
   server being killed and restarted.
 - `npm run test:resume` — an encode killed at 6% finishes after a restart (takes ~5 minutes).
+- `npm run doctor -- <link>` — walks a link through every stage against the real host and explains
+  what went wrong. No server needed.
 - `npm run test:segments` — 18 checks: the parts cover the file exactly, a real encode is killed
   mid-way, the parts from before the crash are reused (their mtimes prove it), and the joined
   file is as long as the source with its audio.
-- `npm run test:recover` — 26 checks: a download cut in half resumes, a job left mid-upload is
+- `npm run test:recover` — 27 checks: a download cut in half resumes, a job left mid-upload is
   uploaded again, "just download it" pressed mid-encode returns the original byte for byte, and a
   finished file's link is posted before the queue has drained.
 - `npm run smoke` — 61 end-to-end checks: sample, upload, browser relay, target size, range

@@ -31,7 +31,8 @@
     "test:durability": "node scripts/durability.test.js",
     "test:resume": "node scripts/resume.test.js",
     "test:recover": "node scripts/recovery.test.js",
-    "test:segments": "node scripts/segments.test.js"
+    "test:segments": "node scripts/segments.test.js",
+    "doctor": "node scripts/doctor.js"
   },
   "engines": {
     "node": ">=18"

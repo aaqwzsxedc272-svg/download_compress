@@ -1194,3 +1194,11 @@ input.is-off {
 @media (max-width: 640px) {
   .mail-grid { grid-template-columns: 1fr; }
 }
+
+/* Which build is running: the first thing to ask after a crash. */
+.footer-build {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  opacity: 0.8;
+}

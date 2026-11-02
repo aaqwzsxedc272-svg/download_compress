@@ -94,29 +94,50 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
 /* A source host that hands the file out slowly, so there is a real window in
    which to stop the machine — exactly what a big file on a slow host does. */
 function slowSource(file) {
+  /* Every request is recorded, with a Range header when the app resumes: that
+     is the evidence that the file was not downloaded twice. */
+  const requests = [];
   const server = http.createServer(async (req, res) => {
     if (!req.url.startsWith('/slow.mp4')) return res.writeHead(404).end();
     try {
-    const size = (await fsp.stat(file)).size;
-    res.writeHead(200, {
-      'content-type': 'video/mp4',
-      'content-length': String(size),
-      'content-disposition': 'attachment; filename="Slow Download.mp4"',
-    });
-    const stream = fs.createReadStream(file, { highWaterMark: 256 * 1024 });
-    for await (const chunk of stream) {
-      if (res.destroyed) return;
-      res.write(chunk);
-      await sleep(120);
-    }
-    res.end();
+      const size = (await fsp.stat(file)).size;
+      const range = req.headers.range || null;
+      requests.push({ range, at: Date.now() });
+      let start = 0;
+      const status = range ? 206 : 200;
+      if (range) {
+        const m = /bytes=(\d+)-/.exec(range);
+        start = m ? Number(m[1]) : 0;
+        res.writeHead(206, {
+          'content-type': 'video/mp4',
+          'content-length': String(size - start),
+          'content-range': `bytes ${start}-${size - 1}/${size}`,
+          'accept-ranges': 'bytes',
+          'content-disposition': 'attachment; filename="Slow Download.mp4"',
+        });
+      } else {
+        res.writeHead(200, {
+          'content-type': 'video/mp4',
+          'content-length': String(size),
+          'accept-ranges': 'bytes',
+          'content-disposition': 'attachment; filename="Slow Download.mp4"',
+        });
+      }
+      const stream = fs.createReadStream(file, { start, highWaterMark: 256 * 1024 });
+      for await (const chunk of stream) {
+        if (res.destroyed) return;
+        res.write(chunk);
+        await sleep(120);
+      }
+      res.end();
     } catch (err) {
       /* A missing file must not take the whole test process down. */
       if (!res.headersSent) res.writeHead(500);
       res.end(String(err.message));
     }
   });
-  return server.listen(SOURCE_PORT, '127.0.0.1');
+  server.requests = requests;
+  return server;
 }
 
 (async () => {
@@ -161,6 +182,7 @@ function slowSource(file) {
     if (!built) throw new Error('the sample clip was never built, so nothing below can be honest');
 
     source = slowSource(sample);
+    await new Promise((resolve) => source.listen(SOURCE_PORT, '127.0.0.1', resolve));
     const sourceUrl = `http://127.0.0.1:${SOURCE_PORT}/slow.mp4`;
 
     /* ---------------------------------------------------------------- 1 */
@@ -195,7 +217,7 @@ function slowSource(file) {
     check('the same job is still there after the restart', Boolean(after), after ? after.status : 'gone');
     check('it is picked up instead of being left failed', after?.resumed === true || after?.status !== 'error', after?.status);
     check(
-      'it is downloading again rather than re-using the fragment',
+      'it carries on from the fragment instead of starting over',
       ['fetching', 'queued', 'compressing', 'done', 'hosted'].includes(after?.status),
       after?.status,
     );
@@ -204,6 +226,14 @@ function slowSource(file) {
       const job = await getJob(downloading);
       return job && ['done', 'hosted', 'error'].includes(job.status) ? job : null;
     });
+    /* The complaint this test exists for: "it re-downloaded the whole file".
+       A resume sends Range from where the fragment ended. */
+    const ranged = source.requests.filter((entry) => entry.range && entry.range !== 'bytes=0-');
+    check(
+      'the rest of the download is a Range request, not a second full copy',
+      ranged.length > 0,
+      `${source.requests.length} request(s): ${source.requests.map((r) => r.range || 'full').join(', ')}`,
+    );
     check(
       'the interrupted download ends with a file, not an error',
       ['done', 'hosted'].includes(finishedDownload?.status),

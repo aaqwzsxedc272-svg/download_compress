@@ -97,10 +97,35 @@
     const mitigated = String(res.headers?.get?.('cf-mitigated') || '').toLowerCase();
     if (mitigated === 'challenge') return true;
     const text = String(html || '');
-    if (!CHALLENGE_HTML.test(text)) return false;
-    /* A real page can mention Cloudflare in a footer; a challenge *is* the
-       page. Length is the cheapest honest discriminator. */
-    return text.length < 30000 || res.status === 403 || res.status === 503;
+    const status = Number(res.status) || 0;
+
+    /* Cloudflare's interstitial is not always labelled: it can answer 403 with
+       a tiny page, or 200 with a wall of inline JavaScript. What it never has
+       is a video or a link, which is the signal used below. */
+    const lookedChallenged =
+      CHALLENGE_HTML.test(text) ||
+      /cf_chl|challenge-platform|_cf_chl_opt|window\.turnstile/i.test(text);
+    if (lookedChallenged) {
+      return text.length < 30000 || status === 403 || status === 503;
+    }
+
+    /* Refused, and the body is a web page: a real browser may be allowed where
+       a plain client is not. That costs one attempt, and it is the difference
+       between "removed" and "blocked". */
+    const contentType = String(res.headers?.get?.('content-type') || '');
+    if ((status === 403 || status === 503) && contentType.includes('html')) return true;
+
+    return false;
+  }
+
+  /** True when a page contains nothing that could be a file, only a player. */
+  function looksEmptyPage(html) {
+    const text = String(html || '');
+    if (!text.trim()) return true;
+    if (/<(video|source)\b/i.test(text)) return false;
+    if (/og:video/i.test(text)) return false;
+    if (/<a\b[^>]*href=["'][^"']*\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|3gp|ogv)/i.test(text)) return false;
+    return true;
   }
 
   const CHALLENGE_HELP =
@@ -922,6 +947,7 @@ function preferPageName(urlName, pageName) {
 
   function fileditchLinks(html, pageUrl) {
     const download = [];
+    const files = [];
     const players = [];
     const push = (list, raw) => {
       if (!raw) return;
@@ -936,12 +962,23 @@ function preferPageName(urlName, pageName) {
       if (!list.includes(absolute)) list.push(absolute);
     };
 
-    // The download anchor, whatever its classes look like.
-    const anchorRe = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,160}?)<\/a>/gi;
+    /* The download anchor, whatever its classes look like. A label is a hint,
+       not a requirement: some pages put an icon or nothing at all inside the
+       anchor, and rejecting those is how the *player* URL ended up being tried
+       as if it were the file. */
+    const anchorRe = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,200}?)<\/a>/gi;
+    const looksLikeFile = (href) => Boolean(signedPayload(href)) || VIDEO_EXT.test(href.split('?')[0]);
     let m;
     while ((m = anchorRe.exec(html))) {
       const [, href, text] = m;
-      if (/download|⬇|save file|JDownloader/i.test(text) && !/report/i.test(text)) push(download, href);
+      if (/report/i.test(text)) continue;
+      if (/download|⬇|save file|JDownloader/i.test(text) || looksLikeFile(href)) {
+        /* Labels only decide ordering: a real download button first, then any
+           anchor that points at a file. */
+        const labelled = /download|⬇|save file|JDownloader/i.test(text);
+        if (labelled) push(download, href);
+        else push(files, href);
+      }
     }
     // A player source is the same file shown as HTML — only worth having when
     // there is no download anchor to use instead.
@@ -950,7 +987,7 @@ function preferPageName(urlName, pageName) {
     const og = /<meta[^>]+property=["']og:video(?::url)?["'][^>]+content=["']([^"']+)["']/i.exec(html);
     if (og) push(players, og[1]);
 
-    return { download, players };
+    return { download, files, players };
   }
 
   function fileditchMeta(html) {
@@ -977,7 +1014,8 @@ function preferPageName(urlName, pageName) {
     if (!fetched.html) throw new ResolveError(`fileditch answered HTTP ${fetched.status || 'nothing'}.`, 'FILEDITCH_FAILED');
     const html = fetched.html;
     const base = fetched.url || pageUrl;
-    const { download, players } = fileditchLinks(html, base);
+    const { download, files: fileAnchors, players } = fileditchLinks(html, base);
+    const anchorList = [...download, ...fileAnchors];
 
     /* The signed link is the intended route; the player URL that carries the
        same file path is the backup when their proxy misbehaves. */
@@ -992,13 +1030,17 @@ function preferPageName(urlName, pageName) {
     };
     const score = (link) => {
       const payload = signedPayload(link);
-      if (!wantPath) return payload ? 2 : 1;
       const path = pathOf(link);
-      // -1 means "a different file": that is worth knowing, but see below.
-      if (!path.endsWith(wantPath)) return -1;
-      return payload ? 3 : 2;
+      const matches = !wantPath || path.endsWith(wantPath);
+      /* A signed link is the only URL that is known to serve bytes, so it stays
+         a candidate even when the path check disagrees (their path encoding is
+         not always the same as the one we came in with). A player page only
+         earns a place when the file cannot be identified at all. */
+      if (payload) return matches ? 3 : 1;
+      if (!wantPath) return 1;
+      return matches ? 2 : 0;
     };
-    const scored = [...download, ...players].map((link) => ({ link, score: score(link) }));
+    const scored = [...anchorList, ...players].map((link) => ({ link, score: score(link) }));
     const ranked = scored
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score)
@@ -1008,7 +1050,7 @@ function preferPageName(urlName, pageName) {
        giving up and handing back a player URL that serves HTML. */
     if (!ranked.length) {
       for (const entry of scored) {
-        if (download.includes(entry.link) && !ranked.includes(entry.link)) ranked.push(entry.link);
+        if (anchorList.includes(entry.link) && !ranked.includes(entry.link)) ranked.push(entry.link);
       }
     }
     /* The page we just loaded is the player URL, token and all; it is the same
@@ -1022,8 +1064,51 @@ function preferPageName(urlName, pageName) {
     }
     if (baseIsFile && !ranked.includes(base)) ranked.push(base);
 
+    /* If everything on offer is a player page, the page very likely reveals its
+       download button with JavaScript (fileditch does, behind Cloudflare). Ask
+       a real browser for the DOM before settling for a URL known to serve HTML. */
+    /* Evidence has to come from an *anchor*. The player page URL is a .mp4 too,
+       and counting it was the bug that made the app hand the downloader a page
+       that only serves HTML ("HTML_PAGE from fileditchvids.st"). */
+    const hasFileLink = anchorList.some((link) => {
+      if (signedPayload(link)) return true;
+      try {
+        const parsed = new URL(link);
+        return VIDEO_EXT.test(parsed.pathname) && parsed.hostname !== (new URL(pageBase()).hostname || '');
+      } catch {
+        return false;
+      }
+    });
+    if ((!hasFileLink || looksEmptyPage(html)) && !fetched.viaBrowser) {
+      const dom = await pageHtmlViaBrowser(base);
+      if (dom && dom.html) {
+        const again = fileditchLinks(dom.html, dom.url || base);
+        const found = [...again.download, ...again.files].filter(Boolean);
+        if (found.length) {
+          const merged = [...found, ...ranked.filter((link) => !found.includes(link))];
+          return {
+            url: merged[0],
+            links: merged,
+            html: dom.html,
+            base: dom.url || base,
+            cookie: dom.cookie || fetched.cookie || null,
+            title: dom.title || fetched.title || null,
+            viaBrowser: true,
+          };
+        }
+      }
+    }
+
     if (ranked.length) {
-      return { url: ranked[0], links: ranked, html, base, cookie: fetched.cookie || null, title: fetched.title || null };
+      return {
+        url: ranked[0],
+        links: ranked,
+        html,
+        base,
+        cookie: fetched.cookie || null,
+        title: fetched.title || null,
+        viaBrowser: Boolean(fetched.viaBrowser),
+      };
     }
 
     // No link at all: the page might itself be a player whose media URL is only
@@ -1157,11 +1242,14 @@ function preferPageName(urlName, pageName) {
       }
       const html = fetched.html;
       const base = fetched.url || url;
-      const { download, players } = fileditchLinks(html, base);
-      const candidates = download.length ? download : players;
+      const extracted = fileditchLinks(html, base);
+      const anchored = [...extracted.download, ...extracted.files];
+      const candidates = anchored.length ? anchored : extracted.players;
       if (!candidates.length) {
         const viaBrowser = await pageBrowserFiles(base);
-        if (viaBrowser && viaBrowser.length) return { resolver: 'fileditch', title: null, files: viaBrowser };
+        if (viaBrowser && viaBrowser.length) {
+          return { resolver: 'fileditch', title: fetched.title || null, files: viaBrowser };
+        }
         throw new ResolveError('fileditch did not expose a download link on that page.', 'FILEDITCH_NO_LINK');
       }
 
@@ -1248,7 +1336,26 @@ function preferPageName(urlName, pageName) {
 
       const unique = [...new Set(out.filter(Boolean))];
       if (!unique.length) throw new ResolveError('fileditch did not give us a download link.', 'FILEDITCH_NO_LINK');
-      return unique;
+      /* Handing the downloader the player page first wastes a whole round trip
+         on HTML (it is what "HTML_PAGE from fileditchvids.st" was), and it used
+         to happen because that page is a *.mp4 URL. Their own page base is the
+         last resort, always. */
+      const pageHost = (() => {
+        try {
+          return new URL(pageBase()).hostname;
+        } catch {
+          return '';
+        }
+      })();
+      const isPlayerPage = (link) => {
+        if (signedPayload(link)) return false;
+        try {
+          return new URL(link).hostname === pageHost;
+        } catch {
+          return true;
+        }
+      };
+      return [...unique.filter((link) => !isPlayerPage(link)), ...unique.filter(isPlayerPage)];
     },
     async direct(ref) {
       return (await fileditch.candidates(ref))[0];

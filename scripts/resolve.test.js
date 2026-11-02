@@ -425,6 +425,62 @@ const GOFILE_FOLDER = {
     assert.match(result.files[0].ref.url, /\/signed\/plain$/);
   });
 
+  await test('a page that only reveals its download button in a browser uses the browser', async () => {
+    /* Exactly what the log showed: the fetched HTML has a player and nothing
+       else, so the only "file" URL in it is the player page itself — which
+       serves HTML. The browser DOM has the real anchor. */
+    const signed = Buffer.from('1793555458:abc:36884/b78/abc.mp4').toString('base64url');
+    stubFetch(() => ({
+      raw: '<title>abc.mp4</title><video src="https://fileditchvids.st/b78/abc.mp4"></video>',
+      type: 'text/html',
+    }));
+    let asked = false;
+    setPageHtmlBrowser(async () => {
+      asked = true;
+      return {
+        html:
+          '<title>abc.mp4</title><video src="https://fileditchvids.st/b78/abc.mp4"></video>' +
+          `<a class="button" href="https://lumistretcheseverymorning.xyz/${signed}">⬇ Download</a>`,
+        cookie: 'cf_clearance=xyz',
+        title: 'abc.mp4',
+        url: 'https://fileditchvids.st/b78/abc.mp4',
+      };
+    });
+    const result = await resolve('https://fileditchfiles.me/b78/abc.mp4');
+    setPageHtmlBrowser(null);
+    assert.equal(asked, true, 'the page had no file link, so the browser should have been asked');
+    assert.match(result.files[0].ref.url, /lumistretcheseverymorning/, result.files[0].ref.url);
+    assert.equal(result.files[0].ref.cookie, 'cf_clearance=xyz');
+  });
+
+  await test('a download anchor with no label is still a download anchor', async () => {
+    const signed = Buffer.from('1793555458:abcDEFghiJKL:36884/b78/abc.mp4').toString('base64url');
+    stubFetch(() => ({
+      raw:
+        '<title>abc.mp4</title><video src="https://fileditchvids.st/b78/abc.mp4"></video>' +
+        `<a class="btn" href="https://lumistretcheseverymorning.xyz/${signed}"><svg></svg></a>`,
+      type: 'text/html',
+    }));
+    const result = await resolve('https://theditch.st/qhygxukd');
+    assert.match(result.files[0].ref.url, /lumistretcheseverymorning/, result.files[0].ref.url);
+    assert.equal(result.files.length, 1);
+  });
+
+  await test('the player page is never offered before a minted link', async () => {
+    const signed = Buffer.from('1793555458:abc:36884/b78/abc.mp4').toString('base64url');
+    stubFetch(() => ({
+      raw:
+        '<title>abc.mp4</title><video src="https://fileditchvids.st/b78/abc.mp4"></video>' +
+        `<a href="https://lumistretcheseverymorning.xyz/${signed}">⬇ Download</a>`,
+      type: 'text/html',
+    }));
+    const result = await resolve('https://theditch.st/qhygxukd');
+    const routes = await directCandidates(result.files[0].ref);
+    assert.match(routes[0], /lumistretcheseverymorning/, routes[0]);
+    const playerAt = routes.findIndex((route) => route.includes('fileditchvids.st'));
+    assert.ok(playerAt === -1 || playerAt > 0, `player page at ${playerAt}: ${routes.join(', ')}`);
+  });
+
   await test('the tab title of the linked page is kept, separately from the file name', async () => {
     stubFetch(() => ({
       raw: '<title>Holiday clip — fileditch</title>' +

@@ -210,6 +210,7 @@ function publicView(job) {
     localDeleted: Boolean(job.localDeleted),
     downloadSpeed: job.downloadSpeed || null,
     downloadEta: job.downloadEta || null,
+    downloadResumed: Boolean(job.downloadResumed),
     projection: job.projection || null,
     hostedUrl: job.hostedUrl || null,
     hostProvider: job.hostProvider || null,

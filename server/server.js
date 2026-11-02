@@ -19,6 +19,7 @@ const ledger = require('./ledger');
 const notify = require('./notify');
 const mailsettings = require('./mailsettings');
 const publish = require('./publish');
+const version = require('./version');
 const { chooseCrf } = require('./estimate');
 const {
   PRESET_LIST,
@@ -462,7 +463,7 @@ async function compressJob(job) {
     notes.push(
       doneParts
         ? `Picked up after a restart: ${doneParts} of ${resumeState.total} parts were already encoded and are kept.`
-        : 'Picked up after a restart with the settings this file started with.',
+        : 'Picked up after a restart — but the stop came before the first part finished, so this file is encoded again (the download itself is kept).',
     );
   } else if (!job.targetMb) {
     jobsStore.updateJob(job, { stage: 'Checking what is worth encoding' });
@@ -1048,6 +1049,37 @@ async function fetchThenCompress(job, ref) {
       ? Math.max(expected * 1.2, 512 * 1024 ** 2)
       : Math.max(expected * 2.2, 1024 ** 3);
 
+    /* What a previous run already downloaded. A crash must not mean paying for
+       the same gigabytes twice. Only the *same URL* is resumed: the bytes on
+       disk belong to whatever that URL served, and a different route may be a
+       different file. */
+    let partialBytes = 0;
+    try {
+      const stat = await fsp.stat(paths.source);
+      partialBytes = stat.size || 0;
+    } catch {
+      partialBytes = 0;
+    }
+    const partialTotal = Number(job.downloadTotal) || 0;
+    /* Signed links rotate but point at the same bytes, so the URL is not the
+       identity — the size the host reports is (checked again on the response's
+       Content-Range, which must start exactly where the fragment ends). */
+    const resumable = partialBytes > 0 && partialTotal > 0;
+
+    /* The whole file is already here (the crash came after the download): there
+       is nothing to fetch at all. */
+    if (resumable && partialTotal && partialBytes >= partialTotal) {
+      console.log(`[job ${job.id}] the download was already complete (${Math.round(partialBytes / 1048576)} MB)`);
+      startCompression(job);
+      return;
+    }
+    if (partialBytes > 0 && !resumable) {
+      /* A fragment with no known size cannot be validated, so it is not worth
+         trusting: start clean rather than risk a corrupt file. */
+      await fsp.rm(paths.source, { force: true }).catch(() => {});
+      partialBytes = 0;
+    }
+
     let free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
     if (free < needed) {
       // Finished files that are already on a host are expendable: their links
@@ -1085,10 +1117,30 @@ async function fetchThenCompress(job, ref) {
     /* A Cloudflare clearance earned while reading the page is what the CDN
        checks again on the file itself. */
     if (ref && ref.cookie) refHeaders.cookie = ref.cookie;
+    if (resumable && partialBytes > 0) {
+      console.log(`[job ${job.id}] resuming the download at ${Math.round(partialBytes / 1048576)} MB`);
+      jobsStore.updateJob(job, {
+        stage: `Continuing the download from ${Math.round(partialBytes / 1048576)} MB`,
+        resolvedNote:
+          'Its earlier run was cut off, so it carries on from where it stopped instead of starting again.',
+      });
+    }
+    let resumeFrom = resumable ? partialBytes : 0;
     const downloadOptions = {
       maxBytes: MAX_UPLOAD_BYTES,
       extraHeaders: refHeaders,
       signal: controller.signal,
+      get resumeFrom() {
+        return resumeFrom;
+      },
+      expectTotal: partialTotal,
+      /* Record what this transfer is (URL + full size) the moment the host
+         answers, so a crash at 90% is resumable rather than restartable. */
+      onStart: ({ total, url: from }) => {
+        if (total) job.downloadTotal = total;
+        if (from) job.downloadUrl = from;
+        jobsStore.updateJob(job, {});
+      },
       onProgress: (received, total) => {
         const p = total ? received / total : 0;
         /* A host that trickles (bunkr can) is easier to wait for when the speed
@@ -1129,9 +1181,21 @@ async function fetchThenCompress(job, ref) {
       const candidate = candidates.shift();
       tried.push(candidate);
       try {
+        if (!job.downloadUrl) job.downloadUrl = candidate;
         const info = await sources.downloadHttp(candidate, paths.source, downloadOptions);
         attempt = { usedBrowser: false, url: (info && info.url) || candidate, filename: (info && info.filename) || null };
+        if (info && info.total) job.downloadTotal = info.total;
+        if (info && info.resumed) job.downloadResumed = true;
+        job.downloadUrl = candidate;
       } catch (err) {
+        /* A resume that the host mangles (wrong bytes, expired signed link, a
+           different file behind the same URL) must not poison the download:
+           the partial is dropped and the next route starts from zero. */
+        if (resumeFrom > 0) {
+          resumeFrom = 0;
+          await fsp.rm(paths.source, { force: true }).catch(() => {});
+          jobsStore.updateJob(job, { stage: 'Starting the download again from the beginning' });
+        }
         if (!RECOVERABLE.has(err.code)) throw err;
         let host = 'that host';
         try {
@@ -1365,6 +1429,7 @@ app.get('/api/health', async (req, res) => {
     autoHost: AUTO_HOST,
     email: notify.describe(),
     publish: await publish.describe(),
+    version: version.describe(),
     browserHosters: ['gofile', 'pixeldrain'],
     /* Cloudflare-protected hosts need this one to be true. */
     browserAvailable: (() => {
@@ -1385,6 +1450,29 @@ app.get('/api/health', async (req, res) => {
 });
 
 app.get('/api/presets', (req, res) => res.json({ presets: PRESET_LIST }));
+
+/** Which build is this? Asked after every crash, and answered in one call. */
+app.get('/api/version', (req, res) => res.json({ version: version.describe() }));
+
+/**
+ * Walk a link through every stage and report what each one said.
+ *
+ * The app can only show one line of an error, and "it did not work" is not
+ * enough to fix a host that hides behind a bot check. `npm run doctor -- <url>`
+ * prints the same report from a terminal.
+ */
+app.get('/api/diagnose-link', async (req, res) => {
+  const url = sources.normalizeUrl(req.query.url);
+  if (!url) return fail(res, 400, 'BAD_URL', 'Pass ?url= with the link to test.');
+  const result = await require('./diagnose').diagnose(url, {
+    browser: req.query.browser === '0' ? 'skip' : undefined,
+  });
+  if (String(req.query.format || '') === 'text') {
+    return res.type('text/plain').send(`${result.text}\n`);
+  }
+  const { text, ...json } = result;
+  return res.json(json);
+});
 
 /* Stop the machine when the queue drains — for metered hosts. */
 app.get('/api/auto-stop', (req, res) => res.json({ autoStop: autoStop.status() }));
@@ -2491,6 +2579,8 @@ async function main() {
   ensureSample().catch((err) => console.warn('Sample clip unavailable:', err.message));
   const ytdlp = await sources.hasYtdlp();
   console.log(`Squeeze listening on http://0.0.0.0:${PORT} (yt-dlp: ${ytdlp ? ytdlp.version : 'not installed'})`);
+  /* The first line after a crash: which build is this, and are the fixes in? */
+  console.log(version.banner());
 
   const mail = mailsettings.describe();
   if (mail.configured) {
@@ -2532,10 +2622,9 @@ async function resumeInterrupted() {
     .filter((job) => ['compressing', 'queued'].includes(job.interruptedFrom))
     .filter((job) => fs.existsSync(jobsStore.jobPaths(job).source));
 
-  /* Stopped in the middle of the download: whatever is on disk is a fragment,
-     so it is thrown away and fetched again from the same link. The ledger and
-     the resolved reference are both on disk, which is why this can work
-     without the browser having kept anything. */
+  /* Stopped in the middle of the download: the fragment on disk is kept and the
+     transfer continues from there with a Range request — a 1 GB file on a slow
+     host should not be paid for twice. */
   const fetchAgain = interrupted
     .filter((job) => job.interruptedFrom === 'fetching' && job.ref && (job.url || job.ref.url))
     .filter((job) => ['url', 'relay', 'ytdlp'].includes(job.source));
@@ -2565,7 +2654,6 @@ async function resumeInterrupted() {
       startCompression(job);
       continue;
     }
-    await fsp.rm(jobsStore.jobPaths(job).source, { force: true }).catch(() => {});
     jobsStore.updateJob(job, {
       status: 'queued',
       stage: 'Picking up the download again',

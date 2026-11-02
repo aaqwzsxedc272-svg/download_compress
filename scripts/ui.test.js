@@ -214,6 +214,9 @@ async function boot({
   publishResult = { ok: true, sink: 'gist', label: 'GitHub gist', url: 'https://gist.github.com/x/deadbeef', count: 1 },
   /* What the server answers to "just download it" — a view of the same job. */
   keepOriginal = { job: { id: 'job1', status: 'queued' } },
+  /* What the server answers to "save the original": the file, and the job as it
+     still stands (encoding). */
+  saveOriginal = { ok: true, ready: false, gone: false, download: null, job: { id: 'job1', status: 'compressing' } },
   storage = STORAGE,
   usage = USAGE,
   cleanResult = { ok: true, freedBytes: 2 * 1024 ** 3, removedJobs: 1, kept: [] },
@@ -275,7 +278,9 @@ async function boot({
     else if (target.includes('/api/usage/settings')) {
       body = { ok: true, settings: usageSettings || usage.settings, usage };
     } else if (target.includes('/api/usage')) body = { usage };
+    else if (target.includes('/save-original')) body = saveOriginal;
     else if (target.includes('/keep-original')) body = keepOriginal;
+    else if (target.includes('/retry')) body = { ok: true, job: { ...keepOriginal.job, status: 'queued', canRetry: false } };
     else if (target.includes('/api/jobs') && init.method === 'POST') body = { job: { id: 'job1', status: 'queued' } };
     else if (target.includes('/api/jobs')) body = { jobs: [] };
     return {
@@ -586,7 +591,7 @@ async function boot({
     if (/720p/.test(tab.textContent)) throw new Error('the tab line is showing the output name, not the link');
   });
 
-  await test('"just download it" is offered on a running file and calls the server', async () => {
+  await test('"save the original" is offered on a running file and keeps the encode going', async () => {
     const eleventh = await boot({ links: LINKS });
     const { window, doc } = eleventh;
     window.EventSource = class {
@@ -604,14 +609,19 @@ async function boot({
     });
     const card = doc.querySelector('[data-job-id="jobRun2"]');
     const button = [...card.querySelectorAll('.job-actions button')].find(
-      (item) => item.textContent === 'Just download it',
+      (item) => item.textContent === 'Save the original too',
     );
-    if (!button) throw new Error('no “Just download it” next to a file being treated');
+    if (!button) throw new Error('no “Save the original too” next to a file being treated');
     button.dispatchEvent(new window.Event('click'));
     await new Promise((resolve) => window.setTimeout(resolve, 100));
-    const call = eleventh.calls.find((entry) => entry.url.includes('/api/jobs/jobRun2/keep-original'));
+    const call = eleventh.calls.find((entry) => entry.url.includes('/api/jobs/jobRun2/save-original'));
     if (!call) throw new Error('the button never called the server');
     if (call.init.method !== 'POST') throw new Error(`used ${call.init.method}`);
+    /* It must never touch the old "stop encoding" route: the encode is the
+       point of the job. */
+    if (eleventh.calls.some((entry) => entry.url.includes('/keep-original'))) {
+      throw new Error('the button stopped the encoder instead of saving the file');
+    }
   });
 
   await test('a file that was already downloaded as-is says so', async () => {
@@ -728,9 +738,13 @@ async function boot({
 
   console.log('the file itself, not just the decision');
 
-  await test('"just download it" starts saving the file immediately when it is whole', async () => {
+  await test('"save the original too" saves the file immediately when it is whole, and leaves the job running', async () => {
     const app = await boot({
-      keepOriginal: {
+      saveOriginal: {
+        ok: true,
+        ready: true,
+        gone: false,
+        download: '/api/jobs/jobWhole/original/Holiday.mp4',
         job: { id: 'jobWhole', status: 'compressing', name: 'Holiday.mp4', originalReady: true, originalName: 'Holiday.mp4' },
       },
     });
@@ -746,8 +760,8 @@ async function boot({
       originalReady: false,
     });
     const card = doc.querySelector('[data-job-id="jobWhole"]');
-    const button = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Just download it');
-    if (!button) throw new Error('no \u201cJust download it\u201d button');
+    const button = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Save the original too');
+    if (!button) throw new Error('no \u201cSave the original too\u201d button');
 
     /* The browser's own download is an anchor click; record it instead of
        letting jsdom try to navigate. */
@@ -764,11 +778,20 @@ async function boot({
     }
     if (!saved.length) throw new Error('pressing it saved nothing \u2014 the file has to arrive, not just the promise of it');
     if (!/\/api\/jobs\/jobWhole\/original\/Holiday\.mp4$/.test(saved[0])) throw new Error(`saved from ${saved[0]}`);
+    /* And the encode is untouched: no "stop encoding" call, no status change. */
+    if (app.calls.some((entry) => entry.url.includes('/keep-original'))) {
+      throw new Error('saving the original stopped the encoder');
+    }
+    if (app.calls.some((entry) => /disconnect|cancel/.test(entry.url))) throw new Error('the job was cancelled');
   });
 
   await test('a file that is still downloading starts saving on its own when it lands', async () => {
     const app = await boot({
-      keepOriginal: {
+      saveOriginal: {
+        ok: true,
+        ready: false,
+        gone: false,
+        download: null,
         job: { id: 'jobLate', status: 'fetching', name: 'Big.mkv', originalReady: false, originalBytes: 12 * 1024 ** 2 },
       },
     });
@@ -784,7 +807,7 @@ async function boot({
       originalReady: false,
     });
     const card = doc.querySelector('[data-job-id="jobLate"]');
-    const button = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Just download it');
+    const button = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Save the original too');
     const saved = [];
     const realClick = window.HTMLAnchorElement.prototype.click;
     window.HTMLAnchorElement.prototype.click = function record() {
@@ -811,6 +834,49 @@ async function boot({
     }
     if (!saved.length) throw new Error('the file landed and nothing was saved');
     if (!/\/api\/jobs\/jobLate\/original\/Big\.mkv$/.test(saved[0])) throw new Error(`saved from ${saved[0]}`);
+  });
+
+  await test('a failed job that kept its work offers "Try again"', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    window.EventSource = class { close() {} };
+    window.__app.trackJob({
+      id: 'jobFail',
+      status: 'error',
+      progress: 0.91,
+      name: 'Long one.mkv',
+      source: 'url',
+      hasFile: false,
+      canRetry: true,
+      error: 'The encoder finished a part of this file but the file was gone.',
+    });
+    const card = doc.querySelector('[data-job-id="jobFail"]');
+    const again = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Try again');
+    if (!again) throw new Error('a failure with hours of work behind it offered no way to carry on');
+    again.dispatchEvent(new window.Event('click'));
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+    const call = app.calls.find((entry) => entry.url.includes('/api/jobs/jobFail/retry'));
+    if (!call) throw new Error('the button never asked the server to carry on');
+    if (call.init.method !== 'POST') throw new Error(`used ${call.init.method}`);
+  });
+
+  await test('a job with nothing left to carry on from does not offer "Try again"', async () => {
+    const app = await boot();
+    const { window, doc } = app;
+    window.EventSource = class { close() {} };
+    window.__app.trackJob({
+      id: 'jobDead',
+      status: 'error',
+      progress: 0.02,
+      name: 'Gone.mp4',
+      source: 'url',
+      hasFile: false,
+      canRetry: false,
+      error: 'That link did not return a video.',
+    });
+    const card = doc.querySelector('[data-job-id="jobDead"]');
+    const again = [...card.querySelectorAll('.job-actions button')].find((item) => item.textContent === 'Try again');
+    if (again) throw new Error('a button that could only fail was offered anyway');
   });
 
   console.log('storage and session');

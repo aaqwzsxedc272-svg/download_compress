@@ -283,6 +283,9 @@ async function runSegmented(job, plan, paths, meta, controller, { robust = false
 
   const pieces = segments.plan({ duration, chunkSeconds: state.chunkSeconds });
   state.total = pieces.length;
+  /* A partial file is never a part, whatever state says: the encoder was killed
+     while writing it. */
+  await segments.clearPartials(job.dir).catch(() => {});
   const done = await segments.finishedParts(job.dir, state);
   state.done = [...done].sort((a, b) => a - b);
   await segments.write(job.dir, state);
@@ -304,10 +307,11 @@ async function runSegmented(job, plan, paths, meta, controller, { robust = false
       throw Object.assign(new Error('Cancelled.'), { code: 'CANCELLED' });
     }
     const out = segments.fileFor(job.dir, piece.index);
-    await fsp.rm(out, { force: true }).catch(() => {});
+    const partial = segments.partialFor(job.dir, piece.index);
+    await fsp.rm(partial, { force: true }).catch(() => {});
     const args = segmentArgs({
       input: paths.source,
-      output: out,
+      output: partial,
       meta,
       size: plan.size,
       preset: getPreset(job.presetId),
@@ -316,26 +320,64 @@ async function runSegmented(job, plan, paths, meta, controller, { robust = false
       start: piece.start,
       length: piece.length,
     });
-    await transcode(paths.source, out, args, {
-      signal: controller.signal,
-      duration: piece.length,
-      onProgress: ({ seconds, speed }) => {
-        const within = Math.min(1, (Number(seconds) || 0) / piece.length);
-        const position = piece.start + within * piece.length;
-        job.progress = Math.min(0.999, position / duration);
-        if (speed > 0) {
-          job.speed = speed;
-          job.etaSeconds = Math.round((duration - position) / speed);
-        }
-        jobsStore.updateJob(job, {
-          stage: `Encoding part ${piece.index + 1} of ${pieces.length} — resumable`,
-          segmentsDone: piece.index,
-          segmentsTotal: pieces.length,
-        });
-      },
+    const runPart = () =>
+      transcode(paths.source, partial, args, {
+        signal: controller.signal,
+        duration: piece.length,
+        onProgress: ({ seconds, speed }) => {
+          const within = Math.min(1, (Number(seconds) || 0) / piece.length);
+          const position = piece.start + within * piece.length;
+          job.progress = Math.min(0.999, position / duration);
+          if (speed > 0) {
+            job.speed = speed;
+            job.etaSeconds = Math.round((duration - position) / speed);
+          }
+          jobsStore.updateJob(job, {
+            stage: `Encoding part ${piece.index + 1} of ${pieces.length} — resumable`,
+            segmentsDone: piece.index,
+            segmentsTotal: pieces.length,
+          });
+        },
+      });
+
+    /* One bad part should not cost the hours spent on the other twelve. A part
+       is minutes of work; the whole file is hours. */
+    let attempt = 0;
+    for (;;) {
+      try {
+        await runPart();
+        break;
+      } catch (err) {
+        if (err.code === 'CANCELLED' || controller.signal.aborted) throw err;
+        if (attempt >= 1) throw err;
+        attempt += 1;
+        await fsp.rm(partial, { force: true }).catch(() => {});
+        console.log(
+          `[job ${job.id}] part ${piece.index + 1} failed once (${err.code || 'ERR'}), retrying it: ` +
+            `${(err.detail || err.message || '').slice(0, 200)}`,
+        );
+        jobsStore.updateJob(job, { stage: `Retrying part ${piece.index + 1} of ${pieces.length}` });
+      }
+    }
+
+    const stat = await fsp.stat(partial).catch((err) => {
+      if (err.code === 'ENOENT') {
+        throw Object.assign(
+          new Error(
+            'The encoder finished a part but its file is not there. Something outside the job removed it — ' +
+              'the disk was cleaned while it ran.',
+          ),
+          { code: 'PART_MISSING' },
+        );
+      }
+      throw err;
     });
-    const stat = await fsp.stat(out);
-    if (!stat.size) throw Object.assign(new Error('A part of the encode came out empty.'), { code: 'EMPTY_OUTPUT' });
+    if (!stat.size) {
+      await fsp.rm(partial, { force: true }).catch(() => {});
+      throw Object.assign(new Error('A part of the encode came out empty.'), { code: 'EMPTY_OUTPUT' });
+    }
+    /* It is a part only now that it is whole. */
+    await fsp.rename(partial, out);
 
     done.add(piece.index);
     state.done = [...done].sort((a, b) => a - b);
@@ -624,8 +666,10 @@ async function compressJob(job) {
 
   /* The source is only needed while encoding. Deleting it now roughly halves
      what a job occupies on disk, which matters on a 32 GB machine handling
-     multi-gigabyte 4K files. */
-  await fsp.rm(paths.source, { force: true }).catch(() => {});
+     multi-gigabyte 4K files. The exception is a job whose original was asked
+     for: it stays until the normal deadline, because "download the original"
+     and "keep the original" are the same promise. */
+  if (!job.wantOriginal) await fsp.rm(paths.source, { force: true }).catch(() => {});
 
   const saved = job.sourceBytes ? Math.max(0, 1 - outStat.size / job.sourceBytes) : 0;
   if (job.noCompress) usedOriginal = false;
@@ -709,7 +753,8 @@ async function hostJob(job, { order } = {}) {
     /* Space is the scarcest thing on these machines. Once the file is on a host
        and the link is in the ledger, the local copy has done its job. */
     if (DELETE_AFTER_UPLOAD) {
-      const freed = await dropLocalCopy(job);
+      /* A user who asked for the original keeps it for the usual two hours. */
+      const freed = await dropLocalCopy(job, { keepSource: Boolean(job.wantOriginal) });
       if (freed) {
         jobsStore.updateJob(job, {
           localDeleted: true,
@@ -738,10 +783,10 @@ async function hostJob(job, { order } = {}) {
  * Delete a finished job's files from disk (its share link stays in the ledger).
  * Returns the bytes freed.
  */
-async function dropLocalCopy(job) {
+async function dropLocalCopy(job, { keepSource = false } = {}) {
   const paths = jobsStore.jobPaths(job);
   let freed = 0;
-  for (const file of [paths.output, paths.thumb, paths.source]) {
+  for (const file of [paths.output, paths.thumb, ...(keepSource ? [] : [paths.source])]) {
     const size = await fsp.stat(file).then((stat) => stat.size).catch(() => 0);
     if (!size) continue;
     const removed = await fsp.rm(file, { force: true }).then(() => size).catch(() => 0);
@@ -945,6 +990,10 @@ autoStop.setBeforeStop(async () => {
 
 const FRIENDLY = {
   CANCELLED: 'Cancelled.',
+  PART_MISSING:
+    'The encoder finished a part of this file but the file was gone — something else cleared the disk while it ran. ' +
+    'The parts that survived are kept, so “Try again” carries on from there.',
+  JOIN_FAILED: 'The parts of this file could not be joined into one video. The parts are kept, so “Try again” re-joins them.',
   NO_VIDEO: 'That file has no video track.',
   INVALID_MEDIA: 'That file is not a video this server can read.',
   BAD_MEDIA: 'That video looks corrupted or uses a format that cannot be read.',
@@ -996,15 +1045,33 @@ async function diskUsage(dir) {
   }
 }
 
+/* A filesystem error is a bug report, not a sentence: "ENOENT: no such file or
+   directory, stat '/home/…/part-0011.mp4'" tells the person nothing they can
+   act on. These are the ones a job can actually hit. */
+function describeSystemError(err) {
+  const message = String((err && err.message) || '');
+  if (err.code === 'ENOENT' || /^ENOENT/.test(message)) {
+    return 'A file this job needed disappeared from the disk while it was being worked on. The parts that are left are kept — “Try again” carries on from there.';
+  }
+  if (err.code === 'EACCES' || /^EACCES/.test(message)) {
+    return 'This server could not write to its own data directory (permissions). Fix the permissions on data/ and try again.';
+  }
+  if (err.code === 'ENOSPC' || /no space left on device/i.test(message)) return null; // handled as NO_DISK
+  return null;
+}
+
 function reportJobError(job, err) {
   const outOfSpace = err.code === 'NO_DISK' || OUT_OF_SPACE.test(String(err.message || ''));
   /* When the encoder refuses a file, the reason matters more than the apology:
      "ffmpeg could not process this file" hides whether it was the container, the
      bit depth or a codec this build cannot decode. */
   const ffmpegDetail = err.code === 'FFMPEG_FAILED' ? (err.detail || '').trim() : '';
+  const systemNote = describeSystemError(err);
   const message = outOfSpace
     ? 'This machine ran out of disk space. Delete finished videos (the Remove button) and try again — a long 4K file needs about three times its own size free.'
-    : err.code === 'FFMPEG_FAILED'
+    : systemNote
+      ? systemNote
+      : err.code === 'FFMPEG_FAILED'
       ? `ffmpeg could not process this file${err.codecNote ? ` (${err.codecNote})` : ''}.` +
         `${ffmpegDetail ? ` It said: ${ffmpegDetail}` : ''} Try another preset, or a different source file.`
       : err.playerNote || FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
@@ -1016,12 +1083,21 @@ function reportJobError(job, err) {
   });
   console.error(`[job ${job.id}] ${outOfSpace ? 'NO_DISK' : err.code || 'ERR'}:`, err.message?.slice(0, 600));
 
-  /* A failed job leaves a partial source and half an output behind. On a small
-     disk those are exactly what stops the next job, so drop them now. */
+  /* A failure near the end of a long encode is the worst time to throw the
+     work away, and that is exactly what this used to do: the source, the output
+     and every finished part were deleted, so "try again" started from zero.
+     What is kept now: the source (whole or partial — it resumes), and the
+     encoded parts (a retry re-encodes only what is missing). What goes: a
+     half-written output, which is not a video. The storage panel and the
+     sweeper own the disk from here, and a failed job is kept for
+     KEEP_UNFINISHED_HOURS rather than thrown away on the spot. */
   const paths = jobsStore.jobPaths(job);
-  fsp.rm(paths.source, { force: true }).catch(() => {});
   fsp.rm(paths.output, { force: true }).catch(() => {});
-  segments.clear(job.dir).catch(() => {});
+  const keptSource = fs.existsSync(paths.source);
+  const keptPartials = fs.existsSync(path.join(job.dir, 'segments'));
+  if (keptSource || keptPartials) {
+    jobsStore.updateJob(job, { retained: true });
+  }
 }
 
 /**
@@ -1293,6 +1369,11 @@ function updateQueuePositions() {
 let heartbeatTimer = null;
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_SECONDS || 45) * 1000;
 
+/* Job ids that an encoder is working on right now. Not a status field: status
+   can be 'error' while a retry is starting, and the point is to never run two
+   encoders over one directory. */
+const runningJobs = new Set();
+
 /* How much of GitHub's free allowance this machine has used. It counts only
    while this process is alive, so it understates rather than overstates — see
    server/usage.js for why it cannot be a reading from GitHub. */
@@ -1330,12 +1411,15 @@ function pumpQueue() {
   while (activeCount < MAX_CONCURRENT && queue.length) {
     const job = queue.shift();
     if (!jobsStore.getJob(job.id)) continue; // removed while waiting
+    if (runningJobs.has(job.id)) continue;
+    runningJobs.add(job.id);
     activeCount += 1;
     startHeartbeat();
     autoStop.cancel('a job started');
     compressJob(job)
       .catch((err) => reportJobError(job, err))
       .finally(() => {
+        runningJobs.delete(job.id);
         activeCount -= 1;
         finishedThisSession += 1;
         updateQueuePositions();
@@ -1359,6 +1443,13 @@ function pumpQueue() {
 }
 
 function startCompression(job) {
+  /* One job, one encoder. Two passes over the same directory delete each
+     other's part files, and the loser reports "ENOENT … part-0011.mp4". */
+  if (job._running || runningJobs.has(job.id)) {
+    console.log(`[job ${job.id}] already running — not starting it twice`);
+    return;
+  }
+  if (queue.some((queued) => queued.id === job.id)) return;
   jobsStore.updateJob(job, { status: 'queued', stage: 'Queued', progress: 0, error: null, interrupted: false });
   queue.push(job);
   pumpQueue();
@@ -2776,13 +2867,101 @@ app.get('/api/jobs/:id/original/:name?', (req, res) => {
 });
 
 /**
+ * "Save the original" — the file that was downloaded, handed over now.
+ *
+ * This is deliberately not the same thing as the *Skip the encoder* switch: it
+ * does not touch the encode. Pressing it means "I want the bytes I already
+ * downloaded, and I still want the smaller file you are making" — which is what
+ * people expect from a button that says download.
+ */
+app.post('/api/jobs/:id/save-original', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+
+  /* Remembered, so the source is not deleted the moment the encode ends: the
+     download starts in a browser and a 2 GB transfer outlives the render. */
+  if (!job.wantOriginal) jobsStore.updateJob(job, { wantOriginal: true });
+
+  const view = jobsStore.publicView(job);
+  const paths = jobsStore.jobPaths(job);
+  /* A finished "just download" job keeps its bytes in the output file. */
+  const originalIsOutput = view.noCompress && ['done', 'hosted'].includes(view.status) && fs.existsSync(paths.output);
+  const gone = ['done', 'hosted'].includes(view.status) && !view.originalReady && !originalIsOutput;
+
+  res.json({
+    ok: true,
+    ready: view.originalReady || originalIsOutput,
+    gone,
+    download: view.originalReady
+      ? `/api/jobs/${job.id}/original/${encodeURIComponent(view.originalName)}`
+      : originalIsOutput
+        ? `/api/jobs/${job.id}/download/${encodeURIComponent(view.outputName || view.name)}`
+        : null,
+    job: view,
+  });
+});
+
+/**
+ * Carry on with a job that failed or was interrupted.
+ *
+ * A failure near the end of a long encode used to take the whole job with it.
+ * The parts and the source are kept now, so this is cheap: the download is not
+ * repeated and the parts already encoded are not encoded again.
+ */
+app.post('/api/jobs/:id/retry', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  if (runningJobs.has(job.id) || jobsStore.isActive(job)) {
+    return fail(res, 409, 'ALREADY_RUNNING', 'That job is already running.');
+  }
+  if (['done', 'hosted'].includes(job.status)) return fail(res, 409, 'ALREADY_DONE', 'That job has already finished.');
+  if (job.status !== 'error') return fail(res, 409, 'NOTHING_TO_RETRY', 'That job has not failed.');
+
+  const paths = jobsStore.jobPaths(job);
+  const sourceBytes = await fsp.stat(paths.source).then((stat) => stat.size).catch(() => 0);
+  const parts = await segments.finishedParts(job.dir, await segments.read(job.dir));
+  if (!sourceBytes && !parts.size && !job.ref) {
+    return fail(
+      res,
+      409,
+      'NOTHING_TO_RETRY',
+      'Nothing survived from that attempt, so there is nothing to carry on from — paste the link again.',
+    );
+  }
+
+  jobsStore.updateJob(job, {
+    status: 'queued',
+    stage: parts.size
+      ? `Picking it up again — ${parts.size} encoded part(s) were kept`
+      : sourceBytes
+        ? 'Picking it up again — the download is still on disk'
+        : 'Starting again',
+    error: null,
+    interrupted: false,
+    progress: 0,
+    resumed: true,
+  });
+  console.log(
+    `[job ${job.id}] retry requested — ${formatSize(sourceBytes)} of source, ${parts.size} part(s) kept`,
+  );
+
+  if (job.ref && !(sourceBytes > 0)) {
+    /* Nothing on disk: the download has to happen again (it resumes from a
+       fragment when there is one). */
+    fetchThenCompress(job, job.ref);
+  } else {
+    startCompression(job);
+  }
+  return res.json({ ok: true, job: jobsStore.publicView(job) });
+});
+
+/**
  * "Just download it" for a file that is already here or on its way.
  *
- * The toggle on the composer decides this before a job starts; this is the same
- * decision taken while it runs, which is when a slow encode actually becomes
- * obvious. Whatever has been downloaded is kept, the encoder is stopped, and
- * the untouched bytes are handed back (remuxed to MP4 only if that loses
- * nothing).
+ * This is the *stop treating it* switch, and it is deliberately not what the
+ * card's download button calls: wanting the original is not a reason to give up
+ * the smaller file. It stays for links created before the composer toggle
+ * existed, and for anyone driving the API.
  */
 app.post('/api/jobs/:id/keep-original', async (req, res) => {
   const job = jobsStore.getJob(req.params.id);

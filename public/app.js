@@ -385,41 +385,70 @@ function updateCard(entry, job) {
     metaEl.insertAdjacentElement('beforebegin', hostedBlock(job));
   }
 
-  /* "Just download it" is not only a decision made before starting: a slow
-     encode is obvious a minute in, and the file already downloaded is exactly
-     what the user wants. */
-  if (['queued', 'fetching', 'compressing'].includes(job.status) && !job.noCompress) {
+  /* "Save the original" is not a way to give up on the encode — it is a way to
+     get the bytes that are already here *and* still get the smaller file. A
+     slow 4K encode is obvious a minute in, and waiting an hour for a file that
+     has already been downloaded is not a trade anyone wants to make. */
+  if (['queued', 'fetching', 'compressing', 'hosting'].includes(job.status) && !job.noCompress) {
     const keep = document.createElement('button');
     keep.type = 'button';
     keep.className = 'btn tiny';
-    keep.textContent = 'Just download it';
+    keep.textContent = job.wantOriginal ? 'Save the original again' : 'Save the original too';
     keep.title =
-      'Stop treating this file and hand back the original, untouched. Whatever has already been downloaded is kept.';
+      'Saves the file exactly as it was downloaded. The encode keeps running — you still get a smaller copy and its share link.';
     keep.addEventListener('click', async () => {
       keep.disabled = true;
-      keep.textContent = 'Keeping the original…';
+      keep.textContent = 'Getting the original…';
       try {
-        const { job: after } = await api(`/api/jobs/${job.id}/keep-original`, { method: 'POST' });
-        /* The point of the button is the file, not the decision: if the download
-           is already whole, the browser starts saving it right now. */
-        if (after && after.originalReady) {
-          startOriginalDownload(after);
-          showAlert('Saving the original now — no re-encoding, no waiting for the encoder.', 'ok');
+        const result = await api(`/api/jobs/${job.id}/save-original`, { method: 'POST' });
+        if (result.ready && result.download) {
+          startOriginalFrom(result.download, result.job.originalName || result.job.name, result.job);
+          showAlert('Saving the original now. The encode keeps running — its share link arrives when it is done.', 'ok');
+        } else if (result.gone) {
+          showAlert('The original is no longer on this machine — only the compressed copy is. The encode is unaffected.', 'error');
         } else {
           state.waitingOriginal.add(job.id);
-          const got = after && after.originalBytes ? formatBytes(after.originalBytes) : '';
+          const got = result.job && result.job.originalBytes ? formatBytes(result.job.originalBytes) : '';
           showAlert(
-            `The encode is stopped. ${got ? `${got} downloaded so far — ` : ''}the file starts saving on its own the moment the download is complete.`,
+            `${got ? `${got} downloaded so far. ` : ''}The original starts saving by itself the moment the download is complete — ` +
+              'and the encode carries on in the background meanwhile.',
             'ok',
           );
         }
+        if (result.job) updateCard(entry, { ...job, ...result.job });
       } catch (err) {
-        showAlert(`Could not switch this file: ${err.message}`, 'error');
+        showAlert(`Could not get the original: ${err.message}`, 'error');
+      } finally {
         keep.disabled = false;
-        keep.textContent = 'Just download it';
+        keep.textContent = 'Save the original too';
       }
     });
     actions.append(keep);
+  }
+
+  /* A failed job that kept its work is not a dead end: this is the same job,
+     carrying on from the parts that were already encoded. */
+  if (job.status === 'error' && job.canRetry) {
+    const again = document.createElement('button');
+    again.type = 'button';
+    again.className = 'btn tiny';
+    again.textContent = 'Try again';
+    again.title =
+      'Carries on from where it stopped: the download is not repeated and the parts already encoded are kept.';
+    again.addEventListener('click', async () => {
+      again.disabled = true;
+      again.textContent = 'Picking it up…';
+      try {
+        const { job: retried } = await api(`/api/jobs/${job.id}/retry`, { method: 'POST' });
+        showAlert('Carrying on from where it stopped — the finished parts are being reused.', 'ok');
+        trackJob(retried || job);
+      } catch (err) {
+        showAlert(`Could not retry this file: ${err.message}`, 'error');
+        again.disabled = false;
+        again.textContent = 'Try again';
+      }
+    });
+    actions.append(again);
   }
 
   if (job.status === 'done' && job.hasFile) {
@@ -475,6 +504,17 @@ function updateCard(entry, job) {
       actions.append(remote);
     }
 
+    /* The untouched download, while it is still here: the compressed copy is
+       not always what a person wants, and it costs nothing to offer both. */
+    if (job.originalReady && !job.noCompress) {
+      const original = document.createElement('a');
+      original.className = 'btn';
+      original.href = `/api/jobs/${job.id}/original/${encodeURIComponent(job.originalName || job.name)}`;
+      original.textContent = 'Original';
+      original.title = 'The file exactly as it was downloaded, untouched.';
+      actions.append(original);
+    }
+
     const play = document.createElement('a');
     play.className = 'btn';
     play.href = `/j/${job.id}`;
@@ -498,9 +538,14 @@ function updateCard(entry, job) {
  */
 function startOriginalDownload(job) {
   const name = job.originalName || job.name || 'original.mp4';
+  return startOriginalFrom(`/api/jobs/${encodeURIComponent(job.id)}/original/${encodeURIComponent(name)}`, name, job);
+}
+
+/** Save a URL the way a browser saves a file: its own anchor, its own download. */
+function startOriginalFrom(href, name, job) {
   const link = document.createElement('a');
-  link.href = `/api/jobs/${encodeURIComponent(job.id)}/original/${encodeURIComponent(name)}`;
-  link.download = name;
+  link.href = href;
+  link.download = job && job.originalName ? job.originalName : name || 'original.mp4';
   link.rel = 'noopener';
   link.style.display = 'none';
   document.body.append(link);
@@ -1301,7 +1346,12 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
 
     const sync = () => {
       wantsOriginal = input.checked;
-      text.textContent = wantsOriginal ? 'Just download — no re-encoding' : 'Compress to a smaller file';
+      /* The switch turns the encoder off entirely — a different thing from the
+         job card's “Save the original too”, which adds the untouched file to a
+         job that is still being compressed. */
+      text.textContent = wantsOriginal
+        ? 'Just download — nothing is re-encoded'
+        : 'Compress to a smaller file (the original stays downloadable while it is here)';
       hint.textContent = wantsOriginal
         ? 'The file comes back exactly as the host has it, only re-wrapped to MP4 when it is not one already.'
         : 'Re-encoded to H.264 at 720p or better, and only kept when it is really smaller.';

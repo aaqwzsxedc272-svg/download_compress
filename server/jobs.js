@@ -68,12 +68,7 @@ async function init() {
   const entries = await fsp.readdir(JOBS_DIR).catch(() => []);
   for (const name of entries) {
     const job = jobs.get(name);
-    /* A job that never finished is not "old": it is unfinished. Its directory
-       holds the half-downloaded source and the parts already encoded, which is
-       exactly what makes a second attempt cheap. */
-    const unfinished = job && (job.interrupted || !['done', 'hosted', 'error'].includes(job.status));
-    const limit = unfinished ? KEEP_UNFINISHED_MS : MAX_AGE_MS;
-    if (!job || now - job.createdAt > limit) {
+    if (expired(job, now)) {
       await fsp.rm(path.join(JOBS_DIR, name), { recursive: true, force: true }).catch(() => {});
       if (job) jobs.delete(name);
     }
@@ -159,8 +154,20 @@ const getJob = (id) => jobs.get(id) || null;
 
 const TERMINAL = new Set(['done', 'hosted', 'error']);
 
+/* Statuses where a file is open, being written or about to be. A job in one of
+   these is *working*, not old, however long it has been working for. */
+const ACTIVE = new Set(['queued', 'fetching', 'uploading', 'awaiting-upload', 'compressing', 'hosting']);
+const isActive = (job) => ACTIVE.has(job && job.status);
+
 function updateJob(job, patch) {
   Object.assign(job, patch);
+  /* When it ended, not when it began. A 4K encode can take hours, and a job
+     that has just finished must not look three hours old to the sweeper. */
+  if (patch.status && TERMINAL.has(patch.status)) {
+    if (!job.finishedAt) job.finishedAt = Date.now();
+  } else if (patch.status && !TERMINAL.has(patch.status)) {
+    job.finishedAt = null;
+  }
   bus.emit('update', job);
   // A share link or a failure must survive an immediate crash.
   if (patch.status && TERMINAL.has(patch.status)) persistNow();
@@ -218,7 +225,33 @@ function sourceIsWhole(job) {
   return ['compressing', 'awaiting-upload', 'done', 'hosting', 'hosted'].includes(job.status);
 }
 
+/**
+ * Is another attempt worth offering?
+ *
+ * Yes when something survived that a retry can use: a whole source (no download
+ * needed), a partial one (the transfer resumes), or any finished parts (the
+ * encoder skips them). A job that failed before a single byte arrived has
+ * nothing to continue, and gets no button that would lie.
+ */
+function canRetry(job) {
+  if (!job || job.status !== 'error') return false;
+  if (job.interrupted) return false;
+  try {
+    if (fs.statSync(path.join(job.dir, 'source')).size > 0) return true;
+  } catch {
+    /* no source */
+  }
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(job.dir, 'segments.json'), 'utf8'));
+    if (state && Array.isArray(state.done) && state.done.length) return true;
+  } catch {
+    /* no parts */
+  }
+  return false;
+}
+
 function publicView(job) {
+  job.canRetry = canRetry(job);
   const view = {
     id: job.id,
     status: job.status,
@@ -265,6 +298,13 @@ function publicView(job) {
     originalBytes: sourceBytesOf(job),
     originalReady: sourceIsWhole(job),
     originalName: job.name || 'original.mp4',
+    /* The user asked for the untouched file as well as the compressed one. It
+       is delivered now and the encode carries on, so this is a request, not a
+       mode: the job still ends with a share link for the smaller file. */
+    wantOriginal: Boolean(job.wantOriginal),
+    /* A failure kept enough on disk to carry on from. The card offers "Try
+       again" only when that is true, so the button is never a bluff. */
+    canRetry: Boolean(job.canRetry),
     hosting: Boolean(job.hosting),
     /* True once the queue picked this up after the machine stopped. */
     resumed: Boolean(job.resumed),
@@ -294,6 +334,24 @@ async function removeJob(id) {
 
 const HOSTED_RECORD_MS = 30 * 24 * 60 * 60 * 1000; // a share link stays useful for a month
 
+/**
+ * Should this job's working files go?
+ *
+ * One rule, used by the startup scan and the sweeper, because two places that
+ * disagree are how a job that is still encoding gets deleted: a busy job is
+ * never expired, a finished job is measured from when it finished, and an
+ * unfinished one gets the long limit (its files are what makes a retry cheap).
+ */
+function expired(job, now = Date.now()) {
+  if (!job) return true; // a directory with no record is debris
+  if (job.pinLocal) return false;
+  if (ACTIVE.has(job.status)) return false;
+  if (job.hostedUrl) return now - job.createdAt > HOSTED_RECORD_MS;
+  const finished = job.status === 'done' || job.status === 'error';
+  const since = finished ? Number(job.finishedAt) || job.createdAt : job.createdAt;
+  return now - since > (finished ? FINISHED_MS : KEEP_UNFINISHED_MS);
+}
+
 /* How long the *local* copy lingers once a job no longer needs it. The app is
    for saving a video to a computer, and a computer can be across the room: two
    hours is long enough to arrive, short enough that a 32 GB Codespace does not
@@ -305,11 +363,18 @@ const FINISHED_MS = Number(process.env.FINISHED_KEEP_MINUTES || 180) * 60 * 1000
 function sweep() {
   const now = Date.now();
   for (const job of jobs.values()) {
-    const age = now - job.createdAt;
-
     /* Pinned: the user asked for these files to stay. Disk pressure is handled
        before a job starts (reclaimSpace), which also respects the pin. */
     if (job.pinLocal) continue;
+
+    /* A job that is running is not old, it is busy: a 4K encode on a 2-core
+       machine can take longer than MAX_AGE_MS, and this sweep used to delete
+       its directory out from under the encoder — which surfaced as
+       "ENOENT: no such file or directory, stat …/segments/part-0011.mp4" and
+       threw away hours of work. Nothing that is being worked on is swept. */
+    if (ACTIVE.has(job.status)) continue;
+
+    const age = now - job.createdAt;
 
     if (job.hostedUrl) {
       /* The file lives on the host now, so only the local copy is expendable.
@@ -324,10 +389,7 @@ function sweep() {
       continue;
     }
 
-    const finished = job.status === 'done' || job.status === 'error';
-    if (age > MAX_AGE_MS || (finished && age > FINISHED_MS)) {
-      removeJob(job.id);
-    }
+    if (expired(job, now)) removeJob(job.id);
   }
   persist();
 }
@@ -351,4 +413,7 @@ module.exports = {
   jobPaths,
   publicView,
   removeJob,
+  sweep,
+  isActive,
+  ACTIVE,
 };

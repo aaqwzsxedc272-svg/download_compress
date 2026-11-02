@@ -531,6 +531,128 @@ function slowSource(file, { delayMs = 120 } = {}) {
     check('and it finishes', ['done', 'hosted'].includes(longDone?.status), longDone?.error || longDone?.status);
     fast.close();
 
+    /* ---------------------------------------------------------------- 5 */
+    /* "It failed when it was nearly finished." The work of such a job is on
+       disk — the download and every part already encoded — so the failure must
+       not be the end of it. Two things are proved here: the job can be picked
+       up again without downloading anything, and the original can be saved
+       while the encode keeps going. */
+    server.kill('SIGKILL');
+    await sleep(600);
+
+    const fastAgain = slowSource(sample, { delayMs: 0 });
+    await new Promise((resolve) => fastAgain.listen(FAST_PORT, '127.0.0.1', resolve));
+
+    const reviveId = 'stoppedat91';
+    const reviveDir = path.join(DATA_DIR, 'jobs', reviveId);
+    await fsp.mkdir(reviveDir, { recursive: true });
+    await fsp.copyFile(sample, path.join(reviveDir, 'source'));
+    const reviveBytes = fs.statSync(path.join(reviveDir, 'source')).size;
+    const hollowId = 'nothingleftatall';
+    await fsp.mkdir(path.join(DATA_DIR, 'jobs', hollowId), { recursive: true });
+
+    const store5 = JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'jobs.json'), 'utf8'));
+    store5.push(
+      {
+        id: reviveId,
+        createdAt: Date.now() - 40 * 60 * 1000,
+        status: 'error',
+        finishedAt: Date.now() - 30 * 60 * 1000,
+        stage: 'Failed',
+        progress: 0.91,
+        source: 'url',
+        url: fastUrl,
+        name: 'Long 4K clip.mp4',
+        presetId: 'small',
+        sourceBytes: reviveBytes,
+        outputBytes: 0,
+        error: 'The encoder stopped 91% of the way through.',
+      },
+      {
+        id: hollowId,
+        createdAt: Date.now() - 60 * 60 * 1000,
+        status: 'error',
+        finishedAt: Date.now() - 60 * 60 * 1000,
+        stage: 'Failed',
+        progress: 0,
+        source: 'url',
+        url: 'https://example.test/unresolvable',
+        name: 'Gone.mp4',
+        presetId: 'small',
+        sourceBytes: 0,
+        outputBytes: 0,
+        error: 'That link could not be read.',
+      },
+    );
+    await fsp.writeFile(path.join(DATA_DIR, 'jobs.json'), JSON.stringify(store5));
+
+    server = startServer(segmented);
+    await ready();
+
+    const failedView = await getJob(reviveId);
+    check('a failed job stays failed after the restart, it is not silently redone', failedView?.status === 'error', failedView?.status);
+    check(
+      'the card is told it can be carried on from',
+      failedView?.canRetry === true,
+      `canRetry ${failedView?.canRetry}, ${failedView?.sourceBytes} bytes kept`,
+    );
+
+    const hollow = await getJob(hollowId);
+    check('a failure with nothing left says so instead of offering false hope', hollow?.canRetry === false);
+    const hollowRetry = await fetch(`${BASE}/api/jobs/${hollowId}/retry`, { method: 'POST' });
+    const hollowBody = await hollowRetry.json().catch(() => ({}));
+    check(
+      'and the button is refused if it is pressed anyway',
+      hollowRetry.status === 409 && hollowBody.code === 'NOTHING_TO_RETRY',
+      `${hollowRetry.status} ${hollowBody.code || ''}`,
+    );
+
+    const servedBeforeRetry = fastAgain.bytes();
+    const retried = await fetch(`${BASE}/api/jobs/${reviveId}/retry`, { method: 'POST' });
+    const retriedBody = await retried.json().catch(() => ({}));
+    check('a failed job can be started again from its card', retried.ok, `${retried.status} ${retriedBody.error || ''}`);
+    check(
+      'and it picks up what failed instead of looking brand new',
+      ['queued', 'compressing', 'fetching'].includes(retriedBody.job?.status),
+      retriedBody.job?.status,
+    );
+
+    const twice = await fetch(`${BASE}/api/jobs/${reviveId}/retry`, { method: 'POST' });
+    check('pressing it twice does not start the same job twice', twice.status === 409, String(twice.status));
+
+    /* Saved while it is encoding: the bytes are there now, and the render has
+       not been cancelled to get them. */
+    const saving = await (await fetch(`${BASE}/api/jobs/${reviveId}/save-original`, { method: 'POST' })).json();
+    check('the original can be saved while the file is still being treated', saving.ready === true, JSON.stringify(saving).slice(0, 120));
+    check('the encode keeps going rather than being stopped', saving.job?.status === 'compressing' || saving.job?.status === 'queued', saving.job?.status);
+    check('it is remembered, so the source is not deleted when the encode ends', saving.job?.wantOriginal === true);
+    const savedBytes = await fetch(`${BASE}${saving.download}`)
+      .then(async (response) => (response.ok ? Buffer.from(await response.arrayBuffer()).length : 0))
+      .catch(() => 0);
+    check('and the file it hands over is the whole original', savedBytes === reviveBytes, `${savedBytes} vs ${reviveBytes}`);
+
+    const revived = await waitFor(
+      async () => {
+        const current = await getJob(reviveId);
+        return current && ['done', 'hosted', 'error'].includes(current.status) ? current : null;
+      },
+      { timeoutMs: 300000 },
+    );
+    check('it finishes this time', ['done', 'hosted'].includes(revived?.status), revived?.error || revived?.status);
+    check(
+      'without downloading the file again',
+      fastAgain.bytes() - servedBeforeRetry < 64 * 1024,
+      `${Math.round((fastAgain.bytes() - servedBeforeRetry) / 1024)} KB fetched`,
+    );
+    check(
+      'and the original is still on disk afterwards, as asked',
+      fs.existsSync(path.join(reviveDir, 'source')),
+      'the source was deleted despite the request to keep it',
+    );
+    const tooLateAgain = await fetch(`${BASE}/api/jobs/${reviveId}/retry`, { method: 'POST' });
+    check('a job that has just finished cannot be retried over itself', tooLateAgain.status === 409, String(tooLateAgain.status));
+    fastAgain.close();
+
   } finally {
     if (server) server.kill('SIGKILL');
     if (source) source.close();

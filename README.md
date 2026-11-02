@@ -182,6 +182,10 @@ carries that name in its URL so the browser's save dialog and any download manag
 
 ## Just download it (no re-encoding)
 
+> Two different things wear this name. **Before** a job starts, *Skip encoding* means "do not
+> treat this file at all". **During** a job, the card's *Save the original too* means "give me the
+> bytes as well" — and the treatment carries on regardless.
+
 Not every link needs a smaller file. Some hosts are fast from the server and slow from a
 laptop, and the point is simply to get the bytes. *Skip the encoder → Just download it* in the
 composer (or the same switch in the file picker) hands the original back untouched:
@@ -194,22 +198,57 @@ composer (or the same switch in the file picker) hands the original back untouch
 - Disk need drops from ~2.2× the file to ~1.2×, because there is no encoder scratch space.
 - It can still be uploaded to a host and still appears in the links panel, so a slow-source
   download also survives the machine stopping.
-- **The decision can be taken late.** A slow encode is obvious a minute in, so the card of a
-  file that is queued, downloading or being treated has its own **Just download it** button.
-  Pressing it stops the encoder, keeps whatever has already been downloaded, and hands those
-  bytes back (re-wrapping the container only when that is lossless). Nothing is restarted: the
-  file goes straight on to a share link, and it says *Downloaded as-is* instead of
-  *Compressed*.
-- **Pressing it saves the file immediately**, not just the decision. If the download is already
-  whole, the browser starts receiving it at once from `GET /api/jobs/:id/original/<name>` — a
-  real download (its own progress, resumable, in the browser's download list), not a fetch held
-  in the page's memory. If the file is still arriving, the page says how much is there and starts
-  the download by itself the moment the last byte lands; half a video is never handed over,
-  because a truncated MP4 does not play.
+- **Taking the original never cancels the treatment.** The card of a file that is queued,
+  downloading or being treated has a **Save the original too** button. Pressing it saves the
+  bytes *and* leaves the encoder running: the point of a 2 GB download is the video, and the
+  point of the treatment is the shareable copy — wanting the first is no reason to throw the
+  second away. The button used to stop the encode and hand back the raw file; that is now a
+  decision made *before* a job starts (the composer's *Skip encoding* switch), not a mid-flight
+  emergency stop.
+- **The save starts immediately**, not after the encode. If the download is already whole, the
+  browser starts receiving it at once from `GET /api/jobs/:id/original/<name>` — a real download
+  (its own progress, resumable, in the browser's download list), not a fetch held in the page's
+  memory — and the encode is not held up for a second. If the file is still arriving, the page
+  says how much is there and starts the download by itself the moment the last byte lands; half
+  a video is never handed over, because a truncated MP4 does not play. The request is remembered
+  (`wantOriginal`), so the source is not deleted when the encoder finishes underneath it.
+- **A failure keeps its work.** See *A failure is not a dead end* below: the source and every
+  encoded part stay on disk, the card offers **Try again**, and pressing it does not download
+  the file again or re-encode a part that was already finished.
 - **A finished file can be taken home from its card**, in any end state: the local copy while it
   is still there (the fastest download — no host in the middle), or the uploaded link once the
   local copy has been deleted to free space. A hosted job used to show only *Details*, and a
   deleted one used to keep a button that answered `410`.
+
+## A failure is not a dead end
+
+A 4K file on a small machine is hours of work, and the reported failure — `ENOENT … stat
+'…/segments/part-0011.mp4'`, at 91% — was not the encoder giving up on the video. It was the app:
+
+- **A job that is working is never old.** The sweeper deleted any job older than three hours,
+  including one that was still encoding; a 4K file takes longer than that, so its own scratch
+  directory was removed out from under it. `sweep()` now skips every status that means a file is
+  open (`queued`, `fetching`, `uploading`, `awaiting-upload`, `compressing`, `hosting`), and a
+  finished job's deadline runs from when it *finished*, not from when it began.
+  `npm run test:sweep` holds a five-hour-old encode, a six-hour encode that just succeeded, a
+  two-hour-old crash and a pinned job against a real filesystem and a real clock.
+- **A part is only a part once it is complete.** Parts used to be encoded straight to
+  `part-0011.mp4`; a machine that stopped mid-part left a truncated file that looked finished
+  (it was bigger than a kilobyte), and the join produced a video with a silent hole in it. Each
+  part is now written to `part-0011.partial.mp4` and renamed into place only when the encoder
+  exits cleanly. A restart deletes any `.partial` file first — it can never be trusted — and
+  leaves the finished parts exactly where they are.
+- **One bad part does not cost the other twelve.** A part is a few minutes of work; the file is a
+  few hours. A part that fails is retried once on its own, with a message on the card (*Retrying
+  part 4 of 12*), before the job as a whole is allowed to fail.
+- **Nothing is deleted when it fails.** `reportJobError` used to remove the source and the parts;
+  now it removes only the half-written output. The job keeps `retained: true` and the card offers
+  **Try again** (`POST /api/jobs/:id/retry`), which re-uses the source and the parts on disk: no
+  second download, no second encode of the work already done. The message says so in plain
+  words, and a job with genuinely nothing left (no source, no parts, no link) says *paste the
+  link again* instead of offering a button that cannot work.
+- **The clock and the disk agree.** The startup scan and the sweeper share one `expired()` rule,
+  so a job cannot be young for one and old for the other.
 
 ## Hosts used for the output
 
@@ -338,6 +377,8 @@ app cannot be used to probe the box it runs on.
 | `POST` | `/api/jobs/:id/hosted` | Attach a link obtained elsewhere (browser upload) |
 | `GET` | `/api/jobs/:id/download` | The compressed MP4 |
 | `GET` | `/api/jobs/:id/original` | The untouched download, for *Just download it* |
+| `POST` | `/api/jobs/:id/save-original` | Save the original now; the encode keeps going — `{ ok, ready, gone, download }` |
+| `POST` | `/api/jobs/:id/retry` | Carry on with a job that failed, from the files it kept |
 | `POST` | `/api/jobs/:id/pin` | Keep this job's files through the sweeper: `{ pinned: true }` |
 | `DELETE` | `/api/jobs/:id` | Cancel / delete a job |
 | `GET` | `/api/storage` | Every file on the disk with its size, owner and deadline, plus the meter |
@@ -738,10 +779,11 @@ and the download starts clean instead of producing a corrupt video. If the host 
 answers `200` with the whole file, which is handled as a normal restart. The card says *Continuing
 the download from 640 MB* and marks the file *download continued where it stopped*.
 
-- **Unfinished work is kept for a day, not three hours.** A job that never finished is not
-  "old": its directory holds the half-downloaded source and the parts already encoded, which is
-  exactly what makes a second attempt cheap. Finished jobs are still swept after 3 hours;
-  unfinished ones get `KEEP_UNFINISHED_HOURS` (24 by default).
+- **Nothing that is running is ever swept**, and **unfinished work is kept for a day, not three
+  hours.** A job that never finished is not "old": its directory holds the half-downloaded source
+  and the parts already encoded, which is exactly what makes a second attempt cheap. A finished
+  job is swept 3 hours after it *finished* (`FINISHED_KEEP_MINUTES`, 180) — a six-hour encode is
+  not deleted the second it succeeds — and unfinished work gets `KEEP_UNFINISHED_HOURS` (24).
 - **The two things that can still be lost** are the encoder's *remaining* time (never the whole
   job) and a finished file that was never uploaded, if the container itself is deleted. GitHub
   Codespaces deletes a stopped codespace after 30 days; that is the only deadline that matters,
@@ -754,8 +796,9 @@ the download from 640 MB* and marks the file *download continued where it stoppe
 kills the server, starts a fresh one on the same data directory, and finds the share link still
 there. `npm run test:resume` kills the server mid-encode and checks the job finishes after the
 restart. `npm run test:recover` covers the other two rows of that table — it cuts a real download
-in half, restarts into a job left mid-upload, presses *Just download it* on a running encode, and
-checks that the first link is posted while the second file is still being worked on.
+in half, restarts into a job left mid-upload, presses *Save the original too* on a running encode
+(and checks the encode keeps going), and checks that the first link is posted while the second
+file is still being worked on.
 
 **Links leave as soon as they exist.** The queue-drained post is the tidy summary, but a file that
 has a share link is posted a minute later, in a small batch of its own (`PUBLISH_EVERY_SECONDS`,
@@ -828,13 +871,18 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   frees exactly the file's size, a pinned job survives the bulk clean, and the meter is simulated
   across a month boundary (2 core-hours per hour on 2 cores, GB-months as an average, a restart
   that must not credit the hours it was not running, the quota and the month surviving a restart).
-- `npm run test:ui` — 33 checks of the browser code in jsdom: the disk pill, the presets, "just download"
+- `npm run test:ui` — 35 checks of the browser code in jsdom: the disk pill, the presets, "just download"
   greying the encoder controls, the size list in the picker, the per-picker switch sending
   `noCompress`, the email button, the webhook panel, and a running job's card showing its link,
-  the name its browser tab will carry, its own "Just download it" button, the storage panel
+  the name its browser tab will carry, its own "Save the original too" button (which must not
+  cancel the encode), "Try again" on a failed job that kept its work, the storage panel
   (opening, file rows, download links, the disabled delete on a running job, the only-copy warning,
   pinning, the bulk clean) and the session/limits tab with its meter (needs
   `npm i --no-save jsdom`, skips without it).
+- `npm run test:sweep` — 11 checks with a real filesystem and a real clock: a five-hour-old
+  encode is never swept, a six-hour encode that has just finished is measured from `finishedAt`
+  and survives, a two-hour-old crash keeps its files for *Try again*, a day-old one is cleaned
+  up, a pinned job is never swept, and every busy status is in the protected set.
 - `npm run test:space` — the space policy end to end: a hosted job's files are deleted,
   the link survives, the download route answers `410`, and `KEEP_LOCAL_AFTER_UPLOAD=1` keeps
   everything.
@@ -843,15 +891,19 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:resume` — an encode killed at 6% finishes after a restart (takes ~5 minutes).
 - `npm run doctor -- <link>` — walks a link through every stage against the real host and explains
   what went wrong. No server needed.
-- `npm run test:segments` — 18 checks: the parts cover the file exactly, a real encode is killed
-  mid-way, the parts from before the crash are reused (their mtimes prove it), and the joined
-  file is as long as the source with its audio.
-- `npm run test:recover` — 42 checks: a download cut in half resumes, the same link sent again
+- `npm run test:segments` — 21 checks: the parts cover the file exactly, a part written under a
+  `.partial` name is never counted as finished, a truncated part left by a crash is thrown away on
+  restart while the finished ones are kept, a real encode is killed mid-way, the parts from
+  before the crash are reused (their mtimes prove it), and the joined file is as long as the
+  source with its audio.
+- `npm run test:recover` — 57 checks: a download cut in half resumes, the same link sent again
   continues that job instead of starting a second one, a job left mid-upload is uploaded again, a
   crash mid-encode is picked up by re-pasting the link (the parts from before are reused and not a
   byte is downloaded again), "just download it" pressed mid-encode returns the original byte for
   byte from `/api/jobs/:id/original`, a half-downloaded file is refused rather than handed over
-  truncated, and a finished file's link is posted before the queue has drained.
+  truncated, a job that failed near the end offers *Try again* and finishes from the files it
+  kept without fetching a byte, the original can be saved mid-encode while the encode keeps
+  going, and a finished file's link is posted before the queue has drained.
 - `npm run smoke` — 61 end-to-end checks: sample, upload, browser relay, target size, range
   requests, share-page resolution, reference jobs, chunked uploads (including a re-sent
   chunk and an out-of-order chunk), and every rejection path. Starts its own
@@ -864,7 +916,9 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 ## Housekeeping
 
 Files are removed by a sweeper on the schedule above (a local copy two hours after its upload, a
-finished job after three, an unfinished one after a day), and a **pinned** job is never swept.
+finished job three hours after it finished, an unfinished one after a day), and a **pinned** job
+is never swept. A job that is still being worked on is never swept, however long it has been
+going.
 Everything is visible and deletable in the storage panel before that happens. Job IDs are random
 and unguessable; nothing is shared between visitors. Downloads also stop if free disk space gets
 tight.

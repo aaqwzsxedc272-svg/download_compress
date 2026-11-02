@@ -59,6 +59,28 @@ const statePath = (jobDir) => path.join(jobDir, STATE_FILE);
 const dirFor = (jobDir) => path.join(jobDir, SEGMENT_DIR);
 const fileFor = (jobDir, index) => path.join(dirFor(jobDir), `part-${String(index).padStart(4, '0')}.mp4`);
 
+/**
+ * Where a part is written *before* it is a part.
+ *
+ * ffmpeg writes here and the file is renamed into place only once the encoder
+ * exits cleanly. Without that, a machine that stops mid-part leaves a truncated
+ * .mp4 under the real name, `finishedParts()` counts it as done (it is bigger
+ * than a kilobyte), and the join silently produces a video with a hole in it.
+ * The name still ends in .mp4 so ffmpeg knows which muxer to use.
+ */
+const partialFor = (jobDir, index) => path.join(dirFor(jobDir), `part-${String(index).padStart(4, '0')}.partial.mp4`);
+
+/** Leftovers from an interrupted run: a partial can never be trusted. */
+async function clearPartials(jobDir) {
+  const dir = dirFor(jobDir);
+  const entries = await fsp.readdir(dir).catch(() => []);
+  await Promise.all(
+    entries
+      .filter((name) => name.includes('.partial.'))
+      .map((name) => fsp.rm(path.join(dir, name), { force: true }).catch(() => {})),
+  );
+}
+
 async function read(jobDir) {
   try {
     const raw = await fsp.readFile(statePath(jobDir), 'utf8');
@@ -129,6 +151,8 @@ module.exports = {
   write,
   clear,
   finishedParts,
+  partialFor,
+  clearPartials,
   writeConcatFile,
   cleanup,
   fileFor,

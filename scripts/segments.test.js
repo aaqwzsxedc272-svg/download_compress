@@ -99,6 +99,43 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
     `${doneSet.size} usable`,
   );
 
+  /* The second way a hole used to appear in a joined video: ffmpeg wrote
+     straight to part-0001.mp4, the machine stopped mid-part, and the truncated
+     file was big enough to count as finished. Parts are written under the
+     .partial name and renamed only when the encoder exits cleanly, so a
+     half-written part can never be mistaken for a finished one. */
+  check(
+    'a part is written under a name that is obviously not a part yet',
+    (() => {
+      const finalName = segments.fileFor(fakeDir, 1);
+      const tempName = segments.partialFor(fakeDir, 1);
+      return (
+        tempName !== finalName &&
+        tempName.includes('.partial.') &&
+        tempName.endsWith('.mp4') // ffmpeg picks its muxer from the extension
+      );
+    })(),
+  );
+  await fsp.writeFile(segments.fileFor(fakeDir, 1), Buffer.alloc(8192, 7));
+  await fsp.writeFile(segments.partialFor(fakeDir, 1), Buffer.alloc(300_000, 7));
+  await fsp.writeFile(segments.partialFor(fakeDir, 2), Buffer.alloc(300_000, 7));
+  const afterTruncation = await segments.finishedParts(fakeDir, await segments.read(fakeDir));
+  check(
+    'a truncated part left by a crash is never joined into the video',
+    afterTruncation.has(0) && afterTruncation.has(1) && !afterTruncation.has(2),
+    `parts ${[...afterTruncation].join(', ') || 'none'}`,
+  );
+
+  await segments.clearPartials(fakeDir);
+  const leftovers = await fsp.readdir(segments.dirFor(fakeDir));
+  check(
+    'a restart throws away half-written parts and keeps the finished ones',
+    !leftovers.some((name) => name.includes('.partial.')) &&
+      leftovers.includes('part-0000.mp4') &&
+      leftovers.includes('part-0001.mp4'),
+    leftovers.join(', ') || 'the directory was emptied',
+  );
+
   console.log('a real encode, interrupted');
 
   let server = startServer();

@@ -33,37 +33,30 @@ const {
 const segments = require('./segments');
 const hosters = require('./hosters');
 const sources = require('./sources');
-const {
-  resolve,
-  directUrl,
-  directCandidates,
-  setGofileBrowser,
-  setPageBrowser,
-  setPageHtmlBrowser,
-} = require('../shared/resolve');
+const { resolve, directUrl, directCandidates } = require('../shared/resolve');
+const browserhooks = require('./browserhooks');
 
-/* gofile mints its API token in an obfuscated browser script, so a headless
-   browser is the only way to list a folder once the plain API says no. It is an
-   optional dependency: if it is not installed this is a no-op. */
-try {
-  const browser = require('./browser');
-  if (browser.available()) {
-    setGofileBrowser((code) => browser.gofileFolder(code));
-    setPageBrowser((url) => browser.captureMedia(url));
-    /* Cloudflare-protected pages (fileditch among them): a real browser runs
-       the challenge and hands back the DOM plus the clearance cookie. */
-    setPageHtmlBrowser((url) => browser.capturePage(url, { waitFor: 'a[href], video, source' }));
-  }
-} catch {
-  /* no browser helper on this deployment */
-}
+/* gofile mints its API token in an obfuscated browser script, and Cloudflare
+   pages build their download button in JavaScript, so a headless browser is the
+   only way through either. Optional dependency: without it this is a no-op.
+   Shared with `npm run doctor` so a diagnostic sees the same machine the app
+   does. */
+browserhooks.install();
 
-/** The capture function, or null when Chromium is not installed here. */
+/**
+ * The capture function used by the download fallback, or null when Chromium is
+ * not installed here.
+ *
+ * It used to return only the media URLs the page played. For a fileditch-style
+ * player that is the player page itself — which serves HTML — so the fallback
+ * now also gets the anchors the rendered page offers, which is where the real
+ * download link lives.
+ */
 function browserCapture() {
   try {
     const browser = require('./browser');
     if (!browser.available()) return null;
-    return (url) => browser.captureMedia(url);
+    return (url) => browser.captureMedia(url, { includeAnchors: true });
   } catch {
     return null;
   }
@@ -1009,7 +1002,7 @@ function reportJobError(job, err) {
     : err.code === 'FFMPEG_FAILED'
       ? `ffmpeg could not process this file${err.codecNote ? ` (${err.codecNote})` : ''}.` +
         `${ffmpegDetail ? ` It said: ${ffmpegDetail}` : ''} Try another preset, or a different source file.`
-      : FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
+      : err.playerNote || FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
   jobsStore.updateJob(job, {
     status: 'error',
     stage: outOfSpace ? 'Out of disk space' : 'Failed',
@@ -1115,8 +1108,12 @@ async function fetchThenCompress(job, ref) {
       }
     }
     /* A Cloudflare clearance earned while reading the page is what the CDN
-       checks again on the file itself. */
-    if (ref && ref.cookie) refHeaders.cookie = ref.cookie;
+       checks again on the file itself — together with the user agent that
+       earned it, because cf_clearance is bound to that string. */
+    if (ref && ref.cookie) {
+      refHeaders.cookie = ref.cookie;
+      if (ref.userAgent) refHeaders['user-agent'] = ref.userAgent;
+    }
     if (resumable && partialBytes > 0) {
       console.log(`[job ${job.id}] resuming the download at ${Math.round(partialBytes / 1048576)} MB`);
       jobsStore.updateJob(job, {
@@ -1176,6 +1173,7 @@ async function fetchThenCompress(job, ref) {
     /* Try each candidate in turn: a stale signed link costs a request, not a
        job. Only the failures that another URL could fix are retried. */
     let attempt = null;
+    let htmlRoutes = 0;
     const tried = [];
     while (!attempt && candidates.length) {
       const candidate = candidates.shift();
@@ -1196,6 +1194,7 @@ async function fetchThenCompress(job, ref) {
           await fsp.rm(paths.source, { force: true }).catch(() => {});
           jobsStore.updateJob(job, { stage: 'Starting the download again from the beginning' });
         }
+        if (err.code === 'HTML_PAGE') htmlRoutes += 1;
         if (!RECOVERABLE.has(err.code)) throw err;
         let host = 'that host';
         try {
@@ -1212,20 +1211,33 @@ async function fetchThenCompress(job, ref) {
        bot challenge, a player-only signed URL) is retried through a real
        browser before the job is allowed to fail. */
     if (!attempt) {
-      attempt = await downloadWithFallback({
-        url: tried[tried.length - 1] || url,
-        pageUrl: job.url || url,
-        destPath: paths.source,
-        download: (target, dest, options) => sources.downloadHttp(target, dest, options),
-        capture,
-        options: downloadOptions,
-        /* fileditch's signed links expire in about half an hour — shorter than a
-           queue wait — so fetch a fresh one before giving up. */
-        refresh: async () => {
-          const fresh = await directCandidates(ref).catch(() => []);
-          return fresh.find((candidate) => !tried.includes(candidate)) || null;
-        },
-      });
+      try {
+        attempt = await downloadWithFallback({
+          url: tried[tried.length - 1] || url,
+          pageUrl: job.url || url,
+          destPath: paths.source,
+          download: (target, dest, options) => sources.downloadHttp(target, dest, options),
+          capture,
+          options: downloadOptions,
+          /* fileditch's signed links expire in about half an hour — shorter
+             than a queue wait — so fetch a fresh one before giving up. */
+          refresh: async () => {
+            const fresh = await directCandidates(ref).catch(() => []);
+            return fresh.find((candidate) => !tried.includes(candidate)) || null;
+          },
+        });
+      } catch (err) {
+        /* Every route answered with a web page, which is what a player page
+           looks like from here — and the reason a plain download cannot work is
+           the JavaScript download button, not a missing file. Say the thing that
+           actually fixes it. */
+        if (err.code === 'HTML_PAGE' && htmlRoutes > 0 && !browserhooks.install().available) {
+          err.playerNote =
+            'That page only plays the video; its download button is built by JavaScript, and this server has no ' +
+            'browser to press it. Run `npm run browser:install` once in the project, then try the link again.';
+        }
+        throw err;
+      }
     }
     if (attempt.usedBrowser) {
       job.browserFetched = true;

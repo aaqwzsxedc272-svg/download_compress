@@ -506,7 +506,8 @@ same cookie is then checked again when the video is requested. So a page fetch g
    `cf-mitigated: challenge`, a 403/503 from a Cloudflare front, or the interstitial's own text.
    Chromium runs the challenge, waits for the page to become the real page, and hands back the DOM
    **plus its cookie jar**. The resolver then mints the signed link from that DOM, and the download
-   sends `cf_clearance` along with the request.
+   sends `cf_clearance` along with the **same user agent that earned it** — Cloudflare binds the
+   clearance to that string, so the cookie alone draws a 403.
 3. **An honest failure** if neither works: `That host answers with a Cloudflare browser check…`
    with the one command that fixes it, never "the file was removed" when it was not.
 
@@ -515,6 +516,19 @@ The browser is optional because it is ~150 MB of Chromium:
 ```bash
 npm run browser:install      # npm install --no-save playwright && npx playwright install chromium
 ```
+
+The browser is wired up in exactly one place, `server/browserhooks.js`, and every entry point goes
+through it: the job runner, `/api/diagnose-link`, and `npm run doctor`. That matters more than it
+sounds — when registration lived in `server.js`, the doctor resolved links with no browser at all and
+reported working links as broken. Both the share page (`theditch.st/…`, what you actually paste) and
+the player page now render their DOM before a link is guessed, because the useful "⬇ Download"
+anchor is written by their JavaScript and is invisible to a plain request.
+
+A URL that is only the *player page* (a bare `name.mp4` with no signed token in front of it) is
+marked `playerish` by the resolver, so nothing downstream mistakes it for the file. When every route
+to a video answers with a web page and no browser is installed, the job says what that means — "its
+download button is built by JavaScript, and this server has no browser to press it" — and names the
+one command that fixes it, instead of "that link is a web page".
 
 `/api/health` reports `browserAvailable`, so the page knows whether step 2 exists on this machine.
 
@@ -536,8 +550,11 @@ the same thing as JSON, with `&format=text` for the block above. Signed tokens a
 they are short-lived credentials.
 
 `npm run test:fallback` covers the observe-the-media path against a fake host that refuses plain
-requests, and `npm run test:resolve` covers the Cloudflare path (challenge detected → browser
-asked → cookie carried → and a normal page never costs a browser).
+requests, `npm run test:resolve` covers the resolver (challenge detected → browser asked → cookie
+carried → a normal page never costs a browser → an anchor the page offers outranks any derived
+URL), and `npm run test:hooks` covers the wiring: that installing the hooks makes the resolver use
+the browser, that the cookie and user agent travel together, and that the doctor sees the same
+browser the worker does.
 
 ## Saving results, and not paying for an idle machine
 
@@ -695,8 +712,12 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:resolve` — 37 resolver tests against stubbed APIs (real response shapes),
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before
-  a minted link,
-  including the page-title naming rule and fileditch's minted-link/player routes.
+  a minted link, plus the page-title naming rule and fileditch's minted-link/player routes.
+- `npm run test:hooks` — 20 checks that the browser is registered once and reaches every caller:
+  a JS-built download button is found, the cookie and its user agent are carried to the fetch, the
+  rendered DOM is cached, the doctor resolves the same link the worker does, with no browser
+  installed nothing invents a cookie or pretends to have read the page, and the report never calls a
+  browser that is simply absent a bug.
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
 - `npm run test:estimate` — the quality rules and the size prediction: a dense 1080p file is

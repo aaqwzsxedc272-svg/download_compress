@@ -165,7 +165,7 @@ async function gofileFolder(code, { timeoutMs = 60_000 } = {}) {
  * reads from your browser. A real browser solves the challenge and its own
  * player requests the media, so the URL can simply be observed.
  */
-async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000 } = {}) {
+async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeAnchors = false } = {}) {
   const pw = load();
   if (!pw || !pw.chromium) {
     throw Object.assign(new Error('The headless browser is not installed on this machine.'), {
@@ -222,6 +222,8 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000 } = {}) {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
     await page.waitForTimeout(settleMs);
+    const cookieHeader =
+      (await context.cookies().catch(() => [])).map((c) => `${c.name}=${c.value}`).join('; ') || '';
 
     // Some players only start on a click; try the usual suspects once.
     for (const selector of ['video', 'button[class*="play" i]', '[class*="player" i]']) {
@@ -232,10 +234,13 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000 } = {}) {
     }
     await page.waitForTimeout(3000);
 
-    // Read what the DOM advertises too: <video src>, <source>, og:video.
+    // Read what the DOM advertises too: <video src>, <source>, og:video, and —
+    // when asked — the anchors, which is where a "Download" button points once
+    // JavaScript has built it.
     const dom = await page
-      .evaluate(() => {
+      .evaluate((withAnchors) => {
         const out = [];
+        const anchors = [];
         const push = (value) => {
           if (value) out.push(new URL(value, location.href).href);
         };
@@ -243,15 +248,40 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000 } = {}) {
         document.querySelectorAll('video source, source').forEach((s) => push(s.src));
         const og = document.querySelector('meta[property="og:video"], meta[property="og:video:url"]');
         if (og) push(og.getAttribute('content'));
-        return out;
-      })
-      .catch(() => []);
-    dom.forEach((u) => remember(u, { force: true }));
+        if (withAnchors) {
+          document.querySelectorAll('a[href]').forEach((a) => {
+            const label = `${a.textContent || ''} ${a.className || ''} ${a.id || ''}`;
+            anchors.push({
+              href: new URL(a.getAttribute('href'), location.href).href,
+              download: /download|⬇|save|get file/i.test(label),
+            });
+          });
+        }
+        return { media: out, anchors };
+      }, Boolean(includeAnchors))
+      .catch(() => ({ media: [], anchors: [] }));
+    dom.media.forEach((u) => remember(u, { force: true }));
+
+    if (includeAnchors) {
+      for (const anchor of dom.anchors) {
+        const clean = String(anchor.href || '').split('#')[0];
+        if (!/^https?:/i.test(clean)) continue;
+        /* Either it names a file, or it is an opaque signed token (base64-ish,
+           no extension) such as fileditch hands out. */
+        const tokenish = /\/[A-Za-z0-9_-]{24,}$/.test(new URL(clean).pathname);
+        const named = /\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|3gp|ogv)(\?|#|$)/i.test(clean);
+        if (!anchor.download && !named && !tokenish) continue;
+        remember(clean, { force: true, cookie: cookieHeader });
+      }
+    }
 
     const cookies = await context.cookies().catch(() => []);
     return {
       media: [...seen.values()],
       cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
+      /* Cloudflare ties cf_clearance to this string: the download has to use
+         the same one or the cookie is worthless. */
+      userAgent: UA,
     };
   } finally {
     await browser.close().catch(() => {});
@@ -322,6 +352,9 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
       title: await page.title().catch(() => title),
       html,
       cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
+      /* cf_clearance is bound to the user agent that earned it, so the
+         download has to use this exact string. */
+      userAgent: UA,
       challenged: CHALLENGE_TITLE.test(await page.title().catch(() => '')),
     };
   } finally {

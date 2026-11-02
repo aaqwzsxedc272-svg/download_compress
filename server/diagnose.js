@@ -47,6 +47,12 @@ async function diagnose(url, { browser } = {}) {
   const version = require('./version').describe();
   steps.version = version;
 
+  /* The app registers its browser hooks at startup; a diagnostic that skipped
+     this ran the resolver with no browser at all and reported a working link as
+     broken. Same wiring, same answer. */
+  const hooks = require('./browserhooks').install();
+  steps.hooks = hooks;
+
   /* 1. Is the browser helper actually usable here? "I installed it" and "the
         server can launch it" are different claims. */
   const pw = (() => {
@@ -57,7 +63,19 @@ async function diagnose(url, { browser } = {}) {
     }
   })();
   if (!pw) {
-    steps.browser = { available: false, why: 'playwright is not installed (npm run browser:install)' };
+    /* What matters is not whether the module is importable but whether the
+       resolver has a browser behind it. Those differ when the hook was never
+       installed — the bug that made an earlier doctor report lie. */
+    steps.browser = {
+      available: hooks.available,
+      wired: hooks.available,
+      /* playwright is not importable at all. "Not wired" and "not installed"
+         are different faults: only the first one is a bug in this repo, and
+         calling a missing browser a bug is the same kind of lie as the report
+         that used to resolve links with no browser behind it. */
+      module: false,
+      why: hooks.available ? 'wired through the browser helper' : hooks.why || 'playwright is not installed (npm run browser:install)',
+    };
   } else {
     let launch = null;
     try {
@@ -69,7 +87,7 @@ async function diagnose(url, { browser } = {}) {
     } catch (err) {
       launch = { why: err.message };
     }
-    steps.browser = { available: Boolean(pw.chromium), ...launch };
+    steps.browser = { available: Boolean(pw.chromium) && hooks.available, wired: hooks.available, module: true, ...launch };
   }
 
   /* 2. The plain request, with the headers the resolver really sends. */
@@ -77,7 +95,7 @@ async function diagnose(url, { browser } = {}) {
     const res = await fetch(url, {
       redirect: 'follow',
       headers: {
-        'user-agent': UA,
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
       },
@@ -107,16 +125,33 @@ async function diagnose(url, { browser } = {}) {
       resolver: result.resolver,
       title: result.title || null,
       pageTitle: result.pageTitle || null,
-      files: (result.files || []).map((file) => ({
+      files: (result.files || []).map((file) => {
+        /* Decided on the *unredacted* URL: a minted link is a long opaque
+           token, a player page is name.mp4 with a short path. */
+        const raw = (file.ref && file.ref.url) || '';
+        let pathname = '';
+        try {
+          pathname = new URL(raw).pathname;
+        } catch {
+          /* not a URL */
+        }
+        const signed = /\/[A-Za-z0-9_-]{24,}$/.test(pathname);
+        const playerish = !signed && /\.(mp4|m4v|webm|mov)$/i.test(pathname);
+        return {
         name: file.name,
         size: file.size,
+        signed,
+        playerish,
         refUrl: redact(file.ref && file.ref.url),
         hasCookie: Boolean(file.ref && file.ref.cookie),
         cookieNames: String((file.ref && file.ref.cookie) || '')
           .split(';')
           .map((part) => part.split('=')[0].trim())
           .filter(Boolean),
-      })),
+        userAgent: (file.ref && file.ref.userAgent) || null,
+        viaBrowser: Boolean(file.ref && file.ref.viaBrowser),
+        };
+      }),
     };
   });
   steps.resolve = resolved;
@@ -135,7 +170,8 @@ async function diagnose(url, { browser } = {}) {
             const probe = await timed(async () => {
               const res = await fetch(candidate, {
                 headers: {
-                  'user-agent': UA,
+                  /* The same identity the real download would present. */
+                  'user-agent': ref.userAgent || UA,
                   /* A range of one byte: enough to see the answer without
                      pulling a 1.7 GB file through a diagnostic. */
                   range: 'bytes=0-0',
@@ -189,7 +225,50 @@ async function diagnose(url, { browser } = {}) {
     steps.browserResult = captured;
   }
 
+  steps.verdict = verdictFor(steps);
   return { url: redact(url), ...steps, text: render({ url, steps }) };
+}
+
+/**
+ * One sentence: what is wrong, and what to do about it.
+ *
+ * The stage-by-stage dump is for me; this line is for whoever is looking at the
+ * link that does not work.
+ */
+function verdictFor(steps) {
+  const browser = Boolean(steps.browser && steps.browser.available);
+  const plain = steps.plainRequest && steps.plainRequest.ok ? steps.plainRequest.value : null;
+  const resolve = steps.resolve;
+  const files = resolve && resolve.ok ? resolve.value.files : [];
+  const offered = files[0] && files[0].refUrl;
+
+  if (!browser && plain && plain.challenge) {
+    return 'This host is checking for a browser and this machine has none — run `npm run browser:install`.';
+  }
+  if (!resolve || !resolve.ok) {
+    return `The page itself could not be read (${(resolve && resolve.error) || 'unknown error'}) — that needs fixing before anything else.`;
+  }
+  /* A minted link is a long opaque token; the player page is a name.mp4 with a
+     short path. Telling them apart is the whole point of this report. */
+  const looksPlayer = Boolean(files[0] && files[0].playerish);
+  if (looksPlayer) {
+    return browser
+      ? 'The download button was not found even in a browser — the page may have changed. Send this whole block.'
+      : 'The download button only appears in a real browser, and this machine has none — run `npm run browser:install`.';
+  }
+  const probes = steps.candidates && steps.candidates.ok ? steps.candidates.value : [];
+  const refused = probes.filter((item) => item.ok && [403, 503, 401].includes(item.value.status));
+  if (refused.length) {
+    return 'The link was minted but the file host refused it — that is the clearance cookie or its user agent, not the page. Send this block.';
+  }
+  const served = probes.filter((item) => item.ok && item.value.status >= 200 && item.value.status < 300);
+  if (served.length && !/text\/html/.test(String(served[0].value.contentType || ''))) {
+    return 'This link resolves to a real file that answers correctly — it should download.';
+  }
+  if (!browser) {
+    return 'Nothing here is obviously broken, but without a browser this report cannot judge hosts that need one — send this whole block.';
+  }
+  return 'Nothing here is obviously broken — send this whole block and it can be read in detail.';
 }
 
 /** The same thing for a human to read in a terminal. */
@@ -201,8 +280,17 @@ function render({ url, steps }) {
     `build     ${steps.version.version || '?'}${steps.version.commit ? ` · ${steps.version.commit}` : ' · no commit (not a git checkout?)'}`,
   );
   lines.push(`node      ${steps.version.node} · resumable encode ${yes(steps.version.features.resumableEncode)}`);
-  lines.push(`browser   ${yes(steps.browser.available)}${steps.browser.executablePath ? ` · ${steps.browser.executablePath}` : ''}`);
-  if (steps.browser.why) lines.push(`          ${steps.browser.why}`);
+  const browser = steps.browser;
+  const wiredBug = browser.wired === false && browser.module === true;
+  lines.push(
+    `browser   ${yes(browser.available)}${browser.executablePath ? ` · ${browser.executablePath}` : ''}` +
+      `${wiredBug ? ' · NOT WIRED INTO THE RESOLVER (bug)' : ''}` +
+      `${!browser.available && !wiredBug ? ' · this report is running without one' : ''}`,
+  );
+  if (!browser.available && !wiredBug) {
+    lines.push('          a host that needs a browser will look broken here and may still work in the app');
+  }
+  if (browser.why) lines.push(`          ${browser.why}`);
   if (steps.browser.exists === false) lines.push('          the browser binary is missing: npx playwright install chromium');
 
   const plain = steps.plainRequest;
@@ -225,7 +313,21 @@ function render({ url, steps }) {
       lines.push(`resolve   ${v.resolver} · ${v.files.length} file(s) · page title: ${v.pageTitle || '—'}`);
       for (const file of v.files.slice(0, 4)) {
         lines.push(`          ${file.name}${file.size ? ` · ${MB(file.size)}` : ''} → ${file.refUrl}`);
-        lines.push(`            cookie: ${file.hasCookie ? file.cookieNames.join(', ') || 'yes' : 'none'}`);
+        lines.push(
+          `            cookie: ${file.hasCookie ? file.cookieNames.join(', ') || 'yes' : 'none'}` +
+            ` · via browser: ${file.viaBrowser ? 'yes' : 'no'}`,
+        );
+      }
+      /* The single most useful line for a fileditch-style page: is the offered
+         URL a *minted* link or the player page (which serves HTML)? */
+      const offered = v.files[0] && v.files[0].refUrl;
+      if (offered) {
+        const looksPlayer = /\.(mp4|m4v|webm|mov)(\b|$)/i.test(offered) && !/\/[A-Za-z0-9_-]{40,}$/.test(offered);
+        lines.push(
+          looksPlayer
+            ? '          ⚠ that is the player page, not a minted link: the download button was not found'
+            : '          ✓ looks like a minted (signed) link, not the player page',
+        );
       }
     }
   }
@@ -261,11 +363,19 @@ function render({ url, steps }) {
   }
 
   lines.push('');
-  lines.push('What the lines mean:');
-  lines.push('  challenge: yes + browser: no   → Cloudflare needs the browser helper on this machine');
-  lines.push('  challenge: yes + browser: yes  → the browser is installed but could not pass it (check the browser block)');
-  lines.push('  candidates 403                → the link was minted but the CDN refused it: cookie or referer, not the page');
-  lines.push('  resolve FAILED                → the page itself was not readable: send this whole block');
+  if (steps.verdict) lines.push(`VERDICT   ${steps.verdict}`);
+  if (steps.candidates && steps.candidates.ok) {
+    const broken = steps.candidates.value.filter(
+      (item) => !item.ok || (![200, 206].includes(item.value.status) && ![301, 302, 307, 308].includes(item.value.status)),
+    );
+    if (broken.length) {
+      lines.push('');
+      lines.push('What a non-200 on a candidate means:');
+      lines.push('  403 / 503 → the CDN refused the minted link: the clearance cookie or its user agent, not the page');
+      lines.push('  404       → the signed link expired between minting and the request (they last ~30 minutes)');
+      lines.push('  text/html → that URL is a player page, not the file');
+    }
+  }
   return lines.join('\n');
 }
 

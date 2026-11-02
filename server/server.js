@@ -320,12 +320,18 @@ async function runSegmented(job, plan, paths, meta, controller, { robust = false
       start: piece.start,
       length: piece.length,
     });
+    /* Where this part has got to. Kept here rather than read from the last
+       progress callback: a callback is allowed to carry only a speed, and
+       treating that as "still at 0:00" is what pinned the bar at 0% for
+       twenty minutes at a time. */
+    let partSeconds = 0;
     const runPart = () =>
       transcode(paths.source, partial, args, {
         signal: controller.signal,
         duration: piece.length,
         onProgress: ({ seconds, speed }) => {
-          const within = Math.min(1, (Number(seconds) || 0) / piece.length);
+          if (Number.isFinite(seconds)) partSeconds = seconds;
+          const within = Math.min(1, Math.max(0, partSeconds) / piece.length);
           const position = piece.start + within * piece.length;
           job.progress = Math.min(0.999, position / duration);
           if (speed > 0) {
@@ -341,11 +347,30 @@ async function runSegmented(job, plan, paths, meta, controller, { robust = false
       });
 
     /* One bad part should not cost the hours spent on the other twelve. A part
-       is minutes of work; the whole file is hours. */
+       is minutes of work; the whole file is hours. This covers both a part that
+       ffmpeg refuses and a part whose file is not there afterwards — the second
+       is what a directory deleted under a running encoder looks like, and
+       encoding it again is cheaper than throwing the job away. */
     let attempt = 0;
     for (;;) {
+      partSeconds = 0;
       try {
         await runPart();
+        const stat = await fsp.stat(partial).catch((err) => {
+          if (err.code === 'ENOENT') {
+            throw Object.assign(
+              new Error('The encoder reported this part as finished, but its file is not on the disk.'),
+              { code: 'PART_MISSING' },
+            );
+          }
+          throw err;
+        });
+        if (!stat.size) {
+          await fsp.rm(partial, { force: true }).catch(() => {});
+          throw Object.assign(new Error('A part of the encode came out empty.'), { code: 'EMPTY_OUTPUT' });
+        }
+        /* It is a part only now that it is whole. */
+        await fsp.rename(partial, out);
         break;
       } catch (err) {
         if (err.code === 'CANCELLED' || controller.signal.aborted) throw err;
@@ -359,25 +384,6 @@ async function runSegmented(job, plan, paths, meta, controller, { robust = false
         jobsStore.updateJob(job, { stage: `Retrying part ${piece.index + 1} of ${pieces.length}` });
       }
     }
-
-    const stat = await fsp.stat(partial).catch((err) => {
-      if (err.code === 'ENOENT') {
-        throw Object.assign(
-          new Error(
-            'The encoder finished a part but its file is not there. Something outside the job removed it — ' +
-              'the disk was cleaned while it ran.',
-          ),
-          { code: 'PART_MISSING' },
-        );
-      }
-      throw err;
-    });
-    if (!stat.size) {
-      await fsp.rm(partial, { force: true }).catch(() => {});
-      throw Object.assign(new Error('A part of the encode came out empty.'), { code: 'EMPTY_OUTPUT' });
-    }
-    /* It is a part only now that it is whole. */
-    await fsp.rename(partial, out);
 
     done.add(piece.index);
     state.done = [...done].sort((a, b) => a - b);
@@ -1374,6 +1380,10 @@ const HEARTBEAT_MS = Number(process.env.HEARTBEAT_SECONDS || 45) * 1000;
    encoders over one directory. */
 const runningJobs = new Set();
 
+/* The sweeper asks this before deleting anything: a job with an encoder on it
+   is never removed, whatever its status field says at that instant. */
+jobsStore.setBusyHook((id) => runningJobs.has(id));
+
 /* How much of GitHub's free allowance this machine has used. It counts only
    while this process is alive, so it understates rather than overstates — see
    server/usage.js for why it cannot be a reading from GitHub. */
@@ -1400,7 +1410,13 @@ function startHeartbeat() {
     const parts = running.map((job) => {
       const pct = Math.round((Number(job.progress) || 0) * 100);
       const eta = job.etaSeconds ? ` · ${Math.max(1, Math.round(job.etaSeconds / 60))}m left` : '';
-      return `${job.id} ${pct}%${eta}`;
+      /* Which part of how many: a line that just says 8% cannot tell you
+         whether the encode has moved at all since the last line. */
+      const part =
+        Number(job.segmentsTotal) > 1
+          ? ` (part ${Math.min(job.segmentsTotal, (Number(job.segmentsDone) || 0) + 1)}/${job.segmentsTotal})`
+          : '';
+      return `${job.id} ${pct}%${part}${eta}`;
     });
     console.log(`[keep-alive] ${new Date().toISOString()} · ${parts.join(' · ')}`);
   }, HEARTBEAT_MS);

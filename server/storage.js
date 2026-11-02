@@ -366,7 +366,9 @@ async function clean({ dataDir, jobsStore, what = 'finished', force = false }) {
       if (ACTIVE.has(job.status) && what !== 'all') continue;
       const finished = ['done', 'hosted', 'error'].includes(job.status);
       if (what === 'finished' && !finished) continue;
-      if (ACTIVE.has(job.status)) {
+      /* Same rule as the sweeper: a job with work in flight is not "finished"
+         whatever its status field says for that instant. */
+      if (ACTIVE.has(job.status) || (jobsStore.isBusy && jobsStore.isBusy(job.id))) {
         kept.push({ id: job.id, name: job.name, reason: 'still running' });
         continue;
       }

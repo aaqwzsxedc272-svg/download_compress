@@ -248,7 +248,17 @@ A 4K file on a small machine is hours of work, and the reported failure — `ENO
   words, and a job with genuinely nothing left (no source, no parts, no link) says *paste the
   link again* instead of offering a button that cannot work.
 - **The clock and the disk agree.** The startup scan and the sweeper share one `expired()` rule,
-  so a job cannot be young for one and old for the other.
+  so a job cannot be young for one and old for the other. On top of the status check, the server
+  tells the sweeper which job ids have an encoder on them right now (`setBusyHook`), so a wrong
+  status for a moment cannot cost a directory; the storage panel's bulk clean obeys the same rule.
+  Everything the sweeper removes is printed as
+  `[sweep] removing <id> — <status>, 5h old (2h after finishing)`, because a directory that
+  disappears without a line in the log is how a bug like this one stays invisible.
+- **The bar tells the truth about a part.** ffmpeg prints progress in blocks and the reader used to
+  hand the time and the speed over separately; the speed-only update looked like "still at 0:00",
+  so the percentage sat still for the whole 15–25 minutes of a 4K part and then jumped. One merged
+  update per block fixes it, and `npm run test:progress` pins the block order down. A part that was
+  reported finished but whose file is missing is encoded once more instead of failing the job.
 
 ## Hosts used for the output
 
@@ -830,8 +840,9 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - A job that was running when the machine stopped is resumed on the next start (see above), so an
   interrupted encode costs time, not the whole job.
 
-- The server prints a `[keep-alive] <job> 42% · 12m left` line to its terminal every 45 seconds
-  while anything is fetching, encoding or uploading. GitHub Codespaces counts terminal output as
+- The server prints a `[keep-alive] <job> 42% (part 6/13) · 12m left` line to its terminal every
+  45 seconds while anything is fetching, encoding or uploading — the part number is there because
+  "8%" alone cannot tell you whether the encode has moved since the last line. GitHub Codespaces counts terminal output as
   activity, so the machine stays awake on its own. Turn it down or off with
   `HEARTBEAT_SECONDS=0`.
 - `./scripts/keepalive.sh` does the same from a second terminal, for any host that measures
@@ -879,10 +890,15 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   (opening, file rows, download links, the disabled delete on a running job, the only-copy warning,
   pinning, the bulk clean) and the session/limits tab with its meter (needs
   `npm i --no-save jsdom`, skips without it).
-- `npm run test:sweep` — 11 checks with a real filesystem and a real clock: a five-hour-old
+- `npm run test:sweep` — 12 checks with a real filesystem and a real clock: a five-hour-old
   encode is never swept, a six-hour encode that has just finished is measured from `finishedAt`
   and survives, a two-hour-old crash keeps its files for *Try again*, a day-old one is cleaned
-  up, a pinned job is never swept, and every busy status is in the protected set.
+  up, a pinned job is never swept, a job with an encoder on it survives even when its status says
+  finished, and every busy status is in the protected set.
+- `npm run test:progress` — 12 checks: real ffmpeg progress blocks (recorded from this build) are
+  read one event per block with the time and the speed together, a speed-only update cannot reset
+  the position to zero, `N/A` is not mistaken for 0%, and a real encode reports a climbing
+  position from 0s to the full length.
 - `npm run test:space` — the space policy end to end: a hosted job's files are deleted,
   the link survives, the download route answers `410`, and `KEEP_LOCAL_AFTER_UPLOAD=1` keeps
   everything.
@@ -891,11 +907,12 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:resume` — an encode killed at 6% finishes after a restart (takes ~5 minutes).
 - `npm run doctor -- <link>` — walks a link through every stage against the real host and explains
   what went wrong. No server needed.
-- `npm run test:segments` — 21 checks: the parts cover the file exactly, a part written under a
+- `npm run test:segments` — 23 checks: the parts cover the file exactly, a part written under a
   `.partial` name is never counted as finished, a truncated part left by a crash is thrown away on
   restart while the finished ones are kept, a real encode is killed mid-way, the parts from
   before the crash are reused (their mtimes prove it), and the joined file is as long as the
-  source with its audio.
+  source with its audio; it also samples the percentage while a real segmented encode runs and
+  checks it never goes backwards and does move inside a part.
 - `npm run test:recover` — 57 checks: a download cut in half resumes, the same link sent again
   continues that job instead of starting a second one, a job left mid-upload is uploaded again, a
   crash mid-encode is picked up by re-pasting the link (the parts from before are reused and not a

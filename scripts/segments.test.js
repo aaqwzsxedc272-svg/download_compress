@@ -152,15 +152,40 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
     check('a job starts', Boolean(job?.id), job?.error || '');
 
     /* Wait until at least three parts exist: an encode that is genuinely
-       half-done, not one that has not begun. */
+       half-done, not one that has not begun. While waiting, take samples of the
+       percentage the page shows — a bar that only moves when a part completes
+       reads as "0%" for the quarter of an hour a 4K part takes. */
+    const samples = [];
     const halfDone = await waitFor(async () => {
       const state = JSON.parse(
         await fsp.readFile(path.join(DATA_DIR, 'jobs', job.id, 'segments.json'), 'utf8').catch(() => '{}'),
       );
+      const current = await getJob(job.id).catch(() => null);
+      if (current) {
+        samples.push({ progress: Number(current.progress) || 0, part: Number(current.segmentsDone) || 0 });
+      }
       return state.done && state.done.length >= 3 ? state : null;
     }, { timeoutMs: 240000 });
     check('the encode is running in parts', Boolean(halfDone), halfDone ? `${halfDone.done.length}/${halfDone.total}` : 'never started');
     if (!halfDone) throw new Error('nothing to resume');
+
+    const backwards = samples.filter((sample, index) => index > 0 && sample.progress < samples[index - 1].progress - 1e-9);
+    check(
+      'the percentage never goes backwards',
+      backwards.length === 0,
+      backwards.length ? `${backwards.length} step(s) back — ${JSON.stringify(backwards[0])}` : `${samples.length} samples`,
+    );
+    const withinPart = samples.filter(
+      (sample, index) =>
+        index > 0 && sample.part === samples[index - 1].part && sample.progress > samples[index - 1].progress + 0.0005,
+    );
+    check(
+      'and it moves inside a part, not only when a part completes',
+      withinPart.length > 0,
+      withinPart.length
+        ? `${Math.round(withinPart[0].progress * 100)}% while part ${withinPart[0].part + 1} ran`
+        : `stuck at ${samples.length ? Math.round(samples[samples.length - 1].progress * 100) : 0}% for the whole part`,
+    );
 
     const keptIndex = halfDone.done[0];
     const keptFile = segments.fileFor(path.join(DATA_DIR, 'jobs', job.id), keptIndex);

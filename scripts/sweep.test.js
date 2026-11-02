@@ -104,6 +104,22 @@ const alive = (job) => fs.existsSync(job.dir);
   check('a crash from a day and a half ago is cleaned up', !alive(jobs.crashancient));
   check('a pinned job is never swept', alive(jobs.pinned));
 
+  /* Belt and braces: even if a job's status says "finished" while an encoder is
+     still on it (a retry starting, a handler running), the server's list of
+     running ids wins. This is the check that would have saved the two jobs that
+     were deleted at 91% and 75% on a three-hour-old build. */
+  const lying = makeJob({ source: 'url', url: 'https://example.test/h', name: 'Lying.mkv' });
+  Object.assign(lying, { status: 'done', createdAt: ago(9 * HOUR), finishedAt: ago(5 * HOUR) });
+  jobsStore.setBusyHook((id) => id === lying.id);
+  jobsStore.sweep();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check(
+    'a job with an encoder on it is kept even when its status says finished',
+    alive(lying),
+    'the busy hook was ignored',
+  );
+  jobsStore.setBusyHook(null);
+
   /* The guard is only as good as its list of busy statuses: a status that
      means "a file is open" but is missing from it is a deleted file waiting to
      happen. */

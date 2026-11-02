@@ -334,6 +334,14 @@ async function removeJob(id) {
 
 const HOSTED_RECORD_MS = 30 * 24 * 60 * 60 * 1000; // a share link stays useful for a month
 
+/* Installed by the server: "is an encoder working on this id right now?". */
+let busyHook = null;
+function setBusyHook(fn) {
+  busyHook = typeof fn === 'function' ? fn : null;
+}
+/** Is an encoder (or a download) actually on this job right now? */
+const isBusy = (id) => Boolean(busyHook && busyHook(id));
+
 /**
  * Should this job's working files go?
  *
@@ -346,6 +354,11 @@ function expired(job, now = Date.now()) {
   if (!job) return true; // a directory with no record is debris
   if (job.pinLocal) return false;
   if (ACTIVE.has(job.status)) return false;
+  /* Belt and braces. The status is the first line of defence, but a status can
+     be wrong for a second (a retry starting, a failure handler running), and
+     deleting a directory an encoder is writing into destroys hours of work.
+     The server knows which job ids have an encoder on them; it says so here. */
+  if (busyHook && busyHook(job.id)) return false;
   if (job.hostedUrl) return now - job.createdAt > HOSTED_RECORD_MS;
   const finished = job.status === 'done' || job.status === 'error';
   const since = finished ? Number(job.finishedAt) || job.createdAt : job.createdAt;
@@ -389,7 +402,14 @@ function sweep() {
       continue;
     }
 
-    if (expired(job, now)) removeJob(job.id);
+    if (expired(job, now)) {
+      /* Say what went, and why. A directory that disappears without a line in
+         the log is how a bug like this one stays invisible for days. */
+      const ageH = Math.round((now - job.createdAt) / 36e5);
+      const since = Number(job.finishedAt) ? `${Math.round((now - job.finishedAt) / 36e5)}h after finishing` : 'never finished';
+      console.log(`[sweep] removing ${job.id} — ${job.status}, ${ageH}h old (${since})`);
+      removeJob(job.id);
+    }
   }
   persist();
 }
@@ -416,4 +436,6 @@ module.exports = {
   sweep,
   isActive,
   ACTIVE,
+  setBusyHook,
+  isBusy,
 };

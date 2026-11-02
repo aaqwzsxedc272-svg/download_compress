@@ -127,8 +127,58 @@ function usefulLine(stderr) {
 }
 
 /**
- * Transcode with live progress reporting.
- * onProgress receives { seconds, speed, fps } as ffmpeg reports it.
+ * Reads ffmpeg's `-progress` output and calls `onProgress` **once per block**.
+ *
+ * The block ffmpeg prints looks like this and ends with a `progress=` line:
+ *
+ *     frame=1240  fps=0.9  out_time=00:00:41.360000  speed=0.04x  progress=continue
+ *
+ * Reporting those fields one at a time (`{seconds}` then `{speed}`) is a trap
+ * that already cost a real bug: the second call carried no `seconds`, so a
+ * caller that did `Number(seconds) || 0` recomputed the position as zero and
+ * the bar sat at the start of that part for twenty minutes at a stretch — the
+ * "0% but the file is being worked on" report. One merged call per block means
+ * the time and the speed always arrive together.
+ */
+function makeProgressReader(onProgress, { duration = 0 } = {}) {
+  let block = {};
+  return {
+    line(line) {
+      const eq = line.indexOf('=');
+      if (eq === -1) return;
+      const key = line.slice(0, eq).trim();
+      const value = line.slice(eq + 1).trim();
+      if (key === 'out_time') {
+        const seconds = parseTimecode(value);
+        if (seconds != null) block.seconds = seconds;
+        return;
+      }
+      if (key === 'out_time_us' && block.seconds == null) {
+        /* Older builds print only the microsecond fields. */
+        const us = Number(value);
+        if (Number.isFinite(us)) block.seconds = us / 1e6;
+        return;
+      }
+      if (key === 'speed') {
+        const speed = Number(value.replace('x', ''));
+        if (Number.isFinite(speed)) block.speed = speed;
+        return;
+      }
+      if (key === 'progress') {
+        if (onProgress && (block.seconds != null || block.speed != null)) onProgress({ ...block });
+        block = {};
+        /* The last block may stop a hair short of the real length; say the
+           pass is finished rather than 99.4% finished. */
+        if (value === 'end' && onProgress && duration > 0) onProgress({ seconds: duration });
+      }
+    },
+  };
+}
+
+/**
+ * Transcode with live progress reporting. `onProgress` is called once per
+ * ffmpeg progress block with `{ seconds, speed }` — both together, never one
+ * at a time (see `makeProgressReader`).
  */
 function transcode(input, output, args, { onProgress, duration = 0, signal } = {}) {
   return new Promise((resolve, reject) => {
@@ -147,25 +197,12 @@ function transcode(input, output, args, { onProgress, duration = 0, signal } = {
     }
 
     child.stdout.setEncoding('utf8');
+    const reader = makeProgressReader(onProgress, { duration });
     child.stdout.on('data', (chunk) => {
       stdoutBuf += chunk;
       const lines = stdoutBuf.split('\n');
       stdoutBuf = lines.pop() || '';
-      for (const line of lines) {
-        const eq = line.indexOf('=');
-        if (eq === -1) continue;
-        const key = line.slice(0, eq).trim();
-        const value = line.slice(eq + 1).trim();
-        if (key === 'out_time' && onProgress) {
-          const seconds = parseTimecode(value);
-          if (seconds != null) onProgress({ seconds });
-        } else if (key === 'speed' && onProgress) {
-          const speed = Number(String(value).replace('x', ''));
-          if (Number.isFinite(speed)) onProgress({ speed });
-        } else if (key === 'progress' && value === 'end') {
-          if (onProgress) onProgress({ seconds: duration });
-        }
-      }
+      for (const line of lines) reader.line(line);
     });
 
     child.stderr.setEncoding('utf8');
@@ -189,4 +226,4 @@ function transcode(input, output, args, { onProgress, duration = 0, signal } = {
   });
 }
 
-module.exports = { ffmpegPath, ffprobePath, probe, thumbnail, transcode, execFile, usefulLine };
+module.exports = { ffmpegPath, ffprobePath, probe, thumbnail, transcode, execFile, usefulLine, makeProgressReader, parseTimecode };

@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<!-- saved from url=(0061)https://moonlit-shadow-6967jxj4vjr53rv5p-3000.app.github.dev/ -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Squeeze — compress videos from links</title>
+<meta name="description" content="Paste video links, get smaller files back. Re-encodes with H.264 so the download is a fraction of the size.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c8f560'/%3E%3Cpath d='M9 12h14M11 16h10M13 20h6' stroke='%230b0d0e' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./Squeeze — compress videos from links_files/styles.css">
+</head>
+<body>
+<div class="bg-glow" aria-hidden="true"></div>
+
+<header class="site-header is-compact" id="siteHeader">
+  <a class="brand" href="https://moonlit-shadow-6967jxj4vjr53rv5p-3000.app.github.dev/">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M5 8h14M7 12h10M9 16h6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"></path></svg>
+    </span>
+    <span class="brand-name">Squeeze</span>
+  </a>
+  <div class="header-meta">
+    <span class="pill" id="diskPill" title="21.8 GB used · 9.6 GB free (31%). A video needs about three times its own size while it encodes.">
+      <span class="dot"></span><span id="diskText">9.6 GB free of 31.3 GB</span>
+    </span>
+    <span class="pill is-ok" id="enginePill" title="No yt-dlp on this server: direct video links and file uploads work. Platform links fall back to your browser."><span class="dot"></span><span id="engineText">encoder ready · direct links</span></span>
+  </div>
+  <div class="disk-bar" id="diskBar" aria-hidden="true"><span class="disk-bar-fill" id="diskBarFill" style="width: 69%;"></span></div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <h1>Big video in.<br><span class="accent">Small file out.</span></h1>
+    <p class="hero-sub">
+      Paste a link or drop a file — Squeeze re-encodes it to H.264 and hands back a download
+      that's a fraction of the size. No watermark, no sign-up.
+    </p>
+  </section>
+
+  <section class="composer card" id="composer">
+    <div class="dropzone" id="dropzone">
+      <div class="dz-idle" id="dzIdle">
+        <label class="field-label" for="urlInput">Video link</label>
+        <textarea id="urlInput" rows="2" spellcheck="false" placeholder="https://example.com/video.mp4 — one link per line"></textarea>
+        <div class="dz-hint">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+          <span>or drop video files here, or <button type="button" class="linkish" id="browseBtn">browse</button></span>
+          <span class="dz-hosts">gofile · turbo.cr · pixeldrain · direct mp4 · any page with a video on it</span>
+          <input type="file" id="fileInput" accept="video/*" multiple="" hidden="">
+        </div>
+      </div>
+      <div class="dz-overlay" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="30" height="30"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+        <strong>Drop to squeeze</strong>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="control-group">
+        <span class="field-label">Quality</span>
+        <div class="segmented" id="quality" role="radiogroup" aria-label="Quality preset"><button type="button" role="radio" data-preset="auto" title="best quality it can afford" aria-checked="true">Recommended</button><button type="button" role="radio" data-preset="max" title="full resolution · near-lossless" aria-checked="false">Max quality</button><button type="button" role="radio" data-preset="high" title="full resolution" aria-checked="false">High quality</button><button type="button" role="radio" data-preset="balanced" title="up to 1080p" aria-checked="false">Smaller</button><button type="button" role="radio" data-preset="small" title="up to 720p" aria-checked="false">Smallest</button></div>
+      </div>
+      <div class="control-group control-size">
+        <label class="field-label" for="targetMb">Fit in <span class="muted">(optional)</span></label>
+        <div class="size-input">
+          <input type="number" id="targetMb" min="1" max="2000" step="1" placeholder="—" inputmode="numeric">
+          <span>MB</span>
+        </div>
+      </div>
+      <div class="control-group control-host">
+        <span class="field-label">Delivery</span>
+        <label class="toggle" for="autoHost">
+          <input type="checkbox" id="autoHost" checked="">
+          <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+          <span class="toggle-text">Give me a share link</span>
+        </label>
+      </div>
+      </div>
+
+    <div class="action-row">
+      <div class="control-group control-host" id="hostGroup">
+        <label class="control-label" for="hostPick">Upload to</label>
+        <select class="select" id="hostPick"><option value="auto">Auto (first that works)</option><option value="gofile">gofile.io</option><option value="pixeldrain">pixeldrain.com</option><option value="catbox">catbox.moe</option></select>
+      </div>
+      <div class="control-group control-autostop" id="autoStopGroup">
+        <label class="control-label" for="autoStop">After the queue</label>
+        <label class="switch">
+          <input type="checkbox" id="autoStop" title="Runs: stop codespace moonlit-shadow-6967jxj4vjr53rv5p">
+          <span class="switch-track" aria-hidden="true"></span>
+          <span class="switch-text">Stop when done</span>
+        </label>
+      </div>
+      <button class="primary" id="goBtn" type="button">
+        <span>Squeeze</span>
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+      </button>
+    </div>
+    <p class="composer-note">
+      <button type="button" class="linkish" id="sampleBtn">Try a sample video</button>
+      <span class="sep">·</span>
+      <span>Files are processed on this server and deleted automatically.</span>
+    </p>
+  </section>
+
+  <div id="transferPanel" class="card transfer" style="margin-top: 16px; padding: 14px 16px; display: none;">
+      <div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:9px">
+        <span class="t-status" style="font-size:13.5px;color:var(--muted)">Reading the link…</span>
+        <span class="t-amount" style="font-family:var(--mono);font-size:12.5px;color:var(--dim)">watchporn.to</span>
+      </div>
+      <div class="progress is-indeterminate"><div class="progress-bar" style="width:0%"></div></div></div><div class="alert" id="alert" role="alert" hidden=""></div>
+
+  <section class="jobs" id="jobsSection">
+    <div class="jobs-head">
+      <h2>Your videos</h2>
+      <button class="ghost" id="clearDone" type="button">Clear finished</button>
+    </div>
+    <p class="jobs-note">Encoding runs on the server, not in this tab — close it and the job keeps going.</p>
+    <div class="job-list" id="jobList"><article class="job card" data-job-id="7b99GP0Z">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://watchporn.to/video/111423/sophia-locke-chloe-foxxe-stepmom-teaches-sex-manyvids/">111423_1080p.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Downloading video · 21% · 337 KB/s · 19m 37s left</div>
+      <div class="progress" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 21%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="jOgjR1-6">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://watchporn.to/video/111423/sophia-locke-chloe-foxxe-stepmom-teaches-sex-manyvids/">111423_720p.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Downloading video · 21% · 288 KB/s · 23m 00s left</div>
+      <div class="progress" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 21%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="MSJYNj-y">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://videos.trendyporn.com/videos/6/a/e/4/6/6ae46ead41921.mp4?md5=MqvGGfzdEVY7YDRbhO-MWQ&amp;expires=1793514686">6ae46ead41921.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Queued</div>
+      <div class="progress is-indeterminate" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="pukzzM20">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://img10.coomerfans.com/storage/7/pq/lw/2892ac-0199aaf9-e444-769d-a8d6-ef87532e42f4.mp4?e=1793520617&amp;hash=feSxBvm4UywmTq_a4UX6Ug">2892ac-0199aaf9-e444-769d-a8d6-ef87532e42f4.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Queued</div>
+      <div class="progress is-indeterminate" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="7c16hpX1">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://pixeldrain.com/u/9qYdDboV">2026-10-23 - Dez Hansen - Secret Breeding - [FamilyTherapy].mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Queued</div>
+      <div class="progress is-indeterminate" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="z9KiOACp">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://bunkr.pk/f/TN9EmsYaEh7Tg">Kate Dalia - Lazy Day Off with Sexy Sweet Girlfriend [1080p].mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Queued</div>
+      <div class="progress is-indeterminate" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="ygw61V-o">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://lumistretcheseverymorning.xyz/MTc5MzUwOTkzMzpwWlFGY1JqaVhoOWRrakZ2aTd4aGlab0hBaS1Femx1VUh0cUwyS1R0T1RNOjM2ODg0L2I3OC9XbFZIQllEUGhoSGNTVG1HVWN2eS5tcDQ">WlVHBYDPhhHcSTmGUcvy.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status is-error" data-field="status">That link is a web page, not a video file.</div>
+      <div class="progress" data-field="progressWrap" style="display: none;"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="wL8tnZLM">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://theditch.st/qhygxukd">WlVHBYDPhhHcSTmGUcvy.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status is-error" data-field="status">That link is a web page, not a video file.</div>
+      <div class="progress" data-field="progressWrap" style="display: none;"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="f7EWXlCP">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://theditch.st/qhygxukd">WlVHBYDPhhHcSTmGUcvy.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status is-error" data-field="status">That link is a web page, not a video file.</div>
+      <div class="progress" data-field="progressWrap" style="display: none;"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="OH3ImMrS">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://theditch.st/qhygxukd">WlVHBYDPhhHcSTmGUcvy.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status is-error" data-field="status">That link is a web page, not a video file.</div>
+      <div class="progress" data-field="progressWrap" style="display: none;"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="kUictqQI">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://theditch.st/qhygxukd">WlVHBYDPhhHcSTmGUcvy.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status is-error" data-field="status">That link is a web page, not a video file.</div>
+      <div class="progress" data-field="progressWrap" style="display: none;"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="n4bvWWFh">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://fileditchfiles.me/b78/WlVHBYDPhhHcSTmGUcvy.mp4">WlVHBYDPhhHcSTmGUcvy.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status is-error" data-field="status">The link did not return a video.</div>
+      <div class="progress" data-field="progressWrap" style="display: none;"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="fijSOMgV">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://filester.me/d/ZUIQcLb">e78f1c92-7cbd-4065-84a0-36d240d61814.mkv</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Queued</div>
+      <div class="progress is-indeterminate" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 0%;"></div></div>
+      <div class="job-meta" data-field="meta" style="display: none;"></div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="QJ8WSazq">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback" style="display: none;"></div><img src="./Squeeze — compress videos from links_files/thumb" alt="" loading="lazy"></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://filester.me/d/8DShnF3">6f27d0b2-6ab0-4c68-a7ec-3ec894b33720.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status" data-field="status">Compressing · 32%</div>
+      <div class="progress" data-field="progressWrap"><div class="progress-bar" data-field="progressBar" style="width: 32%;"></div></div>
+      <div class="job-meta" data-field="meta">1920×1080<span style="opacity:.3">·</span>19m 09s<span style="opacity:.3">·</span>0.2×<span style="opacity:.3">·</span>1h 38m left<span style="opacity:.3">·</span>projected 723 MB (−35%)<span style="opacity:.3">·</span>CRF 23</div>
+      <p class="job-note" data-field="note" hidden=""></p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article><article class="job card" data-job-id="dRIPDIhS">
+    <div class="job-thumb" style="cursor: default;"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name" title="https://turbo.cr/v/b98ru7NqCI3AV">faphouse.com-white-latina-cant-rest-and-gets-fucked-until-she-does-a-cum-facial-p1080.mp4</div>
+        <div class="job-badge" data-field="badge">Recommended</div>
+      </div>
+      <div class="job-status is-done" data-field="status">Link ready · 508 MB → 341 MB (−33%)</div>
+      <div class="progress" data-field="progressWrap" style="display: none;"><div class="progress-bar" data-field="progressBar" style="width: 100%;"></div></div>
+      <div class="hosted"><span class="hosted-label">on gofile</span><a class="hosted-url" href="https://gofile.io/d/0kcnXkIk" target="_blank" rel="noopener noreferrer" title="https://gofile.io/d/0kcnXkIk">https://gofile.io/d/0kcnXkIk</a><button type="button" class="copy-btn">Copy</button></div><div class="job-meta" data-field="meta">1920×1080<span style="opacity:.3">·</span>34m 35s<span style="opacity:.3">·</span>1280×720 out</div>
+      <p class="job-note" data-field="note">1920×1080 → 1280×720: shrinking the frame keeps the picture sharp where a flatter 1080p encode would have looked soft.</p>
+      <div class="job-actions" data-field="actions"><button type="button" class="btn tiny">Remove</button></div>
+    </div>
+  </article></div>
+  </section>
+  <section class="results card" id="resultsSection">
+    <div class="results-head">
+      <h2 class="results-title">Your links</h2>
+      <div class="results-tools">
+        <button class="ghost" id="copyAllLinks" type="button">Copy all links</button>
+        <button class="ghost" id="saveLinks" type="button">Save links file</button>
+        <button class="ghost" id="toggleResults" type="button">Hide</button>
+      </div>
+    </div>
+    <p class="results-hint" id="resultsHint">1 share link saved · kept on this machine's disk, so they are still here after a restart, a closed tab or a stopped machine.</p>
+    <p class="results-hint results-sub" id="linksNote">
+      They are also in <a href="https://moonlit-shadow-6967jxj4vjr53rv5p-3000.app.github.dev/api/links.txt" target="_blank" rel="noopener">links.txt</a> — plain text, one link per line.
+    </p>
+    <div class="results-list" id="resultsList"><div class="result-row"><div class="result-main"><div class="result-name" title="faphouse.com-white-latina-cant-rest-and-gets-fucked-until-she-does-a-cum-facial-squeeze-auto.mp4">faphouse.com-white-latina-cant-rest-and-gets-fucked-until-she-does-a-cum-facial-squeeze-auto.mp4</div><div class="result-meta">508 MB → 341 MB · 01/11/2026 04:41:57 · <a href="https://gofile.io/d/0kcnXkIk" target="_blank" rel="noopener noreferrer">https://gofile.io/d/0kcnXkIk</a></div></div><div class="result-actions"><button type="button" class="btn tiny">Copy</button></div></div></div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <span>Squeeze</span>
+  <span class="sep">·</span>
+  <span>ffmpeg + libx264</span>
+  <span class="sep">·</span>
+  <span id="limitNote">uploads up to 6 GB</span>
+  <span class="sep">·</span>
+  <a class="footer-link" href="https://moonlit-shadow-6967jxj4vjr53rv5p-3000.app.github.dev/diagnostics">connection check</a>
+</footer>
+
+<template id="jobCardTemplate"></template>
+
+<script src="./Squeeze — compress videos from links_files/resolve.js.téléchargement" defer=""></script>
+<script src="./Squeeze — compress videos from links_files/hosters.js.téléchargement" defer=""></script>
+<script src="./Squeeze — compress videos from links_files/app.js.téléchargement" defer=""></script>
+
+
+</body></html>

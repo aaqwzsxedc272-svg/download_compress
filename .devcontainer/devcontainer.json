@@ -1,0 +1,23 @@
+{
+  "name": "Squeeze",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+  "postCreateCommand": "npm install && (sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip && python3 -m pip install --user --quiet -U yt-dlp --break-system-packages || true)",
+  "postStartCommand": "nohup npm start > /tmp/squeeze.log 2>&1 &",
+  "forwardPorts": [
+    3000
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "Squeeze",
+      "onAutoForward": "openPreview",
+      "visibility": "public"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint"
+      ]
+    }
+  }
+}

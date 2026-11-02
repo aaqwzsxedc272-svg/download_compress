@@ -1,0 +1,45 @@
+{
+  "name": "squeeze",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Paste video links, get compressed videos back to download",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "node --watch server/server.js",
+    "smoke": "node scripts/smoke.js",
+    "test:resolve": "node scripts/resolve.test.js",
+    "test:hosters": "node scripts/hosters.test.js",
+    "test": "node scripts/resolve.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js && node scripts/notify.test.js && node scripts/mailsetup.test.js && node scripts/publish.test.js && node scripts/ui.test.js",
+    "deploy:hf": "scripts/deploy-space.sh",
+    "package:hf": "node scripts/package-space.js",
+    "verify": "node scripts/verify-deploy.js",
+    "check": "node scripts/check-link.js",
+    "browser:install": "npm install --no-save playwright && npx playwright install --with-deps chromium",
+    "test:fallback": "node scripts/fallback.test.js",
+    "disk": "node scripts/disk.js",
+    "links": "node scripts/links.js",
+    "test:refs": "node scripts/refs.test.js",
+    "test:estimate": "node scripts/estimate.test.js",
+    "test:encode": "node scripts/encode.test.js",
+    "test:ledger": "node scripts/ledger.test.js",
+    "test:notify": "node scripts/notify.test.js",
+    "test:ui": "node scripts/ui.test.js",
+    "test:space": "node scripts/space.test.js",
+    "test:mail": "node scripts/mailsetup.test.js",
+    "test:publish": "node scripts/publish.test.js",
+    "test:durability": "node scripts/durability.test.js",
+    "test:resume": "node scripts/resume.test.js",
+    "test:recover": "node scripts/recovery.test.js",
+    "test:segments": "node scripts/segments.test.js",
+    "doctor": "node scripts/doctor.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "express": "^4.22.3"
+  }
+}

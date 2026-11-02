@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Squeeze — compress videos from links</title>
+<meta name="description" content="Paste video links, get smaller files back. Re-encodes with H.264 so the download is a fraction of the size." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c8f560'/%3E%3Cpath d='M9 12h14M11 16h10M13 20h6' stroke='%230b0d0e' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="bg-glow" aria-hidden="true"></div>
+
+<header class="site-header" id="siteHeader">
+  <a class="brand" href="/">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M5 8h14M7 12h10M9 16h6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    </span>
+    <span class="brand-name">Squeeze</span>
+  </a>
+  <div class="header-meta">
+    <span class="pill" id="diskPill" title="Free space on the machine doing the work">
+      <span class="dot"></span><span id="diskText">disk …</span>
+    </span>
+    <span class="pill" id="enginePill"><span class="dot"></span><span id="engineText">checking engine…</span></span>
+  </div>
+  <div class="disk-bar" id="diskBar" aria-hidden="true"><span class="disk-bar-fill" id="diskBarFill"></span></div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <h1>Big video in.<br /><span class="accent">Small file out.</span></h1>
+    <p class="hero-sub">
+      Paste a link or drop a file — Squeeze re-encodes it to H.264 and hands back a download
+      that's a fraction of the size. No watermark, no sign-up.
+    </p>
+  </section>
+
+  <section class="composer card" id="composer">
+    <div class="dropzone" id="dropzone">
+      <div class="dz-idle" id="dzIdle">
+        <label class="field-label" for="urlInput">Video link</label>
+        <textarea
+          id="urlInput"
+          rows="2"
+          spellcheck="false"
+          placeholder="https://example.com/video.mp4 — one link per line"
+        ></textarea>
+        <div class="dz-hint">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>or drop video files here, or <button type="button" class="linkish" id="browseBtn">browse</button></span>
+          <span class="dz-hosts">gofile · turbo.cr · pixeldrain · direct mp4 · any page with a video on it</span>
+          <input type="file" id="fileInput" accept="video/*" multiple hidden />
+        </div>
+      </div>
+      <div class="dz-overlay" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="30" height="30"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <strong>Drop to squeeze</strong>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="control-group">
+        <span class="field-label">Quality</span>
+        <div class="segmented" id="quality" role="radiogroup" aria-label="Quality preset"></div>
+      </div>
+      <div class="control-group control-size">
+        <label class="field-label" for="targetMb">Fit in <span class="muted">(optional)</span></label>
+        <div class="size-input">
+          <input type="number" id="targetMb" min="1" max="2000" step="1" placeholder="—" inputmode="numeric" />
+          <span>MB</span>
+        </div>
+      </div>
+      <div class="control-group control-host">
+        <span class="field-label">Delivery</span>
+        <label class="toggle" for="autoHost">
+          <input type="checkbox" id="autoHost" checked />
+          <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+          <span class="toggle-text">Give me a share link</span>
+        </label>
+      </div>
+      <div class="control-group control-mode">
+        <span class="field-label">Skip the encoder</span>
+        <label class="toggle" for="noCompress" title="Hand back the original file, untouched. Use it when a host is fast here but slow on your own machine.">
+          <input type="checkbox" id="noCompress" />
+          <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+          <span class="toggle-text">Just download it</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="action-row">
+      <div class="control-group control-host" id="hostGroup">
+        <label class="control-label" for="hostPick">Upload to</label>
+        <select class="select" id="hostPick">
+          <option value="auto">Auto (first that works)</option>
+        </select>
+      </div>
+      <div class="control-group control-autostop" id="autoStopGroup">
+        <label class="control-label" for="autoStop">After the queue</label>
+        <label class="switch">
+          <input type="checkbox" id="autoStop" />
+          <span class="switch-track" aria-hidden="true"></span>
+          <span class="switch-text">Stop the machine</span>
+        </label>
+      </div>
+      <button class="primary" id="goBtn" type="button">
+        <span>Squeeze</span>
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+    <p class="composer-mode-note" id="composerNote" hidden></p>
+    <p class="composer-note">
+      <button type="button" class="linkish" id="sampleBtn">Try a sample video</button>
+      <span class="sep">·</span>
+      <span>Files are processed on this server and deleted automatically.</span>
+    </p>
+  </section>
+
+  <div class="alert" id="alert" role="alert" hidden></div>
+
+  <section class="jobs" id="jobsSection" hidden>
+    <div class="jobs-head">
+      <h2>Your videos</h2>
+      <button class="ghost" id="clearDone" type="button">Clear finished</button>
+    </div>
+    <p class="jobs-note" id="recoveryNote" hidden></p>
+    <p class="jobs-note">Encoding runs on the server, not in this tab — close it and the job keeps going.</p>
+    <div class="job-list" id="jobList"></div>
+  </section>
+  <section class="results card" id="resultsSection" hidden>
+    <div class="results-head">
+      <h2 class="results-title">Your links</h2>
+      <div class="results-tools">
+        <button class="ghost" id="copyAllLinks" type="button">Copy all links</button>
+        <button class="ghost" id="publishLinks" type="button" hidden>Post them</button>
+        <button class="ghost" id="emailLinks" type="button">Email them to me</button>
+        <button class="ghost" id="saveLinks" type="button">Save links file</button>
+        <button class="ghost" id="toggleResults" type="button">Hide</button>
+      </div>
+    </div>
+    <p class="results-hint" id="resultsHint">
+      Every share link is saved on this machine's disk, so it is still here after a closed tab or a restarted server.
+    </p>
+    <p class="results-hint results-sub" id="linksNote">
+      They are also in <a href="/api/links.txt" target="_blank" rel="noopener">links.txt</a> — plain text, one link per line.
+    </p>
+    <p class="results-hint results-sub" id="publishNote" hidden></p>
+    <p class="results-hint results-sub" id="emailNote" hidden>
+      Mail is not set up on this server yet — the button opens your own mail app with the links already in it.
+    </p>
+
+    <div class="results-list" id="resultsList"></div>
+  </section>
+
+  <section class="card mail-card" id="postCard">
+    <details class="mail-setup" id="postSetup">
+      <summary>
+        <span class="mail-dot" aria-hidden="true"></span>
+        <span id="postSummary">Post the links automatically: not set up</span>
+        <span class="mail-chevron" aria-hidden="true">Set up</span>
+      </summary>
+      <form class="mail-form" id="postForm" autocomplete="off">
+        <p class="mail-intro">
+          Paste a <strong>Discord</strong> or <strong>Slack</strong> webhook URL and every finished
+          queue posts its links to that channel — no email, no app password. In Discord:
+          right-click the channel → <em>Edit Channel</em> → <em>Integrations</em> →
+          <em>Webhooks</em> → <em>New Webhook</em> → copy the URL.
+        </p>
+        <div class="mail-grid">
+          <label class="mail-field mail-field-to">
+            <span>Webhook URL (Discord, Slack, n8n…)</span>
+            <input id="postWebhook" type="password" placeholder="https://discord.com/api/webhooks/…" spellcheck="false" />
+          </label>
+          <label class="mail-field mail-field-to">
+            <span>…or an ntfy topic, for a phone notification (no account)</span>
+            <input id="postNtfy" type="text" placeholder="squeeze-7f3k2p" spellcheck="false" />
+          </label>
+        </div>
+        <p class="mail-hint">
+          Saved on this machine only (<code>data/publish.json</code>, readable by you alone) and used
+          on every run. The URL is a password for that channel: anyone holding it can post there,
+          so keep this page private and never commit it.
+        </p>
+        <div class="mail-actions">
+          <button class="btn primary" type="submit" id="postSave">Save</button>
+          <button class="btn" type="button" id="postTest">Send a test message</button>
+          <button class="btn tiny" type="button" id="postForget">Remove</button>
+          <span class="mail-status" id="postStatus" role="status"></span>
+        </div>
+      </form>
+    </details>
+  </section>
+
+  <section class="card mail-card" id="mailCard">
+    <details class="mail-setup" id="mailSetup">
+      <summary>
+        <span class="mail-dot" aria-hidden="true"></span>
+        <span id="mailSummary">Mail: not set up</span>
+        <span class="mail-chevron" aria-hidden="true">Set up</span>
+      </summary>
+      <form class="mail-form" id="mailForm" autocomplete="off">
+        <p class="mail-intro">
+          Enter it once. The password is saved on this machine only
+          (<code>data/mail.json</code>, readable by you alone) and still works after a restart
+          or a fresh shell — no environment variables to retype.
+        </p>
+        <div class="mail-grid">
+          <label class="mail-field">
+            <span>Mail server</span>
+            <input id="mailHost" type="text" placeholder="smtp.gmail.com" spellcheck="false" required />
+          </label>
+          <label class="mail-field mail-field-port">
+            <span>Port</span>
+            <input id="mailPort" type="number" min="1" max="65535" step="1" value="587" inputmode="numeric" />
+          </label>
+          <label class="mail-field">
+            <span>Username</span>
+            <input id="mailUser" type="text" placeholder="you@gmail.com" spellcheck="false" />
+          </label>
+          <label class="mail-field">
+            <span>App password</span>
+            <input id="mailPass" type="password" placeholder="abcd efgh ijkl mnop" spellcheck="false" />
+          </label>
+          <label class="mail-field mail-field-to">
+            <span>Send the links to</span>
+            <input id="mailTo" type="email" placeholder="aaqwzsxedc272@gmail.com" spellcheck="false" />
+          </label>
+        </div>
+        <p class="mail-hint">
+          Gmail needs an
+          <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">app password</a>,
+          not your normal password (2-step verification must be on). Spaces are ignored, so paste it as Google shows it.
+        </p>
+        <div class="mail-actions">
+          <button class="btn primary" type="submit" id="mailSave">Save</button>
+          <button class="btn" type="button" id="mailTest">Send a test mail</button>
+          <button class="btn tiny" type="button" id="mailForget">Remove</button>
+          <span class="mail-status" id="mailStatus" role="status"></span>
+        </div>
+      </form>
+    </details>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <span>Squeeze</span>
+  <span class="sep">·</span>
+  <span>ffmpeg + libx264</span>
+  <span class="sep">·</span>
+  <span id="limitNote">uploads up to 6 GB</span>
+  <span class="sep">·</span>
+  <a class="footer-link" href="/diagnostics">connection check</a>
+  <span class="sep">·</span>
+  <span id="buildInfo" class="footer-build" title="The exact code this machine is running"></span>
+</footer>
+
+<template id="jobCardTemplate">
+  <article class="job card">
+    <div class="job-thumb"><div class="thumb-fallback"></div></div>
+    <div class="job-body">
+      <div class="job-top">
+        <div class="job-name" data-field="name">Video</div>
+        <div class="job-badge" data-field="badge"></div>
+      </div>
+      <div class="job-status" data-field="status">Queued</div>
+      <div class="progress" data-field="progressWrap"><div class="progress-bar" data-field="progressBar"></div></div>
+      <div class="job-meta" data-field="meta"></div>
+      <div class="job-source" data-field="source" hidden>
+        <span class="job-source-label">Link</span>
+        <a data-field="sourceUrl" class="job-source-url" target="_blank" rel="noopener noreferrer"></a>
+        <span class="job-source-tab" data-field="tabTitle"></span>
+      </div>
+      <p class="job-note" data-field="note" hidden></p>
+      <div class="job-actions" data-field="actions"></div>
+    </div>
+  </article>
+</template>
+
+<script src="/shared/resolve.js" defer></script>
+<script src="/shared/hosters.js" defer></script>
+<script src="/app.js" defer></script>
+</body>
+</html>

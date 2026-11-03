@@ -10,7 +10,7 @@
     "smoke": "node scripts/smoke.js",
     "test:resolve": "node scripts/resolve.test.js",
     "test:hosters": "node scripts/hosters.test.js",
-    "test": "node scripts/resolve.test.js && node scripts/hooks.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js && node scripts/notify.test.js && node scripts/mailsetup.test.js && node scripts/publish.test.js && node scripts/sweep.test.js && node scripts/progress.test.js && node scripts/ui.test.js && node scripts/storage.test.js",
+    "test": "node scripts/resolve.test.js && node scripts/hooks.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js && node scripts/notify.test.js && node scripts/mailsetup.test.js && node scripts/publish.test.js && node scripts/sweep.test.js && node scripts/progress.test.js && node scripts/stream.test.js && node scripts/ui.test.js && node scripts/storage.test.js",
     "deploy:hf": "scripts/deploy-space.sh",
     "package:hf": "node scripts/package-space.js",
     "verify": "node scripts/verify-deploy.js",
@@ -36,7 +36,8 @@
     "test:hooks": "node scripts/hooks.test.js",
     "test:storage": "node scripts/storage.test.js",
     "test:sweep": "node scripts/sweep.test.js",
-    "test:progress": "node scripts/progress.test.js"
+    "test:progress": "node scripts/progress.test.js",
+    "test:stream": "node scripts/stream.test.js"
   },
   "engines": {
     "node": ">=18"

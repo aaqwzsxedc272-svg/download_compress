@@ -750,6 +750,427 @@
     },
   };
 
+  /* ------------------------------------------------------------ streams (HLS)
+   * A stream is a text file that lists the parts of a video. As a *master* it
+   * names several qualities; as a *media playlist* it names the segments. There
+   * is no one URL a plain downloader can take, which is why these links used to
+   * be refused with "paste a direct MP4 instead" — and why a page that streams
+   * its video (missav, and most of that family) used to resolve to whatever
+   * .mp4 was lying around in its ad slot.
+   *
+   * ffmpeg reads a playlist natively: it pulls every segment and remuxes them
+   * into one MP4 with `-c copy`, so nothing is re-encoded and nothing is lost.
+   * What a stream needs is a different *fetch*, not a different pipeline.
+   */
+
+  const isPlaylistUrl = (url) => /\.(m3u8|mpd)(?:[?#]|$)/i.test(String(url || ''));
+
+  /* Adverts are shaped exactly like the video: a <video> element, an .mp4 URL,
+     sometimes even an .m3u8. These are the networks that serve them, and the
+     path words that give them away. A page that streams its video through an
+     HLS master and also carries one of these is a page whose "video" is the HLS
+     one — which is the whole bug behind "it only detected an ad". */
+  const AD_HOST = /(?:^|\.)(?:doubleclick|googlesyndication|googleadservices|adservice|adnxs|adsystem|amazon-adsystem|exoclick|juicyads|tsyndicate|trafficjunky|realsrv|adsterra|popads|popcash|clickadu|adcash|propellerads|onclickads|mgid|taboola|outbrain|revcontent|zergnet|criteo|smartadserver|rubiconproject|pubmatic|openx|yieldmo|sharethrough|teads|spotxchange|springserve|advertising|adserver|adnium|hilltopads|adspyglass|clickaine|adnanny)\./i;
+  const AD_PATH = /(?:^|[/_.-])(?:ads?|advert|adverts|advertisement|advertising|preroll|pre-roll|midroll|postroll|vast|vpaid|popunder|popup|banner|sponsor|promo)(?:[/_.-]|$)/i;
+
+  function isAdUrl(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return false;
+    }
+    if (AD_HOST.test(parsed.hostname)) return true;
+    const path = `${parsed.pathname}${parsed.search}`;
+    return AD_PATH.test(path) && !/\.(m3u8|mpd)$/i.test(parsed.pathname);
+  }
+
+  /** `#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=512000,RESOLUTION=1280x720` */
+  function parseAttributes(text) {
+    const out = {};
+    const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi;
+    let m;
+    while ((m = re.exec(String(text || '')))) out[m[1].toUpperCase()] = m[2].replace(/^"|"$/g, '');
+    return out;
+  }
+
+  function absoluteUrl(raw, baseUrl) {
+    try {
+      const abs = new URL(String(raw).trim().replace(/&amp;/g, '&'), baseUrl).toString();
+      return /^https?:/i.test(abs) ? abs : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Read a playlist into { master, variants, duration, segments, live }.
+   *
+   * Both kinds are recognised: a master lists qualities, a media playlist lists
+   * segments with #EXTINF durations (which sum to the length of the video — the
+   * only way to know how long a stream is before downloading it).
+   */
+  function parsePlaylistText(text, baseUrl) {
+    const lines = String(text || '')
+      .replace(/\uFEFF/g, '')
+      .split(/\r?\n/)
+      .map((line) => line.trim());
+    const variants = [];
+    const segments = [];
+    let duration = 0;
+    let endList = false;
+    let vod = false;
+    let drm = false;
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (!line) continue;
+
+      if (/^#EXT-X-STREAM-INF/i.test(line)) {
+        const attrs = parseAttributes(line.slice(line.indexOf(':') + 1));
+        let uri = null;
+        for (let j = i + 1; j < lines.length; j += 1) {
+          const next = lines[j];
+          if (!next || next.startsWith('#')) continue;
+          uri = absoluteUrl(next, baseUrl);
+          i = j;
+          break;
+        }
+        const [width, height] = String(attrs.RESOLUTION || '')
+          .split('x')
+          .map(Number);
+        if (uri) {
+          variants.push({
+            uri,
+            bandwidth: Number(attrs.BANDWIDTH) || 0,
+            width: width || 0,
+            height: height || 0,
+            name: attrs.NAME || null,
+            codecs: attrs.CODECS || null,
+          });
+        }
+        continue;
+      }
+
+      if (/^#EXTINF:/i.test(line)) {
+        const value = Number(line.slice(8).split(',')[0]);
+        let uri = null;
+        for (let j = i + 1; j < lines.length; j += 1) {
+          const next = lines[j];
+          if (!next || next.startsWith('#')) continue;
+          uri = next;
+          i = j;
+          break;
+        }
+        if (Number.isFinite(value) && value > 0) duration += value;
+        if (uri) segments.push(absoluteUrl(uri, baseUrl));
+        continue;
+      }
+
+      /* A key the browser is not allowed to store, or a key system named
+         outright: the stream is protected, and no amount of downloading gives
+         back a playable file. Saying so is better than an ffmpeg stack trace. */
+      if (/-KEY:/i.test(line) && /(SAMPLE-AES|com\.apple\.streamingkeydelivery|widevine|playready|fairplay|urn:uuid:edef8ba9)/i.test(line)) {
+        drm = true;
+      }
+      if (/^#EXT-X-SESSION-KEY:/i.test(line) && /widevine|playready|fairplay|SAMPLE-AES/i.test(line)) drm = true;
+      if (/^#EXT-X-ENDLIST/i.test(line)) endList = true;
+      if (/^#EXT-X-PLAYLIST-TYPE:\s*VOD/i.test(line)) vod = true;
+    }
+
+    const live = segments.length > 0 && !endList && !vod;
+    return {
+      master: variants.length > 0,
+      variants,
+      segments,
+      segmentCount: segments.length,
+      duration: Math.round(duration * 1000) / 1000,
+      endList,
+      vod,
+      live,
+      drm,
+    };
+  }
+
+  /** The height a variant advertises, or one hidden in its name ("1080p/…"). */
+  function variantHeight(variant) {
+    if (variant && variant.height) return variant.height;
+    const text = `${(variant && variant.name) || ''} ${(variant && variant.uri) || ''}`;
+    const p = /\b(2160|1440|1080|720|480|360|240)p\b/i.exec(text);
+    if (p) return Number(p[1]);
+    const pair = /(\d{3,4})x(\d{3,4})/.exec(text);
+    return pair ? Number(pair[2]) : 0;
+  }
+
+  /**
+   * The best quality on offer.
+   *
+   * Quality first, always: the app re-encodes to a target afterwards, so the
+   * input should be the sharpest one the host has. Ties (and variants with no
+   * resolution at all) are broken by bandwidth.
+   */
+  function pickBestVariant(variants) {
+    const list = (variants || []).filter((variant) => variant && variant.uri);
+    if (!list.length) return null;
+    return [...list].sort((a, b) => {
+      const byHeight = variantHeight(b) - variantHeight(a);
+      if (byHeight) return byHeight;
+      return (b.bandwidth || 0) - (a.bandwidth || 0);
+    })[0];
+  }
+
+  /* Reading a playlist costs two requests (master, then its media playlist) and
+     a job does it twice: once to list the file, once to fetch it. A short cache
+     keeps the second one free without serving a stale variant list for long. */
+  const streamInfoCache = new Map();
+  const STREAM_TTL = 90 * 1000;
+
+  function clearStreamCache() {
+    streamInfoCache.clear();
+  }
+
+  async function fetchPlaylistText(url, headers) {
+    const res = await fetchWithTimeout(url, {
+      headers: { 'user-agent': UA, accept: '*/*', ...headers },
+      redirect: 'follow',
+    });
+    if (!res.ok) {
+      throw new ResolveError(
+        res.status === 403 || res.status === 401
+          ? 'The video server refused the request (it wants the page it belongs to as the referer). ' +
+            'Open the page the stream is on and paste that link instead.'
+          : `The stream's playlist answered HTTP ${res.status}.`,
+        res.status === 403 || res.status === 401 ? 'STREAM_FORBIDDEN' : 'STREAM_BAD_STATUS',
+      );
+    }
+    const text = await res.text();
+    if (!/#EXTM3U|#EXT-X-|<MPD/i.test(text.slice(0, 4000))) {
+      throw new ResolveError(
+        'That link answered with a page instead of a playlist — the stream link is probably generated by the page itself.',
+        'STREAM_NOT_A_PLAYLIST',
+      );
+    }
+    return { text, url: res.url || url };
+  }
+
+  /**
+   * Everything worth knowing about a stream before downloading it: which URL to
+   * read, how long it is, how big it will be and in what resolution.
+   *
+   * `url` may be a master playlist (then the best variant is chosen) or a media
+   * playlist (then it is used as it is).
+   */
+  async function inspectPlaylist(url, { headers = {} } = {}) {
+    const key = String(url);
+    const hit = streamInfoCache.get(key);
+    if (hit && Date.now() - hit.at < STREAM_TTL) return hit.value;
+
+    const first = await fetchPlaylistText(url, headers);
+    const top = parsePlaylistText(first.text, first.url);
+    let chosen = { uri: first.url, bandwidth: 0, height: 0, name: null };
+    let media = top;
+    let master = null;
+
+    if (top.master) {
+      master = first.url;
+      chosen = pickBestVariant(top.variants);
+      if (!chosen) throw new ResolveError('That playlist lists no qualities.', 'STREAM_NO_VARIANTS');
+      if (chosen.uri !== first.url) {
+        const second = await fetchPlaylistText(chosen.uri, headers);
+        media = parsePlaylistText(second.text, second.url);
+        /* A variant can itself be a master (rare, but valid HLS). */
+        if (media.master && !media.segments.length) {
+          const deeper = pickBestVariant(media.variants);
+          if (deeper) {
+            chosen = deeper;
+            media = parsePlaylistText((await fetchPlaylistText(deeper.uri, headers)).text, deeper.uri);
+          }
+        }
+      }
+    }
+
+    if (!media.segments.length && !media.master) {
+      throw new ResolveError('That playlist lists no video segments.', 'STREAM_EMPTY');
+    }
+    if (media.drm || top.drm) {
+      throw new ResolveError(
+        'That stream is protected by DRM, so its video cannot be saved by any downloader. ' +
+          'The page will play it, but a file of it cannot be made.',
+        'STREAM_DRM',
+      );
+    }
+    if (media.live) {
+      throw new ResolveError(
+        'That link is a live stream with no end, so there is no finished video to save. ' +
+          'A finished recording of the same page can still be downloaded.',
+        'STREAM_LIVE',
+      );
+    }
+
+    const height = variantHeight(chosen) || Number(media.variants?.[0]?.height) || 0;
+    /* BANDWIDTH is the whole rendition (video + audio) in bits per second, so
+       the size of the download is duration × bitrate / 8. A rough number, but a
+       rough number beats "unknown" on a 32 GB disk. */
+    const bandwidth = chosen.bandwidth || 0;
+    const estimatedBytes =
+      media.duration > 0 && bandwidth > 0 ? Math.round((media.duration * bandwidth) / 8) : 0;
+
+    const info = {
+      url: chosen.uri,
+      master,
+      height,
+      bandwidth,
+      duration: media.duration,
+      segments: media.segmentCount,
+      estimatedBytes,
+      variants: top.variants.map((variant) => ({
+        uri: variant.uri,
+        height: variantHeight(variant),
+        bandwidth: variant.bandwidth,
+        name: variant.name,
+      })),
+    };
+    streamInfoCache.set(key, { at: Date.now(), value: info });
+    return info;
+  }
+
+  /**
+   * A file name from a page title.
+   *
+   * `pageDisplayName` only answers when the title already contains a file name,
+   * which a streaming page rarely has ("DANDYA-045 … - MissAV"). For those the
+   * title itself is the best name there is, minus the site suffix and anything
+   * a filesystem would refuse.
+   */
+  function fileNameFromTitle(title) {
+    if (!title) return null;
+    let text = String(title).replace(/\s+/g, ' ').trim();
+    const parts = text.split(/\s+[|·•—–]\s+|\s+-\s+/);
+    if (parts.length > 1 && parts[parts.length - 1].length <= 25) {
+      text = parts.slice(0, -1).join(' - ');
+    }
+    text = text
+      .replace(/[\\/:*?"<>|]/g, '-')
+      .replace(/\s+/g, ' ')
+      .slice(0, 120)
+      .trim();
+    if (!text) return null;
+    return /\.(mp4|mkv|webm|mov|m4v)$/i.test(text) ? text : `${text}.mp4`;
+  }
+
+  /** A file name for a stream, when no page title is there to name it. */
+  function nameForStream(url, info) {
+    let host = 'stream';
+    let last = '';
+    let parent = '';
+    try {
+      const parsed = new URL(url);
+      /* "surrit", not "surrit.com": the name is going into somebody's
+         downloads folder, and a dotted host looks like a file extension. */
+      host = parsed.hostname.replace(/^www\./, '').split('.')[0] || 'stream';
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      last = (parts.pop() || '').replace(/\.(m3u8|mpd)$/i, '');
+      parent = parts.pop() || '';
+    } catch {
+      /* keep defaults */
+    }
+    const usable = (value) => value && !/^(playlist|index|master|manifest|prog_index|chunklist|video|media|stream)$/i.test(value) &&
+      !/^[a-f0-9-]{20,}$/i.test(value);
+    const base = usable(last) ? last : usable(parent) ? parent : host;
+    const quality = info && info.height ? `-${info.height}p` : '';
+    return `${base}${quality}.mp4`.replace(/[\\/:*?"<>|]/g, '-');
+  }
+
+  /** The headers a CDN expects, taken from whatever the resolver learned. */
+  function streamHeaders(ref) {
+    const headers = {};
+    if (!ref) return headers;
+    if (ref.referer) headers.referer = ref.referer;
+    if (ref.cookie) headers.cookie = ref.cookie;
+    if (ref.userAgent) headers['user-agent'] = ref.userAgent;
+    try {
+      if (ref.referer) headers.origin = new URL(ref.referer).origin;
+    } catch {
+      /* no origin */
+    }
+    return headers;
+  }
+
+  /**
+   * Of several playlist URLs on one page, the one with the best picture.
+   *
+   * A page with a quality selector lists one URL per quality; a page with an
+   * advert may list an ad's stream too. Reading each master is cheap (they are
+   * a few hundred bytes) and the answer is what the encoder wants. Anything
+   * that cannot be read in time is ignored rather than waited for.
+   */
+  async function bestOf(urls, referer) {
+    const probes = urls.slice(0, 4).map((url) =>
+      inspectPlaylist(url, { headers: streamHeaders({ referer }) }).catch(() => null),
+    );
+    const results = await Promise.race([
+      Promise.all(probes),
+      new Promise((resolve) => setTimeout(() => resolve([]), 6000)),
+    ]).catch(() => []);
+    const scored = results
+      .map((info, index) => ({ info, url: urls[index] }))
+      .filter((entry) => entry.info)
+      .sort((a, b) => {
+        const byHeight = (b.info.height || 0) - (a.info.height || 0);
+        if (byHeight) return byHeight;
+        return (b.info.bandwidth || 0) - (a.info.bandwidth || 0);
+      });
+    return scored.length ? scored[0].url : urls[0];
+  }
+
+  const stream = {
+    id: 'stream',
+    match: (url) => (isPlaylistUrl(url) ? 'stream' : null),
+    async list(url) {
+      const info = await inspectPlaylist(url);
+      const name = nameForStream(url, info);
+      return {
+        resolver: 'stream',
+        title: null,
+        files: [
+          {
+            id: url,
+            name,
+            size: info.estimatedBytes || 0,
+            mime: 'video/mp2t',
+            kind: 'video',
+            quality: info.height ? `${info.height}p` : null,
+            note: [
+              info.variants && info.variants.length > 1 ? `${info.variants.length} qualities` : 'stream',
+              info.duration ? `${Math.max(1, Math.round(info.duration / 60))} min` : null,
+            ]
+              .filter(Boolean)
+              .join(' · '),
+            ref: { resolver: 'stream', url, name, duration: info.duration, quality: info.height || null },
+          },
+        ],
+      };
+    },
+    /**
+     * The URL to fetch *now* is the media playlist of the best variant, not the
+     * master: choosing the quality here means the download and the label on the
+     * card cannot disagree.
+     */
+    async direct(ref) {
+      const info = await inspectPlaylist(ref.url, { headers: streamHeaders(ref) });
+      /* Hand the findings back to the job: the disk check and the card both
+         want the length, the resolution and roughly how many bytes are coming. */
+      Object.assign(ref, {
+        streamUrl: info.url,
+        duration: info.duration || ref.duration || 0,
+        quality: info.height || ref.quality || null,
+        estimatedBytes: info.estimatedBytes || 0,
+        segments: info.segments || 0,
+      });
+      return info.url;
+    },
+  };
+
   /* ----------------------------------------------------------- generic pages */
 
 
@@ -827,6 +1248,59 @@ function preferPageName(urlName, pageName) {
   if (looksGenerated(urlName) && !looksGenerated(pageName)) return pageName;
   return urlName;
 }
+
+  /**
+   * Every playlist URL a page mentions.
+   *
+   * Players write theirs into a script (\`file: "…/playlist.m3u8"\`, sometimes
+   * with the slashes escaped as \\/ or \\u002F), and a master playlist is
+   * usually on a different host than the page — that is the normal shape, not a
+   * suspicious one.
+   */
+  function extractPlaylistUrls(html, baseUrl) {
+    /* Escaped slashes are everywhere in inline JSON, and a URL split by them is
+       invisible to a plain regex, so the page is flattened once for scanning. */
+    const flat = String(html || '')
+      .replace(/\\u002[fF]/g, '/')
+      .replace(/\\\//g, '/');
+    const found = [];
+    const push = (raw) => {
+      if (!raw) return;
+      const abs = absoluteUrl(String(raw).replace(/&amp;/g, '&').trim(), baseUrl);
+      if (abs && isPlaylistUrl(abs)) found.push(abs);
+    };
+
+    const looseRe = /(https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mpd)(?:\?[^\s"'<>\\]*)?)/gi;
+    let m;
+    while ((m = looseRe.exec(flat))) push(m[1]);
+
+    /* A relative one inside a player's configuration: file/src/source/url/hls */
+    const configRe = /(?:file|src|source|url|hls|m3u8)\s*[:=]\s*["']([^"'<>\s]+\.(?:m3u8|mpd)(?:\?[^"'<>\s]*)?)["']/gi;
+    while ((m = configRe.exec(flat))) push(m[1]);
+
+    /* <meta property="og:video" content="…playlist.m3u8"> — some players put the
+       playlist exactly where a plain video URL would go. */
+    const metaRe = /<meta[^>]+(?:property|name)=["'](?:og:video(?::secure_url|:url)?|twitter:player:stream)["'][^>]*>/gi;
+    while ((m = metaRe.exec(flat))) {
+      const content = /content=["']([^"']+)["']/i.exec(m[0]);
+      if (content) push(content[1]);
+    }
+
+    /* JSON-LD's contentUrl */
+    const jsonRe = /"contentUrl"\s*:\s*"([^"]+)"/gi;
+    while ((m = jsonRe.exec(flat))) push(m[1]);
+
+    /* <source src="stream.m3u8"> and data-* attributes */
+    const tagRe = /<(?:video|source)\b[^>]*\b(?:src|data-src)=["']([^"']+\.(?:m3u8|mpd)(?:\?[^"']*)?)["']/gi;
+    while ((m = tagRe.exec(flat))) push(m[1]);
+
+    const seen = new Set();
+    return found.filter((url) => {
+      if (seen.has(url)) return false;
+      seen.add(url);
+      return true;
+    });
+  }
 
   function extractVideoUrls(html, baseUrl) {
     const found = [];
@@ -1455,7 +1929,42 @@ function preferPageName(urlName, pageName) {
       }
       const html = await res.text();
       const base = res.url || url;
-      const urls = extractVideoUrls(html, base).filter((u) => !PLAYLIST_EXT.test(new URL(u).pathname));
+      const displayName = pageDisplayName(html);
+
+      /* A page that plays its video from a playlist has exactly one real
+         source, and it is usually on a different host than the page (an HLS
+         master on the CDN, the page on the site). The loose .mp4 URLs on such a
+         page are adverts — that is why this link used to resolve to an ad. A
+         playlist wins over anything else, and an advert is never offered. */
+      const playlists = extractPlaylistUrls(html, base).filter((u) => !isAdUrl(u));
+      const urls = extractVideoUrls(html, base).filter(
+        (u) => !isAdUrl(u) && !isPlaylistUrl(u) && VIDEO_EXT.test(new URL(u).pathname),
+      );
+
+      if (playlists.length) {
+        /* The same master is often named twice (og:video and the player
+           config); different URLs on one page usually mean the page's own
+           quality selector. Quality first, so the best of them is chosen here
+           and the rest are not offered as separate files to choose between. */
+        const unique = [...new Set(playlists.map((url) => url.split('#')[0]))];
+        const chosen = unique.length > 1 ? await bestOf(unique, base) : unique[0];
+        const titleName = displayName || fileNameFromTitle(pageTitleOf(html) || '');
+        const files = [chosen].map((streamUrl, index) => {
+          const name = index === 0 && titleName ? titleName : `stream-${index + 1}.mp4`;
+          return {
+            id: streamUrl,
+            name,
+            size: 0,
+            mime: 'application/vnd.apple.mpegurl',
+            kind: 'video',
+            note: 'stream',
+            ref: { resolver: 'stream', url: streamUrl, name, referer: base },
+          };
+        });
+        /* The page's own <title> travels with the job: the card shows the tab
+           name of the page the link came from, not the file that comes out. */
+        return { resolver: 'stream', title: null, pageTitle: pageTitleOf(html) || null, files };
+      }
 
       if (!urls.length) {
         const viaBrowser = await pageBrowserFiles(base);
@@ -1463,13 +1972,13 @@ function preferPageName(urlName, pageName) {
         const hasPlayer = /\.(m3u8|mpd)/i.test(html) || /jwplayer|videojs|hls/i.test(html);
         throw new ResolveError(
           hasPlayer
-            ? 'That page streams its video (no single file to download).'
+            ? 'That page streams its video, but the stream link is built by its JavaScript and could not be read ' +
+                'from the page. Open the player once, then paste the stream link itself.'
             : 'No video file was advertised on that page.',
           'NO_VIDEO_ON_PAGE',
         );
       }
 
-      const displayName = pageDisplayName(html);
       const files = urls.slice(0, 10).map((videoUrl, index) => {
         let name = 'video.mp4';
         try {
@@ -1489,7 +1998,7 @@ function preferPageName(urlName, pageName) {
           ref: { resolver: 'direct', url: videoUrl, name },
         };
       });
-      return { resolver: 'page', title: null, files };
+      return { resolver: 'page', title: null, pageTitle: pageTitleOf(html) || null, files };
     },
     async direct(ref) {
       return ref.url;
@@ -1498,7 +2007,7 @@ function preferPageName(urlName, pageName) {
 
   /* ----------------------------------------------------------------- registry */
 
-  const RESOLVERS = [gofile, turbo, pixeldrain, bunkr, filester, fileditch, direct, page];
+  const RESOLVERS = [gofile, turbo, pixeldrain, bunkr, filester, fileditch, stream, direct, page];
 
   /** Videos first, biggest first — the file people usually want. */
   function orderFiles(files) {
@@ -1607,31 +2116,88 @@ function preferPageName(urlName, pageName) {
   }
 
   /** Ask the headless browser what media a page actually plays, if it is there. */
+  /** One entry for a stream: the shape the page and the browser both produce. */
+  function streamFileEntry(streamUrl, { name, referer, cookie, userAgent, quality, mime } = {}) {
+    const fileName = String(name || nameForStream(streamUrl, { height: Number(quality) || 0 }))
+      .replace(/\.(m3u8|mpd)$/i, '.mp4');
+    return {
+      id: streamUrl,
+      name: fileName,
+      size: 0,
+      mime: mime || 'application/vnd.apple.mpegurl',
+      kind: 'video',
+      quality: quality ? `${quality}p` : null,
+      note: 'stream',
+      ref: {
+        resolver: 'stream',
+        url: streamUrl,
+        name: fileName,
+        referer: referer || null,
+        cookie: cookie || null,
+        userAgent: userAgent || null,
+      },
+    };
+  }
+
   async function pageBrowserFiles(url) {
     if (!pageBrowserHook) return null;
     try {
       const result = await pageBrowserHook(url);
       const media = Array.isArray(result) ? result : (result && result.media) || [];
-      const files = media
-        .filter((item) => item && item.url)
-        .slice(0, 12)
-        .map((item, index) => {
-          let name = `video-${index + 1}.mp4`;
-          try {
-            const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
-            if (last && VIDEO_EXT.test(last)) name = last;
-          } catch {
-            /* keep default */
-          }
-          return {
-            id: item.url,
-            name,
-            size: Number(item.size) || 0,
-            mime: item.contentType || '',
-            kind: 'video',
-            ref: { resolver: 'direct', url: item.url, name },
-          };
-        });
+      /* A player that streams reports every segment as "media": hundreds of
+         URLs that are pieces of one video, not hundreds of videos. Only the
+         playlist is a file worth listing. */
+      const playable = media.filter((item) => {
+        if (!item || !item.url || isAdUrl(item.url)) return false;
+        if (isPlaylistUrl(item.url)) return true;
+        return !/\.ts(?:\?|#|$)/i.test(item.url);
+      });
+
+      /* A stream wins over anything else the browser saw: the .mp4s on such a
+         page are adverts (and the ad filter above only knows the ones it has
+         heard of). Several playlists mean the page's own quality selector, so
+         the best one is chosen, exactly like a page that names them in HTML. */
+      const playlistUrls = [...new Set(playable.filter((item) => isPlaylistUrl(item.url)).map((item) => item.url))];
+      if (playlistUrls.length) {
+        const chosen = playlistUrls.length > 1 ? await bestOf(playlistUrls, url) : playlistUrls[0];
+        const item = playable.find((entry) => entry.url === chosen) || { url: chosen };
+        /* The browser knows the clearance cookie it earned, and the user agent
+           that earned it — both are needed again by the CDN. */
+        const cookie = item.cookie || (result && result.cookie) || null;
+        const userAgent = item.userAgent || (result && result.userAgent) || null;
+        const referer = item.referer || url;
+        const info = await inspectPlaylist(chosen, {
+          headers: streamHeaders({ referer, cookie, userAgent }),
+        }).catch(() => null);
+        return [
+          streamFileEntry(chosen, {
+            name: (result && result.title && fileNameFromTitle(result.title)) || undefined,
+            referer,
+            cookie,
+            userAgent,
+            quality: info && info.height ? info.height : null,
+            mime: item.contentType,
+          }),
+        ];
+      }
+
+      const files = playable.slice(0, 12).map((item, index) => {
+        let name = `video-${index + 1}.mp4`;
+        try {
+          const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
+          if (last && VIDEO_EXT.test(last)) name = last;
+        } catch {
+          /* keep default */
+        }
+        return {
+          id: item.url,
+          name,
+          size: Number(item.size) || 0,
+          mime: item.contentType || '',
+          kind: 'video',
+          ref: { resolver: 'direct', url: item.url, name },
+        };
+      });
       return files.length ? files : null;
     } catch {
       return null;
@@ -1669,5 +2235,16 @@ function preferPageName(urlName, pageName) {
     pageTitleOf,
     isChallenge,
     gofileDownloadHeaders,
+    /* streams */
+    isPlaylistUrl,
+    isAdUrl,
+    extractPlaylistUrls,
+    parsePlaylistText,
+    pickBestVariant,
+    variantHeight,
+    inspectPlaylist,
+    nameForStream,
+    fileNameFromTitle,
+    clearStreamCache,
   };
 });

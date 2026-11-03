@@ -13,9 +13,18 @@ const {
   directUrl,
   directCandidates,
   extractVideoUrls,
+  extractPlaylistUrls,
+  isAdUrl,
+  parsePlaylistText,
+  pickBestVariant,
+  variantHeight,
+  inspectPlaylist,
+  nameForStream,
+  clearStreamCache,
   pageDisplayName,
   preferPageName,
   setPageHtmlBrowser,
+  setPageBrowser,
   pageTitleOf,
 } = require('../shared/resolve');
 
@@ -561,6 +570,277 @@ const GOFILE_FOLDER = {
   await test('a page with only an HLS stream says so', async () => {
     stubFetch(() => ({ raw: '<script src="hls.js"></script><video></video>', type: 'text/html' }));
     await assert.rejects(resolve('https://example.com/stream'), (err) => err.code === 'NO_VIDEO_ON_PAGE');
+  });
+
+  /* ------------------------------------------------------------------ streams
+   * missav.ws/en/dandya-045 plays its video from an HLS master on surrit.com.
+   * Pasting that page used to resolve to an advertisement: the page carries an
+   * ad .mp4, the real video is a playlist, and playlists were filtered out
+   * before anything looked at them. */
+
+  console.log('streams (HLS)');
+
+  const MASTER = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=845000,RESOLUTION=640x360,NAME="360p"
+360p/video.m3u8
+#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=2100000,RESOLUTION=1280x720,NAME="720p"
+720p/video.m3u8
+#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=4800000,RESOLUTION=1920x1080,NAME="1080p"
+1080p/video.m3u8
+`;
+
+  const MEDIA = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:6.006,
+https://surrit.com/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/1080p/video0.ts
+#EXTINF:6.006,
+https://surrit.com/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/1080p/video1.ts
+#EXTINF:2.500,
+https://surrit.com/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/1080p/video2.ts
+#EXT-X-ENDLIST
+`;
+
+  /* The page exactly as it behaves in the wild: an advert with a .mp4 (and a
+     .mp4 ad network), and the real video in a player config, with escaped
+     slashes because it is inside an inline script. */
+  const MISSвAV_PAGE = `<html><head>
+      <title>DANDYA-045 A long title here - MissAV</title>
+      <meta property="og:video" content="https://ads.exoclick.com/vast/preroll.mp4" />
+    </head><body>
+      <video src="https://cdn.juicyads.com/creative/banner.mp4" autoplay muted></video>
+      <script>
+        jwplayer("player").setup({
+          file: "https:\/\/surrit.com\/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0\/playlist.m3u8",
+          image: "https://missav.ws/thumbs/1.jpg"
+        });
+      </script>
+    </body></html>`;
+  const MISSвAV_PAGE_FIXED = MISSвAV_PAGE.replace('MISSвAV', 'MISSAV');
+
+  await test('a page that streams its video resolves to the stream, not to its advert', async () => {
+    clearStreamCache();
+    const pageUrl = 'https://missav.ws/en/dandya-045';
+    stubFetch((url) => {
+      if (url.includes('playlist.m3u8')) return { raw: MASTER, type: 'application/vnd.apple.mpegurl' };
+      if (url.includes('/1080p/video.m3u8')) return { raw: MEDIA, type: 'application/vnd.apple.mpegurl' };
+      return { raw: MISSвAV_PAGE_FIXED, type: 'text/html' };
+    });
+
+    const result = await resolve(pageUrl);
+    assert.equal(result.resolver, 'stream', `resolved to ${result.resolver}`);
+    assert.equal(result.files.length, 1, `${result.files.length} files`);
+    assert.match(result.files[0].ref.url, /^https:\/\/surrit\.com\/91f6b5f7.*\/playlist\.m3u8$/);
+    assert.equal(result.files[0].ref.resolver, 'stream');
+    /* The CDN wants the page it belongs to as the referer. */
+    assert.equal(result.files[0].ref.referer, pageUrl);
+    assert.match(result.files[0].name, /^DANDYA-045/);
+  });
+
+  await test('and the advert is not offered as a second file', async () => {
+    const result = await resolve('https://missav.ws/en/dandya-045');
+    const urls = result.files.map((file) => file.ref.url);
+    assert.ok(!urls.some((url) => /exoclick|juicyads/.test(url)), urls.join(', '));
+  });
+
+  await test('an ad network host is recognised, a CDN is not', () => {
+    assert.equal(isAdUrl('https://ads.exoclick.com/vast/preroll.mp4'), true);
+    assert.equal(isAdUrl('https://cdn.juicyads.com/x/banner.mp4'), true);
+    assert.equal(isAdUrl('https://surrit.com/91f6/playlist.m3u8'), false);
+    assert.equal(isAdUrl('https://cdn.example.com/movie.mp4'), false);
+  });
+
+  await test('escaped slashes in a player config are understood', () => {
+    const urls = extractPlaylistUrls(
+      '<script>player.setup({file: "https:\/\/surrit.com\/abc\/playlist.m3u8"});</script>',
+      'https://missav.ws/en/dandya-045',
+    );
+    assert.deepEqual(urls, ['https://surrit.com/abc/playlist.m3u8']);
+  });
+
+  await test('a relative playlist in a <source> is made absolute', () => {
+    const urls = extractPlaylistUrls(
+      '<video><source src="media/stream.m3u8" type="application/x-mpegURL"></video>',
+      'https://example.com/watch/1',
+    );
+    assert.deepEqual(urls, ['https://example.com/watch/media/stream.m3u8']);
+  });
+
+  await test('a playlist announced in og:video counts too', () => {
+    const urls = extractPlaylistUrls(
+      '<meta property="og:video" content="https://cdn.example.com/live/master.m3u8" />',
+      'https://example.com/',
+    );
+    assert.deepEqual(urls, ['https://cdn.example.com/live/master.m3u8']);
+  });
+
+  await test('the best quality is chosen, not the first one listed', () => {
+    const parsed = parsePlaylistText(MASTER, 'https://surrit.com/91f6/playlist.m3u8');
+    assert.equal(parsed.master, true);
+    assert.equal(parsed.variants.length, 3);
+    const best = pickBestVariant(parsed.variants);
+    assert.equal(best.height, 1080);
+    assert.equal(best.uri, 'https://surrit.com/91f6/1080p/video.m3u8');
+  });
+
+  await test('without resolutions, the highest bandwidth wins', () => {
+    const text = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=500000
+low/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3000000
+high/index.m3u8
+`;
+    const parsed = parsePlaylistText(text, 'https://cdn.example.com/v/');
+    assert.equal(pickBestVariant(parsed.variants).uri, 'https://cdn.example.com/v/high/index.m3u8');
+  });
+
+  await test('a quality in the variant name counts when RESOLUTION is missing', () => {
+    const text = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=900000,NAME="480p"
+480/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=900000,NAME="1080p"
+1080/index.m3u8
+`;
+    const parsed = parsePlaylistText(text, 'https://cdn.example.com/x/');
+    const best = pickBestVariant(parsed.variants);
+    assert.equal(variantHeight(best), 1080);
+  });
+
+  await test('the length of a stream is the sum of its segments', () => {
+    const parsed = parsePlaylistText(MEDIA, 'https://surrit.com/x/1080p/video.m3u8');
+    assert.equal(parsed.duration, 14.512);
+    assert.equal(parsed.segmentCount, 3);
+    assert.equal(parsed.live, false);
+    assert.equal(parsed.segments[0], 'https://surrit.com/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/1080p/video0.ts');
+  });
+
+  await test('a live stream is refused in words a person can act on', async () => {
+    clearStreamCache();
+    const live = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:42
+#EXTINF:6.0,
+https://cdn.example.com/live/seg42.ts
+`;
+    stubFetch(() => ({ raw: live, type: 'application/vnd.apple.mpegurl' }));
+    await assert.rejects(resolve('https://cdn.example.com/live/chunklist.m3u8'), (err) => err.code === 'STREAM_LIVE');
+  });
+
+  await test('a pasted .m3u8 is a job of its own, named after its host and quality', async () => {
+    clearStreamCache();
+    stubFetch((url) =>
+      url.endsWith('playlist.m3u8')
+        ? { raw: MASTER, type: 'application/vnd.apple.mpegurl' }
+        : { raw: MEDIA, type: 'application/vnd.apple.mpegurl' },
+    );
+    const result = await resolve('https://surrit.com/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/playlist.m3u8');
+    assert.equal(result.resolver, 'stream');
+    const file = result.files[0];
+    assert.equal(file.quality, '1080p');
+    assert.match(file.name, /^surrit-1080p\.mp4$/, file.name);
+    assert.ok(file.size > 0, 'an estimated size is better than none');
+    assert.equal(file.sizeIsEstimate, undefined);
+  });
+
+  await test('the file ref resolves to the chosen variant playlist', async () => {
+    clearStreamCache();
+    stubFetch((url) =>
+      url.endsWith('/playlist.m3u8')
+        ? { raw: MASTER, type: 'application/vnd.apple.mpegurl' }
+        : { raw: MEDIA, type: 'application/vnd.apple.mpegurl' },
+    );
+    const resolved = await resolve('https://surrit.com/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/playlist.m3u8');
+    const ref = resolved.files[0].ref;
+    const url = await directUrl(ref);
+    assert.equal(url, 'https://surrit.com/91f6/1080p/video.m3u8'.replace('91f6/', '91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/'));
+    /* The findings are handed back on the ref: the disk check and the card use
+       the length and the estimate. */
+    assert.equal(ref.quality, 1080);
+    assert.equal(ref.duration, 14.512);
+    assert.ok(ref.estimatedBytes > 1000);
+  });
+
+  await test('a page that offers several qualities gives the best one, not the first', async () => {
+    clearStreamCache();
+    const page = `<html><head><title>Quality selector page</title></head><body>
+      <script>
+        const qualities = {
+          low:  "https://cdn.example.com/low/playlist.m3u8",
+          high: "https://cdn.example.com/high/playlist.m3u8"
+        };
+      </script></body></html>`;
+    const master = (height) => `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x${height},NAME="${height}p"
+video.m3u8
+`;
+    const media = `#EXTM3U
+#EXTINF:6.0,
+seg0.ts
+#EXT-X-ENDLIST
+`;
+    stubFetch((url) => {
+      if (url.includes('/low/playlist.m3u8')) return { raw: master(360), type: 'application/vnd.apple.mpegurl' };
+      if (url.includes('/high/playlist.m3u8')) return { raw: master(1080), type: 'application/vnd.apple.mpegurl' };
+      if (url.endsWith('video.m3u8')) return { raw: media, type: 'application/vnd.apple.mpegurl' };
+      return { raw: page, type: 'text/html' };
+    });
+
+    const result = await resolve('https://example.com/watch/quality');
+    assert.equal(result.files.length, 1, `${result.files.length} files offered`);
+    assert.match(result.files[0].ref.url, /\/high\/playlist\.m3u8$/, result.files[0].ref.url);
+  });
+
+  await test('the segments a browser saw are not listed as hundreds of files', async () => {
+    clearStreamCache();
+    stubFetch(() => ({ raw: '<html><body>player page</body></html>', type: 'text/html' }));
+    setPageBrowser(async () => ({
+      media: [
+        { url: 'https://surrit.com/91f6/playlist.m3u8', contentType: 'application/vnd.apple.mpegurl' },
+        { url: 'https://surrit.com/91f6/1080p/video0.ts', contentType: 'video/mp2t' },
+        { url: 'https://surrit.com/91f6/1080p/video1.ts', contentType: 'video/mp2t' },
+        { url: 'https://ads.exoclick.com/pre.mp4', contentType: 'video/mp4' },
+      ],
+    }));
+    try {
+      const result = await resolve('https://missav.ws/en/dandya-045');
+      assert.equal(result.files.length, 1, result.files.map((f) => f.name).join(', '));
+      assert.equal(result.files[0].ref.resolver, 'stream');
+      assert.match(result.files[0].ref.url, /playlist\.m3u8$/);
+    } finally {
+      setPageBrowser(null);
+    }
+  });
+
+  await test('a stream whose playlist is really a web page says so', async () => {
+    clearStreamCache();
+    stubFetch(() => ({ raw: '<!doctype html><html><body>nope</body></html>', type: 'text/html' }));
+    await assert.rejects(
+      inspectPlaylist('https://surrit.com/other/playlist.m3u8'),
+      (err) => err.code === 'STREAM_NOT_A_PLAYLIST',
+    );
+  });
+
+  await test('a DRM-protected stream is refused instead of failing halfway', async () => {
+    clearStreamCache();
+    const protectedPlaylist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://key-id",KEYFORMAT="com.apple.streamingkeydelivery"
+#EXTINF:6.0,
+seg0.ts
+#EXT-X-ENDLIST
+`;
+    stubFetch(() => ({ raw: protectedPlaylist, type: 'application/vnd.apple.mpegurl' }));
+    await assert.rejects(
+      resolve('https://cdn.example.com/protected/playlist.m3u8'),
+      (err) => err.code === 'STREAM_DRM' && /DRM/.test(err.message),
+    );
+  });
+
+  await test('a name comes from the URL when it has a real one', () => {
+    assert.equal(nameForStream('https://cdn.example.com/holiday/beach-day.m3u8', { height: 720 }), 'beach-day-720p.mp4');
   });
 
   await test('rejects a non-url', async () => {

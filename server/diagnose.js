@@ -15,6 +15,14 @@ const UA = 'Squeeze/1.0 (diagnostics)';
 
 const MB = (bytes) => `${(Number(bytes) / 1048576).toFixed(1)} MB`;
 
+/** "48 s" reads better than "0 min" for a short clip. */
+const durationText = (seconds) => {
+  const value = Number(seconds) || 0;
+  if (value < 60) return `${Math.round(value)} s`;
+  const minutes = Math.round(value / 60);
+  return minutes < 90 ? `${minutes} min` : `${Math.round(minutes / 6) / 10} h`;
+};
+
 /** A signed link is a credential for ~30 minutes: show the shape, not the token. */
 function redact(url) {
   try {
@@ -150,6 +158,10 @@ async function diagnose(url, { browser } = {}) {
           .filter(Boolean),
         userAgent: (file.ref && file.ref.userAgent) || null,
         viaBrowser: Boolean(file.ref && file.ref.viaBrowser),
+        /* A stream has no size until it is read: say which one was chosen and
+           how long it is, because that is what decides whether the disk is
+           big enough. */
+        stream: file.ref && file.ref.resolver === 'stream',
         };
       }),
     };
@@ -196,6 +208,34 @@ async function diagnose(url, { browser } = {}) {
           return out;
         })
       : { ok: false, error: 'no reference' };
+  }
+
+  /* 4b. A stream: which quality was chosen, how long it is, how big. This is
+     the step that answers "it only found an ad" — it names the playlist that
+     was picked and what is in it. */
+  if (steps.resolve && steps.resolve.ok && steps.resolve.value.files.some((file) => file.stream)) {
+    const { inspectPlaylist, resolve: resolveAgain } = require('../shared/resolve');
+    const ref = (await resolveAgain(url).catch(() => null))?.files?.[0]?.ref;
+    steps.stream = await timed(async () => {
+      const info = await inspectPlaylist(ref.url, {
+        headers: {
+          ...(ref.referer ? { referer: ref.referer } : {}),
+          ...(ref.cookie ? { cookie: ref.cookie } : {}),
+          ...(ref.userAgent ? { 'user-agent': ref.userAgent } : {}),
+        },
+      });
+      return {
+        quality: info.height ? `${info.height}p` : 'unknown',
+        durationSeconds: Math.round(info.duration),
+        estimatedBytes: info.estimatedBytes,
+        segments: info.segments,
+        chosen: redact(info.url),
+        variants: (info.variants || []).map((variant) => ({
+          quality: variant.height ? `${variant.height}p` : variant.name || 'unknown',
+          bandwidth: variant.bandwidth,
+        })),
+      };
+    });
   }
 
   /* 5. What a real browser sees, when one is available. */
@@ -255,6 +295,15 @@ function verdictFor(steps) {
     return browser
       ? 'The download button was not found even in a browser — the page may have changed. Send this whole block.'
       : 'The download button only appears in a real browser, and this machine has none — run `npm run browser:install`.';
+  }
+  if (steps.stream) {
+    if (!steps.stream.ok) return `The stream was found but could not be read: ${steps.stream.error}. Send this block.`;
+    const chosen = steps.stream.value;
+    return (
+      `This page streams its video: the best quality on offer is ${chosen.quality}, ` +
+      `${durationText(chosen.durationSeconds)}, about ${MB(chosen.estimatedBytes)} — ` +
+      'the app downloads exactly that and then compresses it.'
+    );
   }
   const probes = steps.candidates && steps.candidates.ok ? steps.candidates.value : [];
   const refused = probes.filter((item) => item.ok && [403, 503, 401].includes(item.value.status));
@@ -322,12 +371,30 @@ function render({ url, steps }) {
          URL a *minted* link or the player page (which serves HTML)? */
       const offered = v.files[0] && v.files[0].refUrl;
       if (offered) {
+        const looksStream = Boolean(v.files[0] && v.files[0].stream);
         const looksPlayer = /\.(mp4|m4v|webm|mov)(\b|$)/i.test(offered) && !/\/[A-Za-z0-9_-]{40,}$/.test(offered);
         lines.push(
-          looksPlayer
-            ? '          ⚠ that is the player page, not a minted link: the download button was not found'
-            : '          ✓ looks like a minted (signed) link, not the player page',
+          looksStream
+            ? '          ✓ that is an HLS playlist — the video itself, served as segments'
+            : looksPlayer
+              ? '          ⚠ that is the player page, not a minted link: the download button was not found'
+              : '          ✓ looks like a minted (signed) link, not the player page',
         );
+      }
+    }
+  }
+
+  if (steps.stream) {
+    if (!steps.stream.ok) lines.push(`stream    FAILED — ${steps.stream.error}`);
+    else {
+      const v = steps.stream.value;
+      lines.push(
+        `stream    ${v.quality} · ${durationText(v.durationSeconds)} · about ${MB(v.estimatedBytes)} · ` +
+          `${v.segments} segments`,
+      );
+      lines.push(`          playing ${v.chosen}`);
+      if (v.variants.length > 1) {
+        lines.push(`          qualities offered: ${v.variants.map((variant) => variant.quality).join(', ')}`);
       }
     }
   }

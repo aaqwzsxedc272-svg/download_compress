@@ -1245,9 +1245,17 @@ function showPicker({ pageUrl, resolver, title, files, mode }) {
     meta.className = 'picker-meta';
     const bits = [];
     /* The size is the thing that decides which file is worth queueing. When a
-       host hides it the server probes it, so "unknown" should be rare. */
-    bits.push(file.size ? formatBytes(file.size) : 'size unknown');
+       host hides it the server probes it, so "unknown" should be rare. A
+       stream's size is length × bitrate, not a Content-Length: say "about" so
+       the number is not mistaken for a promise. */
+    bits.push(
+      file.size ? `${file.sizeIsEstimate ? 'about ' : ''}${formatBytes(file.size)}` : 'size unknown',
+    );
     bits.push(VIDEO_KIND_LABEL[file.kind] || 'file');
+    /* "1080p · 3 min · 4 qualities" — everything a person needs to know that
+       this is a stream and which quality was picked for them. */
+    if (file.quality) bits.push(file.quality);
+    if (file.note) bits.push(file.note);
     if (mode === 'browser' && file.size > 1.5 * 1024 ** 3) {
       bits.push('large — your browser downloads it in full first');
     }

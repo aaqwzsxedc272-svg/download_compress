@@ -88,8 +88,9 @@ Squeeze detects it at startup and reports it on `/api/health`.
 | **bunkr** | server only | follows the signed-CDN flow; rotates domains, often bot-protected |
 | **filester.me** | server only | public metadata + share-page scrape; behind DDoS-Guard; takes the file's real name from the page, not the CDN's UUID |
 | **fileditch** (`theditch.st`, `fileditch.st`, `fileditchfiles.me`) | server only, needs `npm run browser:install` | three URL shapes for one video: the share page, the signed link it hands out, and the file host. All three sit behind Cloudflare, so the page is opened in a real browser and its clearance cookie is reused for the download. `fileditchfiles.me/…` answers 500 to a plain request, so it is resolved through the player page (`fileditchvids.st`); the signed link lives ~26 minutes, so a fresh one is minted at fetch time |
+| **HLS / DASH streams** (`.m3u8`, `.mpd`) | yes | the best quality on offer is chosen and remuxed into one MP4 by ffmpeg (`-c copy`: no re-encode); a live stream or a DRM-protected one is refused in words, not a stack trace |
 | direct `.mp4` / `.webm` | yes | no resolution needed |
-| any page with a video | yes | `og:video`, `<video>`, `<source>`, JSON-LD |
+| any page with a video | yes | `og:video`, `<video>`, `<source>`, JSON-LD, or the playlist in the player's own config |
 
 "Server only" means the *server* must be able to reach the host — so hosts that forbid
 cross-origin reads (turbo, bunkr, filester) cannot work in a sandbox whose network blocks them.
@@ -110,8 +111,9 @@ real end-to-end encode, then explains what that combination means.
    - `filester.me/d/{slug}` → public metadata, then share-page scrape
    - `fileditch.st/{id}` / `theditch.st/{id}` / a bare `fileditchfiles.me/...` path → the
      page's `⬇ Download` anchor (a freshly signed link), with the player URL as a fallback
+   - a URL that ends in `.m3u8`/`.mpd` → the stream itself (best quality picked)
    - a URL that ends in a video extension → used directly
-   - anything else → the page is fetched and scanned for a video URL
+   - anything else → the page is fetched and scanned for a video URL *or* a playlist
 2. **Fetch it**, in whichever of these can reach the file:
    - the server downloads it itself (fastest),
    - `yt-dlp` extracts it for the platforms it supports,
@@ -219,6 +221,42 @@ composer (or the same switch in the file picker) hands the original back untouch
   is still there (the fastest download — no host in the middle), or the uploaded link once the
   local copy has been deleted to free space. A hosted job used to show only *Details*, and a
   deleted one used to keep a button that answered `410`.
+
+## Pages that stream their video (HLS)
+
+A lot of sites — missav among them — never serve a video file. The page plays an **HLS
+playlist**: a text file that lists the pieces of the video, with a *master* playlist naming the
+qualities on offer. Pasting such a page used to resolve to whatever `.mp4` was lying in the
+page… which is the advert. That is the whole bug: the video was a playlist, playlists were
+filtered out before anything looked at them, and the ad was what remained.
+
+* **The playlist is a real source.** `shared/resolve.js` reads `.m3u8`/`.mpd` URLs out of the
+  page — absolute ones, ones with escaped slashes (`https:\/\/…`, `https:\u002F\u002F…`), and
+  relative ones inside a player's config — and treats them as the video.
+* **Quality first.** The master lists every quality; the one with the biggest picture is chosen,
+  and only that one is downloaded. A page that lists one playlist per quality (its own little
+  quality selector) is read the same way: all of them are weighed, the best is kept.
+* **The advert is never touched.** Known ad networks (exoclick, juicyads, doubleclick, …) and
+  ad-shaped paths (`/vast/`, `/preroll/`, `/banner/`) are dropped before anything is offered, and
+  a playlist always wins over a loose `.mp4` on the same page. `npm run test:stream` proves it by
+  counting requests to the ad: zero.
+* **The stream is remuxed, not re-encoded.** ffmpeg pulls every segment and writes them into one
+  MP4 with `-c copy` — the frames are exactly the host's — and the normal pipeline takes it from
+  there (720p floor, size check, share link, resume). The file is assembled under a `.part` name
+  and renamed only when ffmpeg exits cleanly.
+* **The CDN gets the page as its referer**, plus the cookies and user agent the browser had, if
+  the page needed one. If the CDN still refuses, the app opens the page once in a real browser to
+  earn that clearance and tries the stream again — a 403 is not the end of the job. A refusal it
+  cannot fix says so in a sentence that names the next step (paste the page, not the stream).
+* **Sizes are honest.** A stream has no `Content-Length`, so the picker shows *about* 1.4 GB —
+  the playlist's own length (the sum of its `#EXTINF` values) times the chosen quality's
+  bitrate. The card says which quality was picked before the download starts.
+* **Live and DRM are refused up front**: a live stream has no end to save, and a protected one
+  cannot be saved by any downloader. Both say so instead of failing twenty minutes later.
+
+The whole shape is tested end to end against a real server, a real master playlist and real
+segments cut by ffmpeg (`npm run test:stream`), and `npm run doctor -- <link>` now prints the
+quality, the length and the estimated size of the stream it found.
 
 ## A failure is not a dead end
 
@@ -850,7 +888,7 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
-- `npm run test:resolve` — 37 resolver tests against stubbed APIs (real response shapes),
+- `npm run test:resolve` — 54 resolver tests against stubbed APIs (real response shapes),
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before
   a minted link, plus the page-title naming rule and fileditch's minted-link/player routes.
@@ -895,6 +933,11 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   and survives, a two-hour-old crash keeps its files for *Try again*, a day-old one is cleaned
   up, a pinned job is never swept, a job with an encoder on it survives even when its status says
   finished, and every busy status is in the protected set.
+- `npm run test:stream` — 20 checks end to end: a page carrying an advert and an HLS master on
+  another host resolves to the stream (not the ad), the ad is requested **zero** times, the 720p
+  variant is fetched and the 360p one is not, the segments become one MP4 with audio at 720p, the
+  result is named after the page rather than `playlist.m3u8`, and a pasted `.m3u8` works by
+  itself.
 - `npm run test:progress` — 12 checks: real ffmpeg progress blocks (recorded from this build) are
   read one event per block with the time and the speed together, a speed-only update cannot reset
   the position to zero, `N/A` is not mistaken for 0%, and a real encode reports a climbing

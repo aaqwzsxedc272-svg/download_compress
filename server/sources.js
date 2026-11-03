@@ -6,7 +6,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { ffmpegPath } = require('./ffmpeg');
+const { ffmpegPath, makeProgressReader, usefulLine } = require('./ffmpeg');
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -431,6 +431,158 @@ async function downloadHttp(
   };
 }
 
+/* -------------------------------------------------------------- streams */
+
+/**
+ * Fetch an HLS (or DASH) stream into one local file.
+ *
+ * A playlist is a list of segments, so there is nothing a Range request can do
+ * with it. ffmpeg is the tool that already knows how to read one, and `-c copy`
+ * means it only remuxes: every segment's frames land in the MP4 exactly as the
+ * host encoded them. The encoder then treats that MP4 like any other source, so
+ * the rest of the pipeline (and its 720p floor, its size checks, its resume)
+ * works unchanged.
+ *
+ * The file is assembled under a `.part` name and only renamed when ffmpeg exits
+ * cleanly — the same rule the encoder's parts follow, for the same reason: a
+ * machine that stops mid-stream must not leave something that looks like a video.
+ */
+async function downloadStream(
+  url,
+  destPath,
+  {
+    onProgress,
+    duration = 0,
+    signal,
+    extraHeaders = {},
+    timeoutMs = 45 * 60 * 1000,
+  } = {},
+) {
+  const temp = `${destPath}.stream.part`;
+  await fsp.rm(temp, { force: true }).catch(() => {});
+
+  const headerLines = Object.entries(extraHeaders)
+    .filter(([key, value]) => value && !['user-agent'].includes(String(key).toLowerCase()))
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('\r\n');
+  const userAgent = extraHeaders['user-agent'] || extraHeaders['User-Agent'] || UA;
+
+  const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y'];
+  if (headerLines) args.push('-headers', `${headerLines}\r\n`);
+  args.push('-user_agent', userAgent);
+  args.push(
+    '-i', url,
+    /* Both tracks, if they exist; `?` keeps a video-only stream from failing. */
+    '-map', '0:v:0?',
+    '-map', '0:a:0?',
+    '-c', 'copy',
+    '-movflags', '+faststart',
+    '-f', 'mp4',
+    '-progress', 'pipe:1',
+    '-nostats',
+    temp,
+  );
+
+  const started = Date.now();
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    let stdoutBuf = '';
+    let killed = null;
+    let settled = false;
+    let timer = null;
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      fn(value);
+    };
+    const stop = (code) => {
+      killed = code;
+      child.kill('SIGKILL');
+    };
+    const onAbort = () => stop('CANCELLED');
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    timer = setTimeout(() => stop('TIMEOUT'), timeoutMs);
+    if (timer.unref) timer.unref();
+
+    const reader = makeProgressReader(({ seconds, speed }) => {
+      if (!onProgress) return;
+      let bytes = 0;
+      try {
+        bytes = fs.statSync(temp).size;
+      } catch {
+        /* not written yet */
+      }
+      onProgress({ seconds, speed, bytes, duration });
+    }, { duration });
+
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdoutBuf += chunk;
+      const lines = stdoutBuf.split('\n');
+      stdoutBuf = lines.pop() || '';
+      for (const line of lines) reader.line(line);
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+      if (stderr.length > 64_000) stderr = stderr.slice(-32_000);
+    });
+
+    child.on('error', (err) => finish(reject, err));
+    child.on('close', (code) => {
+      if (killed === 'CANCELLED') {
+        return finish(reject, Object.assign(new Error('Cancelled'), { code: 'CANCELLED' }));
+      }
+      if (killed === 'TIMEOUT') {
+        return finish(
+          reject,
+          Object.assign(
+            new Error(
+              `The stream was still running after ${Math.round(timeoutMs / 60000)} minutes and was stopped. ` +
+                'A live stream never finishes; a very long recording needs a bigger STREAM_TIMEOUT_MINUTES.',
+            ),
+            { code: 'STREAM_TIMEOUT' },
+          ),
+        );
+      }
+      if (code === 0) return finish(resolve, { stderr, tookMs: Date.now() - started });
+      return finish(
+        reject,
+        Object.assign(new Error(stderr.trim() || `ffmpeg exited with code ${code}`), {
+          code: 'FFMPEG_FAILED',
+          stderr,
+          detail: usefulLine(stderr),
+        }),
+      );
+    });
+  }).catch(async (err) => {
+    await fsp.rm(temp, { force: true }).catch(() => {});
+    throw err;
+  });
+
+  const stat = await fsp.stat(temp).catch(() => null);
+  if (!stat || stat.size < 1024) {
+    await fsp.rm(temp, { force: true }).catch(() => {});
+    throw Object.assign(
+      new Error(
+        'The stream produced no video. The server that holds the segments may want the page as its referer, ' +
+          'or the stream may have expired.',
+      ),
+      { code: 'STREAM_EMPTY' },
+    );
+  }
+  await fsp.rm(destPath, { force: true }).catch(() => {});
+  await fsp.rename(temp, destPath);
+  return { url, total: stat.size, tookMs: result.tookMs };
+}
+
 module.exports = {
   UA,
   normalizeUrl,
@@ -442,6 +594,7 @@ module.exports = {
   downloadPlatform,
   probeRemote,
   downloadHttp,
+  downloadStream,
   isBlockedHost,
   freeDiskBytes,
   filenameFrom,

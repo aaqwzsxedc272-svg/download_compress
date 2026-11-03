@@ -933,11 +933,11 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   and survives, a two-hour-old crash keeps its files for *Try again*, a day-old one is cleaned
   up, a pinned job is never swept, a job with an encoder on it survives even when its status says
   finished, and every busy status is in the protected set.
-- `npm run test:stream` — 20 checks end to end: a page carrying an advert and an HLS master on
+- `npm run test:stream` — 22 checks end to end: a page carrying an advert and an HLS master on
   another host resolves to the stream (not the ad), the ad is requested **zero** times, the 720p
   variant is fetched and the 360p one is not, the segments become one MP4 with audio at 720p, the
   result is named after the page rather than `playlist.m3u8`, and a pasted `.m3u8` works by
-  itself.
+  itself, and the same stream queued from the picker by its reference finishes too.
 - `npm run test:progress` — 12 checks: real ffmpeg progress blocks (recorded from this build) are
   read one event per block with the time and the speed together, a speed-only update cannot reset
   the position to zero, `N/A` is not mistaken for 0%, and a real encode reports a climbing

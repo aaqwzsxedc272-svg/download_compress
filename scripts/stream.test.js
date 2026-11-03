@@ -290,7 +290,28 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
       info ? `${info.width}x${info.height}` : 'unknown',
     );
 
-    /* -------------------------------------------- 3. the playlist on its own */
+    /* ------------------------------------- 3. picked from the page's file list
+       This is the path the page itself uses: /api/resolve lists the stream, the
+       picker posts its ref back as source: 'ref'. A resolver that is missing
+       from the server's allow-list answers "That file reference is not valid." */
+    const picked = await (await fetch(`${BASE}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'ref',
+        ref: listed.files[0].ref,
+        name: listed.files[0].name,
+        presetId: 'small',
+      }),
+    })).json();
+    check('the stream can be queued from the picker, by its reference', Boolean(picked.job?.id), picked.error || '');
+    const pickedDone = await waitFor(async () => {
+      const job = picked.job?.id ? await getJob(picked.job.id) : null;
+      return job && ['done', 'hosted', 'error'].includes(job.status) ? job : null;
+    }, { timeoutMs: 300000 });
+    check('and it finishes like any other job', ['done', 'hosted'].includes(pickedDone?.status), pickedDone?.error || pickedDone?.status);
+
+    /* -------------------------------------------- 4. the playlist on its own */
     const direct = await (await fetch(`${BASE}/api/jobs`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

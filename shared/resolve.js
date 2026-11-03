@@ -825,6 +825,34 @@
   }
 
   /**
+   * A short sample of the film, published next to the film.
+   *
+   * Sites put a two-minute preview beside a two-hour feature, and the preview
+   * is often the *better encoded* of the two — so "highest quality" alone picks
+   * it, which is exactly the report "only previews caught". These are the names
+   * those files carry in the wild: `preview.mp4`, `_PR.mp4`, `trailer.mp4`,
+   * `sample.m3u8`, `…/teaser/…`, `mediabook_320p.mp4`. Only used to rank: if a
+   * page offers nothing else, a preview is still better than an error.
+   */
+  const PREVIEW_PATH = /(?:^|[\/._-])(?:preview|previewclip|trailer|trailerhg|teaser|sample|mediabook)(?:[\/._-]|\d|$)/i;
+  function isPreviewUrl(rawUrl) {
+    let path = '';
+    try {
+      path = decodeURIComponent(new URL(String(rawUrl || '')).pathname);
+    } catch {
+      return false;
+    }
+    if (PREVIEW_PATH.test(path)) return true;
+    const name = path.split('/').filter(Boolean).pop() || '';
+    /* `FNS-257_PR.mp4`: the site's own promo naming. The stem has to *end* in
+       `_pr`, so a product code like SOD-PR123.mp4 is not caught. */
+    if (/[._-]pr(?:[._-]\d{3,4}p)?\.(?:mp4|m3u8)$/i.test(name)) return true;
+    /* `tr_720p.mp4`, the other spelling of the same thing. */
+    if (/^tr[_-]?\d{2,4}p?\./i.test(name)) return true;
+    return false;
+  }
+
+  /**
    * An advert dressed as a video file.
    *
    * The banner in the report was called `9558-0-300x250.medium.mp4`: an IAB
@@ -998,38 +1026,174 @@
    * download reuses those exact headers, because the segments are guarded the
    * same way.
    */
-  function headerLadder(url, headers) {
-    const attempts = [headers];
-    if (!headers.referer) {
-      let origin = null;
-      try {
-        origin = new URL(url).origin;
-      } catch {
-        /* not a URL */
-      }
-      if (origin) {
-        attempts.push({
-          ...headers,
-          referer: `${origin}/`,
-          origin,
-          'sec-fetch-dest': 'video',
-          'sec-fetch-mode': 'cors',
-          'sec-fetch-site': 'same-origin',
-        });
-        attempts.push({ ...headers, referer: `${origin}/`, origin });
-      }
+  const HLS_ACCEPT = 'application/vnd.apple.mpegurl, application/x-mpegURL, */*';
+
+  /**
+   * Streaming CDNs that only serve the site that embeds them.
+   *
+   * A bare playlist pasted on its own has no page, so there is no referer to
+   * derive — and this CDN answers 403 without one. The pairing is not a guess:
+   * it is how the player on that site loads it, and it is the one case where
+   * the missing piece can be supplied. Anything not listed here gets the
+   * generic ladder, which tries the CDN's own origin and then nothing.
+   */
+  const PARENT_SITE = [
+    [/(^|\.)surrit\.com$/i, 'https://missav.ws/'],
+    [/(^|\.)fourhoi\.com$/i, 'https://missav.ws/'],
+    [/(^|\.)streamhls\.click$/i, 'https://www.javdock.com/'],
+  ];
+
+  function knownParentReferer(url) {
+    try {
+      const host = new URL(url).hostname;
+      const hit = PARENT_SITE.find(([pattern]) => pattern.test(host));
+      return hit ? hit[1] : null;
+    } catch {
+      return null;
     }
-    return attempts;
   }
 
-  async function fetchPlaylistText(url, headers = {}) {
+  /**
+   * The headers a browser would send for a playlist, computed the way a browser
+   * computes them.
+   *
+   * This is the difference the field report turned on: surrit.com (missav's
+   * video CDN) serves the *film* to a request whose Referer is
+   * `https://missav.ws/` — the page's **origin** — because a cross-site
+   * subresource is sent with `strict-origin-when-cross-origin`, not with the
+   * full page address. A deep link as Referer is a different string, and on
+   * some of these CDNs a wrong Referer gets a decoy playlist instead of an
+   * error. Sending the page address where the browser sends the origin is a
+   * mistake that only shows up on the one site you care about.
+   */
+  function browserHeaders(pageUrl, streamUrl) {
+    const out = { accept: HLS_ACCEPT, 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors' };
+    try {
+      const page = new URL(pageUrl);
+      const stream = new URL(streamUrl);
+      const crossSite = page.host !== stream.host;
+      out.referer = crossSite ? `${page.origin}/` : page.href;
+      out.origin = page.origin;
+      out['sec-fetch-site'] = crossSite ? 'cross-site' : 'same-origin';
+    } catch {
+      /* not a URL — send nothing extra */
+    }
+    return out;
+  }
+
+  /**
+   * The sets of headers worth trying, in order, for one playlist URL.
+   *
+   * Nothing about a stream tells you which of these a given CDN wants, and the
+   * wrong answer is a 403 (or, worse, a decoy playlist of advert images). So
+   * they are tried cheapest-first: browser-correct, then the full page address,
+   * then no origin at all, then the CDN as its own referer. Whoever answers is
+   * remembered and reused for every segment, because segments are guarded
+   * exactly like the playlist.
+   */
+  function headerLadder(url, headers) {
+    const tries = [];
+    const seen = new Set();
+    const push = (extra) => {
+      const attempt = {};
+      for (const [key, value] of Object.entries(extra)) {
+        if (value !== undefined && value !== null && value !== '') attempt[key] = value;
+      }
+      const key = JSON.stringify(attempt);
+      if (seen.has(key)) return;
+      seen.add(key);
+      tries.push(attempt);
+    };
+
+    const pageUrl = headers.referer || headers.Referer || '';
+    if (pageUrl) {
+      push({ ...headers, ...browserHeaders(pageUrl, url) });
+      push({ ...headers, accept: HLS_ACCEPT });
+    }
+    push({ ...headers, accept: HLS_ACCEPT, referer: undefined, origin: undefined });
+    /* No page to copy from, but this CDN is known to belong to one. */
+    const parent = knownParentReferer(url);
+    if (parent) {
+      push({ ...headers, ...browserHeaders(parent, url) });
+      push({ ...headers, accept: HLS_ACCEPT, referer: parent, origin: parent.replace(/\/$/, '') });
+    }
+    try {
+      const own = new URL(url).origin;
+      push({
+        accept: HLS_ACCEPT,
+        referer: `${own}/`,
+        origin: own,
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'user-agent': headers['user-agent'] || headers['User-Agent'],
+      });
+    } catch {
+      /* not a URL */
+    }
+    if (!tries.length) push({ ...headers });
+    return tries;
+  }
+
+  /**
+   * How big one segment is, so the whole stream can be estimated.
+   *
+   * A master playlist states BANDWIDTH and the arithmetic is free. A media
+   * playlist states nothing, and "0 MB" is not a size a person can plan around
+   * — the disk guard and the card both need a number. One HEAD for one segment
+   * is a few hundred bytes of traffic and gives a good answer, because a film
+   * is hundreds of pieces of roughly the same length.
+   */
+  async function probeSegmentBytes(url, headers) {
+    for (const method of ['HEAD', 'GET']) {
+      const res = await fetchWithTimeout(
+        url,
+        method === 'HEAD'
+          ? { method, headers: { 'user-agent': UA, ...headers }, redirect: 'follow' }
+          : { method, headers: { 'user-agent': UA, range: 'bytes=0-0', ...headers }, redirect: 'follow' },
+        3500,
+      ).catch(() => null);
+      if (!res) continue;
+      if (res.body && method === 'GET') res.body.cancel().catch(() => {});
+      const total = Number(
+        (res.headers.get('content-range') || '').split('/')[1] || res.headers.get('content-length') || 0,
+      );
+      if (Number.isFinite(total) && total > 0) return total;
+    }
+    return 0;
+  }
+
+  /** `name=value` pairs from a response's Set-Cookie, on top of the ones we had. */
+  function mergeCookies(existing, res) {
+    const jar = new Map();
+    for (const pair of String(existing || '').split(';')) {
+      const trimmed = pair.trim();
+      if (!trimmed) continue;
+      jar.set(trimmed.split('=')[0].trim(), trimmed);
+    }
+    const fresh =
+      typeof res.headers.getSetCookie === 'function'
+        ? res.headers.getSetCookie()
+        : [res.headers.get('set-cookie')].filter(Boolean);
+    for (const raw of fresh) {
+      for (const piece of String(raw).split(/,(?=[^;,]+=)/)) {
+        const pair = piece.split(';')[0].trim();
+        if (!pair || !pair.includes('=')) continue;
+        jar.set(pair.split('=')[0].trim(), pair);
+      }
+    }
+    return jar.size ? [...jar.values()].join('; ') : '';
+  }
+
+  async function fetchPlaylistText(url, headers = {}, { timeoutMs = 8000 } = {}) {
     let lastError = null;
     for (const attempt of headerLadder(url, headers)) {
-      const res = await fetchWithTimeout(url, {
-        headers: { 'user-agent': UA, accept: '*/*', ...attempt },
-        redirect: 'follow',
-      });
-      if (res.ok) {
+      const res = await fetchWithTimeout(
+        url,
+        { headers: { 'user-agent': UA, ...attempt }, redirect: 'follow' },
+        timeoutMs,
+      ).catch(() => null);
+      if (res && res.ok) {
         const text = await res.text();
         if (!/#EXTM3U|#EXT-X-|<MPD/i.test(text.slice(0, 4000))) {
           throw new ResolveError(
@@ -1037,9 +1201,12 @@
             'STREAM_NOT_A_PLAYLIST',
           );
         }
-        return { text, url: res.url || url, headers: attempt };
+        /* A CDN that hands out a session cookie on the first request expects it
+           back on every segment; ffmpeg gets the string with the headers. */
+        const cookie = mergeCookies(attempt.cookie, res);
+        return { text, url: res.url || url, headers: cookie ? { ...attempt, cookie } : attempt };
       }
-      if (res.status !== 401 && res.status !== 403) {
+      if (res && res.status !== 401 && res.status !== 403) {
         throw new ResolveError(`The stream's playlist answered HTTP ${res.status}.`, 'STREAM_BAD_STATUS');
       }
       lastError = new ResolveError(
@@ -1052,13 +1219,6 @@
     throw lastError || new ResolveError('The video server refused the request.', 'STREAM_FORBIDDEN');
   }
 
-  /**
-   * Everything worth knowing about a stream before downloading it: which URL to
-   * read, how long it is, how big it will be and in what resolution.
-   *
-   * `url` may be a master playlist (then the best variant is chosen) or a media
-   * playlist (then it is used as it is).
-   */
   async function inspectPlaylist(url, { headers = {} } = {}) {
     const key = String(url);
     const hit = streamInfoCache.get(key);
@@ -1113,8 +1273,12 @@
        the size of the download is duration × bitrate / 8. A rough number, but a
        rough number beats "unknown" on a 32 GB disk. */
     const bandwidth = chosen.bandwidth || 0;
-    const estimatedBytes =
+    let estimatedBytes =
       media.duration > 0 && bandwidth > 0 ? Math.round((media.duration * bandwidth) / 8) : 0;
+    if (!estimatedBytes && media.segments.length) {
+      const oneSegment = await probeSegmentBytes(media.segments[0], working).catch(() => 0);
+      if (oneSegment > 0) estimatedBytes = oneSegment * media.segments.length;
+    }
 
     const info = {
       url: chosen.uri,
@@ -1200,30 +1364,61 @@
   }
 
   /**
-   * Of several playlist URLs on one page, the one with the best picture.
+   * Of several playlist URLs on one page, the one that is the film.
    *
-   * A page with a quality selector lists one URL per quality; a page with an
-   * advert may list an ad's stream too. Reading each master is cheap (they are
-   * a few hundred bytes) and the answer is what the encoder wants. Anything
-   * that cannot be read in time is ignored rather than waited for.
+   * Three things decide it, in this order:
+   *
+   *   1. **Not a preview.** A sample is never the feature, whatever its
+   *      picture size, and these pages put the sample's URL right next to the
+   *      film's.
+   *   2. **How long it is.** The media playlist states the length as the sum of
+   *      its segments, so it costs nothing to read and it is the one fact an
+   *      advert or a preview cannot fake: two hours versus forty seconds. A
+   *      short clip at 1080p must lose to the feature at 720p — that is the
+   *      "only previews caught" report, exactly.
+   *   3. **How good it looks.** Between two long ones, the bigger picture wins;
+   *      then bitrate; then the longer one.
+   *
+   * A page with a quality selector lists one URL per quality, so the loser of
+   * rule 3 is simply the other rendition of the same film. Each probe is capped
+   * on its own, so one slow host cannot throw the whole comparison away.
    */
-  async function bestOf(urls, referer) {
-    const probes = urls.slice(0, 4).map((url) =>
-      inspectPlaylist(url, { headers: streamHeaders({ referer }) }).catch(() => null),
+  function durationClass(info) {
+    const seconds = Number(info && info.duration) || 0;
+    if (seconds >= 300) return 2; // a film
+    if (seconds >= 90) return 1; // at least a real scene, not a spot
+    return 0; // a preview, an advert, or unknown
+  }
+
+  async function rankStreams(urls, referer) {
+    const headers = streamHeaders({ referer });
+    const results = await Promise.all(
+      urls
+        .slice(0, 4)
+        .map((url) =>
+          inspectPlaylist(url, { headers })
+            .then((info) => ({ info, url }))
+            .catch(() => null),
+        ),
     );
-    const results = await Promise.race([
-      Promise.all(probes),
-      new Promise((resolve) => setTimeout(() => resolve([]), 6000)),
-    ]).catch(() => []);
-    const scored = results
-      .map((info, index) => ({ info, url: urls[index] }))
-      .filter((entry) => entry.info)
-      .sort((a, b) => {
-        const byHeight = (b.info.height || 0) - (a.info.height || 0);
-        if (byHeight) return byHeight;
-        return (b.info.bandwidth || 0) - (a.info.bandwidth || 0);
-      });
-    return scored.length ? scored[0].url : urls[0];
+    return results.filter(Boolean).sort((a, b) => {
+      const previewA = isPreviewUrl(a.url) ? 1 : 0;
+      const previewB = isPreviewUrl(b.url) ? 1 : 0;
+      if (previewA !== previewB) return previewA - previewB;
+      const classA = durationClass(a.info);
+      const classB = durationClass(b.info);
+      if (classA !== classB) return classB - classA;
+      const byHeight = (b.info.height || 0) - (a.info.height || 0);
+      if (byHeight) return byHeight;
+      const byBandwidth = (b.info.bandwidth || 0) - (a.info.bandwidth || 0);
+      if (byBandwidth) return byBandwidth;
+      return (b.info.duration || 0) - (a.info.duration || 0);
+    });
+  }
+
+  async function bestOf(urls, referer) {
+    const ranked = await rankStreams(urls, referer);
+    return ranked.length ? ranked[0].url : urls[0];
   }
 
   const stream = {
@@ -2059,23 +2254,39 @@ function preferPageName(urlName, pageName) {
            quality selector. Quality first, so the best of them is chosen here
            and the rest are not offered as separate files to choose between. */
         const unique = [...new Set(playlists.map((url) => url.split('#')[0]))];
-        const chosen = unique.length > 1 ? await bestOf(unique, base) : unique[0];
+        const ranked = unique.length > 1 ? await rankStreams(unique, base) : [];
+        const chosen = ranked.length ? ranked[0].url : unique[0];
         const titleName = displayName || fileNameFromTitle(pageTitleOf(html) || '');
-        const files = [chosen].map((streamUrl, index) => {
-          const name = index === 0 && titleName ? titleName : `stream-${index + 1}.mp4`;
-          return {
-            id: streamUrl,
-            name,
-            size: 0,
-            mime: 'application/vnd.apple.mpegurl',
-            kind: 'video',
-            note: 'stream',
-            ref: { resolver: 'stream', url: streamUrl, name, referer: base },
-          };
-        });
+        const info = await inspectPlaylist(chosen, {
+          headers: streamHeaders({ referer: base }),
+        }).catch(() => null);
+        const files = [
+          streamFileEntry(chosen, {
+            name: titleName || undefined,
+            referer: base,
+            quality: info && info.height ? info.height : null,
+            duration: info && info.duration ? info.duration : 0,
+            estimatedBytes: info && info.estimatedBytes ? info.estimatedBytes : 0,
+            preview: Boolean(info && info.duration > 0 && info.duration < 90),
+          }),
+        ];
         /* The page's own <title> travels with the job: the card shows the tab
            name of the page the link came from, not the file that comes out. */
-        return { resolver: 'stream', title: null, pageTitle: pageTitleOf(html) || null, files };
+        return {
+          resolver: 'stream',
+          title: null,
+          pageTitle: pageTitleOf(html) || null,
+          files,
+          /* Every playlist the page offered, longest first: the doctor prints
+             this, and it is how "it caught the preview" gets diagnosed instead
+             of guessed at. */
+          streamCandidates: ranked.map((entry) => ({
+            url: entry.url,
+            duration: entry.info.duration || 0,
+            height: entry.info.height || 0,
+            preview: isPreviewUrl(entry.url),
+          })),
+        };
       }
 
       if (!urls.length) {
@@ -2251,9 +2462,14 @@ function preferPageName(urlName, pageName) {
     const userAgent = (dom && dom.userAgent) || null;
 
     if (dom && dom.html) {
-      const playlists = extractPlaylistUrls(dom.html, pageUrl).filter(
-        (candidate) => !isAdUrl(candidate) && !looksLikeMediaSegment(candidate),
-      );
+      /* What the HTML names *and* what the player actually asked for. The two
+         can disagree: a page states its preview in the markup and builds the
+         film's playlist in JavaScript, so taking the HTML alone picks the
+         sample. They are ranked together, longest first. */
+      const playlists = [
+        ...extractPlaylistUrls(dom.html, pageUrl),
+        ...(Array.isArray(dom.media) ? dom.media.map((item) => item && item.url).filter(isPlaylistUrl) : []),
+      ].filter((candidate) => candidate && !isAdUrl(candidate) && !looksLikeMediaSegment(candidate));
       if (playlists.length) {
         const unique = [...new Set(playlists.map((item) => item.split('#')[0]))];
         const chosen = unique.length > 1 ? await bestOf(unique, pageUrl) : unique[0];
@@ -2261,7 +2477,19 @@ function preferPageName(urlName, pageName) {
           pageDisplayName(dom.html) ||
           fileNameFromTitle(dom.title || pageTitleOf(dom.html)) ||
           nameForStream(chosen, {});
-        const file = streamFileEntry(chosen, { name, referer: pageUrl, cookie, userAgent });
+        const detail = await inspectPlaylist(chosen, {
+          headers: streamHeaders({ referer: pageUrl, cookie, userAgent }),
+        }).catch(() => null);
+        const file = streamFileEntry(chosen, {
+          name,
+          referer: pageUrl,
+          cookie,
+          userAgent,
+          quality: detail && detail.height ? detail.height : null,
+          duration: detail && detail.duration ? detail.duration : 0,
+          estimatedBytes: detail && detail.estimatedBytes ? detail.estimatedBytes : 0,
+          preview: Boolean(detail && detail.duration > 0 && detail.duration < 90),
+        });
         return {
           resolver: 'stream',
           title: null,
@@ -2301,23 +2529,38 @@ function preferPageName(urlName, pageName) {
       }
     }
 
+    /* No playlist in the HTML. The same visit already watched the player make
+       its requests (a second launch would cost another bot check), so rank
+       *those* — by length first, then picture — instead of asking again. */
+    const observed = Array.isArray(dom && dom.media) ? dom.media : null;
+    if (observed && observed.length) {
+      const listed = await filesFromBrowserMedia(observed, { ...(dom || {}), fallbackUrl: pageUrl });
+      if (listed && listed.length) return { resolver: 'browser', title: null, files: listed };
+    }
     const media = await pageBrowserFiles(url);
     if (media && media.length) return { resolver: 'browser', title: null, files: media };
     return null;
   }
 
   /** One entry for a stream: the shape the page and the browser both produce. */
-  function streamFileEntry(streamUrl, { name, referer, cookie, userAgent, quality, mime } = {}) {
+  function streamFileEntry(
+    streamUrl,
+    { name, referer, cookie, userAgent, quality, mime, duration, estimatedBytes, preview } = {},
+  ) {
     const fileName = String(name || nameForStream(streamUrl, { height: Number(quality) || 0 }))
       .replace(/\.(m3u8|mpd)$/i, '.mp4');
+    const minutes = Number(duration) > 0 ? Math.max(1, Math.round(Number(duration) / 60)) : 0;
     return {
       id: streamUrl,
       name: fileName,
-      size: 0,
+      size: Number(estimatedBytes) || 0,
       mime: mime || 'application/vnd.apple.mpegurl',
       kind: 'video',
       quality: quality ? `${quality}p` : null,
-      note: 'stream',
+      /* The length is what tells a film apart from a sample, so it belongs on
+         the card, not only in the encoder. */
+      duration: Number(duration) || 0,
+      note: preview ? 'a short preview, not the film' : minutes ? `stream · ${minutes} min` : 'stream',
       ref: {
         resolver: 'stream',
         url: streamUrl,
@@ -2329,51 +2572,72 @@ function preferPageName(urlName, pageName) {
     };
   }
 
-  async function pageBrowserFiles(url) {
-    if (!pageBrowserHook) return null;
-    try {
-      const result = await pageBrowserHook(url);
-      const media = Array.isArray(result) ? result : (result && result.media) || [];
-      /* A player that streams reports every segment as "media": hundreds of
-         URLs that are pieces of one video, not hundreds of videos. Only the
-         playlist is a file worth listing. */
-      const playable = media.filter((item) => {
-        if (!item || !item.url || isAdUrl(item.url)) return false;
-        if (isPlaylistUrl(item.url)) return true;
-        /* Everything else must be a whole file: a segment is a piece of one,
-           and an advert pretending to be a file is not the video. */
-        return !looksLikeMediaSegment(item.url);
-      });
+  /**
+   * Turn what a browser saw into files, dropping everything that is not a
+   * video: adverts, segments, and — when ranking playlists — the shorter one.
+   */
+  async function filesFromBrowserMedia(
+    rawMedia,
+    { cookie = null, userAgent = null, title = null, fallbackUrl = null } = {},
+  ) {
+    const media = Array.isArray(rawMedia) ? rawMedia : [];
+    const pageUrl = fallbackUrl || '';
 
-      /* A stream wins over anything else the browser saw: the .mp4s on such a
-         page are adverts (and the ad filter above only knows the ones it has
-         heard of). Several playlists mean the page's own quality selector, so
-         the best one is chosen, exactly like a page that names them in HTML. */
-      const playlistUrls = [...new Set(playable.filter((item) => isPlaylistUrl(item.url)).map((item) => item.url))];
-      if (playlistUrls.length) {
-        const chosen = playlistUrls.length > 1 ? await bestOf(playlistUrls, url) : playlistUrls[0];
-        const item = playable.find((entry) => entry.url === chosen) || { url: chosen };
-        /* The browser knows the clearance cookie it earned, and the user agent
-           that earned it — both are needed again by the CDN. */
-        const cookie = item.cookie || (result && result.cookie) || null;
-        const userAgent = item.userAgent || (result && result.userAgent) || null;
-        const referer = item.referer || url;
-        const info = await inspectPlaylist(chosen, {
-          headers: streamHeaders({ referer, cookie, userAgent }),
-        }).catch(() => null);
-        return [
-          streamFileEntry(chosen, {
-            name: (result && result.title && fileNameFromTitle(result.title)) || undefined,
-            referer,
-            cookie,
-            userAgent,
-            quality: info && info.height ? info.height : null,
-            mime: item.contentType,
-          }),
-        ];
-      }
+    /* A player that streams reports every segment as "media": hundreds of
+       URLs that are pieces of one video, not hundreds of videos. Only the
+       playlist is a file worth listing. */
+    const playable = media.filter((item) => {
+      if (!item || !item.url || isAdUrl(item.url)) return false;
+      if (isPlaylistUrl(item.url)) return true;
+      /* Everything else must be a whole file: a segment is a piece of one,
+         and an advert pretending to be a file is not the video. */
+      return !looksLikeMediaSegment(item.url);
+    });
 
-      const files = playable.slice(0, 12).map((item, index) => {
+    /* A stream wins over anything else the browser saw: the .mp4s on such a
+       page are adverts (and the ad filter above only knows the ones it has
+       heard of). Several playlists mean the page's own quality selector — or a
+       preview next to the feature — so `bestOf` weighs them by length and
+       picture, exactly like a page that names them in HTML. */
+    const playlistUrls = [...new Set(playable.filter((item) => isPlaylistUrl(item.url)).map((item) => item.url))];
+    if (playlistUrls.length) {
+      const chosen = playlistUrls.length > 1 ? await bestOf(playlistUrls, pageUrl) : playlistUrls[0];
+      const item = playable.find((entry) => entry.url === chosen) || { url: chosen };
+      /* The browser knows the clearance cookie it earned, and the user agent
+         that earned it — both are needed again by the CDN. */
+      const refCookie = item.cookie || cookie || null;
+      const refUserAgent = item.userAgent || userAgent || null;
+      const referer = item.referer || pageUrl;
+      const info = await inspectPlaylist(chosen, {
+        headers: streamHeaders({ referer, cookie: refCookie, userAgent: refUserAgent }),
+      }).catch(() => null);
+      return [
+        streamFileEntry(chosen, {
+          name: (title && fileNameFromTitle(title)) || undefined,
+          referer,
+          cookie: refCookie,
+          userAgent: refUserAgent,
+          quality: info && info.height ? info.height : null,
+          duration: (info && info.duration) || 0,
+          estimatedBytes: (info && info.estimatedBytes) || 0,
+          preview: Boolean(info && info.duration > 0 && info.duration < 90),
+          mime: item.contentType,
+        }),
+      ];
+    }
+
+    /* Whole files only, and a preview sorts below a film: a page can carry
+       both a two-minute sample and the real download link. */
+    const files = playable
+      .slice()
+      .sort((a, b) => {
+        const previewA = isPreviewUrl(a.url) ? 1 : 0;
+        const previewB = isPreviewUrl(b.url) ? 1 : 0;
+        if (previewA !== previewB) return previewA - previewB;
+        return (Number(b.size) || 0) - (Number(a.size) || 0);
+      })
+      .slice(0, 12)
+      .map((item, index) => {
         let name = `video-${index + 1}.mp4`;
         try {
           const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
@@ -2391,13 +2655,21 @@ function preferPageName(urlName, pageName) {
             resolver: 'direct',
             url: item.url,
             name,
-            referer: item.referer || url,
-            cookie: item.cookie || (result && result.cookie) || null,
-            userAgent: item.userAgent || (result && result.userAgent) || null,
+            referer: item.referer || pageUrl,
+            cookie: item.cookie || cookie || null,
+            userAgent: item.userAgent || userAgent || null,
           },
         };
       });
-      return files.length ? files : null;
+    return files.length ? files : null;
+  }
+
+  async function pageBrowserFiles(url) {
+    if (!pageBrowserHook) return null;
+    try {
+      const result = await pageBrowserHook(url);
+      const media = Array.isArray(result) ? result : (result && result.media) || [];
+      return await filesFromBrowserMedia(media, { ...(result || {}), fallbackUrl: url });
     } catch {
       return null;
     }
@@ -2438,12 +2710,14 @@ function preferPageName(urlName, pageName) {
     isPlaylistUrl,
     isAdUrl,
     isAdCreativeUrl,
+    isPreviewUrl,
     looksLikeMediaSegment,
     extractPlaylistUrls,
     parsePlaylistText,
     pickBestVariant,
     variantHeight,
     inspectPlaylist,
+    rankStreams,
     nameForStream,
     fileNameFromTitle,
     clearStreamCache,

@@ -343,6 +343,44 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
     const page = await context.newPage();
+
+    /* One visit has to answer three questions — what does the HTML say, what
+       did the player actually request, and how long was the video — because a
+       second visit costs another Cloudflare challenge and can drop the
+       clearance the first one earned. */
+    const seen = new Map();
+    const remember = (rawUrl, meta = {}) => {
+      if (!rawUrl || !/^https?:/i.test(rawUrl)) return;
+      const clean = rawUrl.split('#')[0];
+      if (!MEDIA.test(clean) && !meta.force) return;
+      if (seen.has(clean)) return;
+      seen.set(clean, {
+        url: clean,
+        contentType: meta.contentType || '',
+        size: Number(meta.size) || 0,
+        referer: meta.referer || '',
+        cookie: meta.cookie || '',
+      });
+    };
+    page.on('request', (request) => {
+      const headers = request.headers();
+      remember(request.url(), {
+        force: request.resourceType() === 'media',
+        referer: headers.referer || '',
+        cookie: headers.cookie || '',
+      });
+    });
+    page.on('response', (response) => {
+      const type = (response.headers()['content-type'] || '').toLowerCase();
+      if (type.startsWith('video/') || type === 'application/octet-stream' || PLAYLIST_TYPE.test(type)) {
+        remember(response.url(), {
+          force: true,
+          contentType: type,
+          size: response.headers()['content-length'],
+        });
+      }
+    });
+
     const started = Date.now();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
 
@@ -361,6 +399,32 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
     }
     await page.waitForTimeout(settleMs);
 
+    /* A player that has not started has not requested its playlist, and a page
+       whose video only appears on a click looks identical to a page with no
+       video at all. Press play the ways a person does, then give the player a
+       few seconds to ask for its manifest. */
+    const playlistsSeen = () => [...seen.keys()].filter((candidate) => /\.(m3u8|mpd)(?:\?|$)/i.test(candidate));
+    if (!playlistsSeen().length) {
+      for (const selector of ['video', 'button[class*="play" i]', '[class*="player" i]', '[class*="vjs" i]']) {
+        const target = page.locator(selector).first();
+        if (await target.count().catch(() => 0)) {
+          await target.click({ timeout: 1500, force: true }).catch(() => {});
+        }
+      }
+      await page
+        .evaluate(() => {
+          for (const video of document.querySelectorAll('video')) {
+            video.muted = true;
+            Promise.resolve(video.play && video.play()).catch(() => {});
+          }
+        })
+        .catch(() => {});
+      const deadline = Date.now() + Math.min(12_000, Math.max(3_000, timeoutMs - (Date.now() - started)));
+      while (Date.now() < deadline && !playlistsSeen().length) {
+        await page.waitForTimeout(500);
+      }
+    }
+
     /* The player is often in an iframe on another host, and that frame's HTML
        is where its playlist lives — the main document's HTML would miss it. */
     const mainHtml = await page.content().catch(() => '');
@@ -376,6 +440,7 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
       url: page.url(),
       title: await page.title().catch(() => title),
       html,
+      media: [...seen.values()],
       cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
       /* cf_clearance is bound to the user agent that earned it, so the
          download has to use this exact string. */

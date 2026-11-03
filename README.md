@@ -248,11 +248,33 @@ filtered out before anything looked at them, and the ad was what remained.
   `_1324_<token>_<timestamp>`) and by directory (`/hls/`, `/dash/`), and dropped everywhere a file
   list is built. If that leaves nothing, the app says it found no video instead of showing twelve
   adverts with a **Compress** button each.
+* **A preview is never mistaken for the film.** Porn sites publish a two-minute sample beside a
+  two-hour feature, and the sample is often the *better encoded* of the two — so "highest quality"
+  alone picks the sample. The ranking is therefore: not a preview by name (`preview.mp4`,
+  `FNS-257_PR.mp4`, `tr_720p.mp4`, `sample.m3u8`), then **how long it runs** (read from the media
+  playlist's segments, which costs nothing and cannot be faked), then the picture. A 1080p sample
+  loses to a 720p feature, every time. When only a short preview exists, the card says so instead of
+  passing it off as the film, and the doctor says it in one sentence.
+* **The referer is what a browser would send, not the address you pasted.** A cross-site subresource
+  is sent with `strict-origin-when-cross-origin`, so the CDN sees `https://missav.ws/` and never the
+  deep link — surrit.com serves its playlist to the origin form only. The full page address is tried
+  next, then no referer at all, then the CDN as its own referer. A **bare** playlist pasted on its
+  own has no page to copy from, so a short table of known CDN → parent site supplies it
+  (surrit.com → missav.ws). Whatever is accepted is reused for every segment, together with any
+  session cookie the playlist handed out — ffmpeg would otherwise fetch each piece as a stranger.
+* **One browser visit answers everything.** The HTML, the requests the player made, the cookies and
+  the title all come from a single launch, because a second visit costs another bot check and can
+  lose the clearance the first one earned. If no playlist has appeared yet, the player is started
+  (a real click, then a muted `play()`) and given a few seconds to ask for its manifest.
 * **A page behind a bot check is read through the browser's *HTML*, not its network log.** This
   was the missav report: the plain request got 403, the app fell straight to the browser's captured
   requests (which were ad segments), and the playlist — sitting in an inline script, exactly where
   HLS players put it — was never looked at. The order is now: rendered HTML (frames included) →
   a video URL in the DOM → the network capture, last.
+* **A size you can plan around.** A master playlist states its bandwidth and the arithmetic is
+  free; a media playlist states nothing, and "0 MB" is not a size. One `HEAD` for one segment,
+  multiplied by the number of segments, estimates the whole download within a few percent — the disk
+  guard and the card both need that number.
 * **The stream is remuxed, not re-encoded.** ffmpeg pulls every segment and writes them into one
   MP4 with `-c copy` — the frames are exactly the host's — and the normal pipeline takes it from
   there (720p floor, size check, share link, resume). The file is assembled under a `.part` name
@@ -907,10 +929,12 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
-- `npm run test:resolve` — 61 resolver tests against stubbed APIs (real response shapes),
+- `npm run test:resolve` — 66 resolver tests against stubbed APIs (real response shapes),
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before
-  a minted link, plus the page-title naming rule and fileditch's minted-link/player routes.
+  a minted link, plus the page-title naming rule and fileditch's minted-link/player routes. It also
+  replays the missav report: a bot-checked page whose network log is twelve ad segments, a page that
+  offers a 1080p preview next to a 720p film, and the referer a browser would actually send.
 - `npm run test:hooks` — 20 checks that the browser is registered once and reaches every caller:
   a JS-built download button is found, the cookie and its user agent are carried to the fetch, the
   rendered DOM is cached, the doctor resolves the same link the worker does, with no browser

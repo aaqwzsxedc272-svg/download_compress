@@ -13,7 +13,7 @@
 
 const UA = 'Squeeze/1.0 (diagnostics)';
 
-const MB = (bytes) => `${(Number(bytes) / 1048576).toFixed(1)} MB`;
+const MB = (bytes) => (Number(bytes) > 0 ? `${(Number(bytes) / 1048576).toFixed(1)} MB` : 'size unknown');
 
 /** "48 s" reads better than "0 min" for a short clip. */
 const durationText = (seconds) => {
@@ -215,7 +215,8 @@ async function diagnose(url, { browser } = {}) {
      was picked and what is in it. */
   if (steps.resolve && steps.resolve.ok && steps.resolve.value.files.some((file) => file.stream)) {
     const { inspectPlaylist, resolve: resolveAgain } = require('../shared/resolve');
-    const ref = (await resolveAgain(url).catch(() => null))?.files?.[0]?.ref;
+    const resolved = await resolveAgain(url).catch(() => null);
+    const ref = resolved?.files?.[0]?.ref;
     steps.stream = await timed(async () => {
       const info = await inspectPlaylist(ref.url, {
         headers: {
@@ -233,6 +234,15 @@ async function diagnose(url, { browser } = {}) {
         variants: (info.variants || []).map((variant) => ({
           quality: variant.height ? `${variant.height}p` : variant.name || 'unknown',
           bandwidth: variant.bandwidth,
+        })),
+        /* The playlists the page offered and how long each one runs — the
+           difference between the film and the sample beside it. */
+        candidates: (resolved.streamCandidates || []).map((entry) => ({
+          durationSeconds: Math.round(entry.duration || 0),
+          quality: entry.height ? `${entry.height}p` : 'unknown',
+          preview: Boolean(entry.preview),
+          chosen: ref && entry.url === ref.url,
+          url: redact(entry.url),
         })),
       };
     });
@@ -299,9 +309,20 @@ function verdictFor(steps) {
   if (steps.stream) {
     if (!steps.stream.ok) return `The stream was found but could not be read: ${steps.stream.error}. Send this block.`;
     const chosen = steps.stream.value;
+    if (chosen.durationSeconds > 0 && chosen.durationSeconds < 90) {
+      const others = (chosen.candidates || []).filter((entry) => !entry.chosen);
+      return (
+        `The stream this page offers is only ${durationText(chosen.durationSeconds)} long — that is a preview or ` +
+        'a spot, not the film.' +
+        (others.length
+          ? ` The other playlists on the page were ${others.map((entry) => durationText(entry.durationSeconds)).join(', ')}.`
+          : ' The page did not offer anything longer.') +
+        ' Send this block.'
+      );
+    }
     return (
       `This page streams its video: the best quality on offer is ${chosen.quality}, ` +
-      `${durationText(chosen.durationSeconds)}, about ${MB(chosen.estimatedBytes)} — ` +
+      `${durationText(chosen.durationSeconds)}, ${MB(chosen.estimatedBytes)} — ` +
       'the app downloads exactly that and then compresses it.'
     );
   }
@@ -389,12 +410,23 @@ function render({ url, steps }) {
     else {
       const v = steps.stream.value;
       lines.push(
-        `stream    ${v.quality} · ${durationText(v.durationSeconds)} · about ${MB(v.estimatedBytes)} · ` +
+        `stream    ${v.quality} · ${durationText(v.durationSeconds)} · ${MB(v.estimatedBytes)} · ` +
           `${v.segments} segments`,
       );
       lines.push(`          playing ${v.chosen}`);
       if (v.variants.length > 1) {
         lines.push(`          qualities offered: ${v.variants.map((variant) => variant.quality).join(', ')}`);
+      }
+      if (v.candidates && v.candidates.length > 1) {
+        /* Which of the page's playlists won, and what it beat. A sample beside
+           the feature is obvious here and invisible on the card. */
+        lines.push('          playlists on the page:');
+        for (const entry of v.candidates) {
+          lines.push(
+            `            ${entry.chosen ? '→' : ' '} ${durationText(entry.durationSeconds)} · ${entry.quality}` +
+              `${entry.preview ? ' · a preview by name' : ''} · ${entry.url}`,
+          );
+        }
       }
     }
   }

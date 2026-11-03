@@ -16,6 +16,7 @@ const {
   extractPlaylistUrls,
   isAdUrl,
   isAdCreativeUrl,
+  isPreviewUrl,
   looksLikeMediaSegment,
   parsePlaylistText,
   pickBestVariant,
@@ -938,6 +939,122 @@ seg0.ts
         /paste the page/i.test(err.message) &&
         !/^HTTP 403/.test(err.message),
     );
+  });
+
+  /* The page advertises a *preview* and the film, and the preview is the
+     better-encoded of the two — 1080p against the film's 720p. "Highest
+     quality" alone picks the preview, which is the second half of the report:
+     "only previews caught not the real video". */
+  const FILM_PLAYLIST = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.006,
+https://cdn.example/film/video0.ts
+${Array.from({ length: 1199 }, (_, i) => `#EXTINF:6.006,\nhttps://cdn.example/film/video${i + 1}.ts`).join('\n')}
+#EXT-X-ENDLIST
+`;
+  const PREVIEW_PLAYLIST = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+${Array.from({ length: 20 }, (_, i) => `#EXTINF:6.006,\nhttps://cdn.example/preview/video${i}.ts`).join('\n')}
+#EXT-X-ENDLIST
+`;
+
+  await test('a two-hour film beats a two-minute preview, even at a smaller picture', async () => {
+    clearStreamCache();
+    stubFetch((url) => {
+      if (url.includes('/preview/')) {
+        return { raw: PREVIEW_PLAYLIST.replace(/cdn\.example\/preview/, 'cdn.example/preview'), type: 'application/vnd.apple.mpegurl' };
+      }
+      if (url.includes('preview.m3u8')) return { raw: PREVIEW_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+      return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+    });
+    const page = `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+      <video src="https://cdn.example/preview.m3u8"></video>
+      <script>player.setup({ file: "https://surrit.com/91f6/playlist.m3u8" });</script>
+    </body></html>`;
+    stubFetch((url) => {
+      if (url.startsWith('https://missav.ws/')) return { raw: page, type: 'text/html' };
+      if (url.includes('preview.m3u8')) {
+        return { raw: PREVIEW_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+      }
+      return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+    });
+    const result = await resolve('https://missav.ws/en/dandya-045');
+    assert.equal(result.files.length, 1);
+    assert.match(result.files[0].ref.url, /surrit\.com\/91f6\/playlist\.m3u8$/);
+  });
+
+  await test('and a preview alone is labelled for what it is, not sold as the film', async () => {
+    clearStreamCache();
+    stubFetch(() => ({ raw: PREVIEW_PLAYLIST, type: 'application/vnd.apple.mpegurl' }));
+    const info = await inspectPlaylist('https://cdn.example/preview.m3u8');
+    assert.ok(isPreviewUrl('https://cdn.example/preview.m3u8'));
+    assert.ok(info.duration > 0 && info.duration < 180, `duration ${info.duration}`);
+  });
+
+  await test('the referer sent to the CDN is the page origin, as a browser sends it', async () => {
+    clearStreamCache();
+    const calls = [];
+    stubFetch((url, init) => {
+      const headers = (init && init.headers) || {};
+      calls.push({ url, referer: headers.referer || '', origin: headers.origin || '', site: headers['sec-fetch-site'] || '' });
+      return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+    });
+    await inspectPlaylist('https://surrit.com/91f6/playlist.m3u8', {
+      headers: { referer: 'https://missav.ws/en/dandya-045' },
+    });
+    assert.ok(calls.length > 0);
+    const first = calls[0];
+    assert.equal(first.referer, 'https://missav.ws/', 'the origin, not the deep link');
+    assert.equal(first.origin, 'https://missav.ws');
+    assert.equal(first.site, 'cross-site');
+  });
+
+  await test('a bare surrit link borrows the site that embeds it', async () => {
+    clearStreamCache();
+    const seen = [];
+    stubFetch((url, init) => {
+      const referer = ((init && init.headers) || {}).referer || '';
+      seen.push(referer);
+      if (referer.startsWith('https://missav.ws')) {
+        return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+      }
+      return { raw: 'forbidden', type: 'text/plain', status: 403 };
+    });
+    const info = await inspectPlaylist('https://surrit.com/91f6b5f7/playlist.m3u8');
+    assert.ok(info.duration > 0);
+    assert.ok(seen.includes('https://missav.ws/'), JSON.stringify(seen));
+    assert.equal(info.headers.referer, 'https://missav.ws/');
+  });
+
+  await test('the browser path ranks the film it saw above the preview the HTML named', async () => {
+    clearStreamCache();
+    /* The page is bot-checked, so only the browser gets the HTML — and the
+       HTML names the preview. The player's own request is the film. */
+    stubFetch((url) => {
+      if (url.startsWith('https://missav.ws/')) {
+        return { raw: '<html><title>Just a moment...</title></html>', type: 'text/html', status: 403 };
+      }
+      if (url.includes('/preview')) return { raw: PREVIEW_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+      return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+    });
+    setPageHtmlBrowser(async () => ({
+      title: 'DANDYA-045 - MissAV',
+      url: 'https://missav.ws/en/dandya-045',
+      cookie: 'cf_clearance=abc',
+      html: `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+        <video src="https://cdn.example/preview.m3u8"></video></body></html>`,
+      media: [{ url: 'https://surrit.com/91f6/playlist.m3u8', contentType: 'application/vnd.apple.mpegurl' }],
+    }));
+    try {
+      const result = await resolve('https://missav.ws/en/dandya-045');
+      assert.equal(result.files.length, 1);
+      assert.match(result.files[0].ref.url, /surrit\.com\/91f6\/playlist\.m3u8$/, result.files[0].ref.url);
+      assert.match(result.files[0].note, /min/);
+    } finally {
+      setPageHtmlBrowser(null);
+    }
   });
 
   await test('a stream whose playlist is really a web page says so', async () => {

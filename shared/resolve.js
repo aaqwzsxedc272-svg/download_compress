@@ -781,8 +781,65 @@
       return false;
     }
     if (AD_HOST.test(parsed.hostname)) return true;
+    if (isAdCreativeUrl(url)) return true;
     const path = `${parsed.pathname}${parsed.search}`;
     return AD_PATH.test(path) && !/\.(m3u8|mpd)$/i.test(parsed.pathname);
+  }
+
+  /**
+   * Is this URL a *piece* of a video rather than a video?
+   *
+   * A page that streams reports its segments as ordinary media requests, and
+   * they are shaped exactly like files. The report that produced this list —
+   * twelve "files", 1.4 MB altogether, one of them a 300x250 banner and the rest
+   * `117761513_240p_h264_init_…mp4`, `…_1324_…mp4`, `…_1325_…mp4` — is what a
+   * segment list looks like when nobody noticed. Offering them to a person is
+   * worse than offering nothing: each one is a fifth of a second of an advert.
+   *
+   * Rules, in order of how sure they are:
+   *   - a segment extension (.ts, .m4s, CMAF) is never a file;
+   *   - `init` segments (fMP4/CMAF) only exist to start a stream;
+   *   - a numbered piece (`seg12`, `chunk_4`, `_1324_`, `part-3`) is a piece.
+   */
+  function looksLikeMediaSegment(rawUrl) {
+    let parsed;
+    try {
+      parsed = new URL(String(rawUrl || ''));
+    } catch {
+      return false;
+    }
+    const path = parsed.pathname;
+    if (/\.(ts|m4s|cmfv|cmfa|cmft)$/i.test(path)) return true;
+    const name = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');
+    if (/^(?:init|init-\w+)\.(?:mp4|m4s)$/i.test(name)) return true;
+    if (/(?:^|[._-])init(?:[._-]|$)/i.test(name)) return true;
+    /* `…_1324_kztiJgf5nAdkJ7y9_1793730536.mp4`: a sequence number, an opaque
+       token and a timestamp — the shape every ad server and most packagers use
+       for one segment of a fragmented stream. */
+    if (/^\d+_\w+_\d+_[A-Za-z0-9_-]+_\d{9,}\.mp4$/i.test(name)) return true;
+    if (/(?:^|[._-])(?:seg|segment|chunk|frag|fragment|part|piece)[._-]?\d+(?:[._-]|$)/i.test(name)) return true;
+    if (/(?:^|[._-])(?:seg|segment|chunk|part)[._-]?\d+\.(?:ts|m4s|mp4)$/i.test(name)) return true;
+    /* A directory that says what it is holding. */
+    if (/\/(?:hls|dash|segments?|chunks?)\//i.test(path) && /\.(?:mp4|m4s|ts)$/i.test(path)) return true;
+    return false;
+  }
+
+  /**
+   * An advert dressed as a video file.
+   *
+   * The banner in the report was called `9558-0-300x250.medium.mp4`: an IAB
+   * size in the name, which no video a person wants is called. The host and
+   * path checks in `isAdUrl` cannot see that, so the name gets a look too.
+   */
+  function isAdCreativeUrl(rawUrl) {
+    let name = '';
+    try {
+      name = decodeURIComponent(new URL(String(rawUrl || '')).pathname.split('/').filter(Boolean).pop() || '');
+    } catch {
+      return false;
+    }
+    if (/\b\d{2,4}x\d{2,4}\b/.test(name) && !/\b(?:1920|1280|720|1080|2160|3840)x\d{3,4}\b/.test(name)) return true;
+    return /(?:^|[._-])(?:banner|preroll|pre-roll|midroll|overlay|creative|vast|vpaid)(?:[._-]|$)/i.test(name);
   }
 
   /** `#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=512000,RESOLUTION=1280x720` */
@@ -929,28 +986,70 @@
     streamInfoCache.clear();
   }
 
-  async function fetchPlaylistText(url, headers) {
-    const res = await fetchWithTimeout(url, {
-      headers: { 'user-agent': UA, accept: '*/*', ...headers },
-      redirect: 'follow',
-    });
-    if (!res.ok) {
-      throw new ResolveError(
-        res.status === 403 || res.status === 401
-          ? 'The video server refused the request (it wants the page it belongs to as the referer). ' +
-            'Open the page the stream is on and paste that link instead.'
-          : `The stream's playlist answered HTTP ${res.status}.`,
-        res.status === 403 || res.status === 401 ? 'STREAM_FORBIDDEN' : 'STREAM_BAD_STATUS',
+  /**
+   * The header sets a CDN might want, in the order worth trying.
+   *
+   * A bare playlist pasted on its own carries no referer, and a CDN that only
+   * serves its streams to the site that embeds them answers 403 — which is
+   * exactly what was reported ("the video server refused the request"). The
+   * page path has the right referer already; a pasted stream does not, so the
+   * next best guesses are tried: the CDN's own origin (some check "referer is
+   * me"), then a same-site fetch shape. Whoever answers is remembered, and the
+   * download reuses those exact headers, because the segments are guarded the
+   * same way.
+   */
+  function headerLadder(url, headers) {
+    const attempts = [headers];
+    if (!headers.referer) {
+      let origin = null;
+      try {
+        origin = new URL(url).origin;
+      } catch {
+        /* not a URL */
+      }
+      if (origin) {
+        attempts.push({
+          ...headers,
+          referer: `${origin}/`,
+          origin,
+          'sec-fetch-dest': 'video',
+          'sec-fetch-mode': 'cors',
+          'sec-fetch-site': 'same-origin',
+        });
+        attempts.push({ ...headers, referer: `${origin}/`, origin });
+      }
+    }
+    return attempts;
+  }
+
+  async function fetchPlaylistText(url, headers = {}) {
+    let lastError = null;
+    for (const attempt of headerLadder(url, headers)) {
+      const res = await fetchWithTimeout(url, {
+        headers: { 'user-agent': UA, accept: '*/*', ...attempt },
+        redirect: 'follow',
+      });
+      if (res.ok) {
+        const text = await res.text();
+        if (!/#EXTM3U|#EXT-X-|<MPD/i.test(text.slice(0, 4000))) {
+          throw new ResolveError(
+            'That link answered with a page instead of a playlist — the stream link is probably generated by the page itself.',
+            'STREAM_NOT_A_PLAYLIST',
+          );
+        }
+        return { text, url: res.url || url, headers: attempt };
+      }
+      if (res.status !== 401 && res.status !== 403) {
+        throw new ResolveError(`The stream's playlist answered HTTP ${res.status}.`, 'STREAM_BAD_STATUS');
+      }
+      lastError = new ResolveError(
+        'The video server refused the request. A stream like this is usually served only to the page it is ' +
+          'embedded in, and this link arrived without that page. Paste the page the video plays on, or open ' +
+          'the page in a browser and copy the .m3u8 address it actually requests.',
+        'STREAM_FORBIDDEN',
       );
     }
-    const text = await res.text();
-    if (!/#EXTM3U|#EXT-X-|<MPD/i.test(text.slice(0, 4000))) {
-      throw new ResolveError(
-        'That link answered with a page instead of a playlist — the stream link is probably generated by the page itself.',
-        'STREAM_NOT_A_PLAYLIST',
-      );
-    }
-    return { text, url: res.url || url };
+    throw lastError || new ResolveError('The video server refused the request.', 'STREAM_FORBIDDEN');
   }
 
   /**
@@ -966,6 +1065,8 @@
     if (hit && Date.now() - hit.at < STREAM_TTL) return hit.value;
 
     const first = await fetchPlaylistText(url, headers);
+    /* Whatever made the first request work is what the segments will need. */
+    const working = first.headers;
     const top = parsePlaylistText(first.text, first.url);
     let chosen = { uri: first.url, bandwidth: 0, height: 0, name: null };
     let media = top;
@@ -976,14 +1077,14 @@
       chosen = pickBestVariant(top.variants);
       if (!chosen) throw new ResolveError('That playlist lists no qualities.', 'STREAM_NO_VARIANTS');
       if (chosen.uri !== first.url) {
-        const second = await fetchPlaylistText(chosen.uri, headers);
+        const second = await fetchPlaylistText(chosen.uri, working);
         media = parsePlaylistText(second.text, second.url);
         /* A variant can itself be a master (rare, but valid HLS). */
         if (media.master && !media.segments.length) {
           const deeper = pickBestVariant(media.variants);
           if (deeper) {
             chosen = deeper;
-            media = parsePlaylistText((await fetchPlaylistText(deeper.uri, headers)).text, deeper.uri);
+            media = parsePlaylistText((await fetchPlaylistText(deeper.uri, working)).text, deeper.uri);
           }
         }
       }
@@ -1018,6 +1119,8 @@
     const info = {
       url: chosen.uri,
       master,
+      /* The headers that were actually accepted, for ffmpeg to reuse. */
+      headers: working,
       height,
       bandwidth,
       duration: media.duration,
@@ -1166,6 +1269,8 @@
         quality: info.height || ref.quality || null,
         estimatedBytes: info.estimatedBytes || 0,
         segments: info.segments || 0,
+        /* Proven to work for this URL; ffmpeg sends the same to every segment. */
+        streamHeaders: info.headers || null,
       });
       return info.url;
     },
@@ -1916,8 +2021,11 @@ function preferPageName(urlName, pageName) {
         redirect: 'follow',
       }).catch(() => null);
       if (!res || !res.ok) {
-        const viaBrowser = await pageBrowserFiles(url);
-        if (viaBrowser && viaBrowser.length) return { resolver: 'browser', title: null, files: viaBrowser };
+        /* The site refuses a plain request (missav is behind a bot check). That
+           is exactly the case the browser is for — and its *HTML* is what
+           carries the playlist, not its network log. */
+        const viaBrowser = await browserPage(url);
+        if (viaBrowser) return viaBrowser;
         throw new ResolveError(
           res ? `That page answered HTTP ${res.status}.` : 'That page could not be reached.',
           'BAD_STATUS',
@@ -1938,7 +2046,11 @@ function preferPageName(urlName, pageName) {
          playlist wins over anything else, and an advert is never offered. */
       const playlists = extractPlaylistUrls(html, base).filter((u) => !isAdUrl(u));
       const urls = extractVideoUrls(html, base).filter(
-        (u) => !isAdUrl(u) && !isPlaylistUrl(u) && VIDEO_EXT.test(new URL(u).pathname),
+        (u) =>
+          !isAdUrl(u) &&
+          !isPlaylistUrl(u) &&
+          !looksLikeMediaSegment(u) &&
+          VIDEO_EXT.test(new URL(u).pathname),
       );
 
       if (playlists.length) {
@@ -1967,13 +2079,14 @@ function preferPageName(urlName, pageName) {
       }
 
       if (!urls.length) {
-        const viaBrowser = await pageBrowserFiles(base);
-        if (viaBrowser && viaBrowser.length) return { resolver: 'browser', title: null, files: viaBrowser };
+        const viaBrowser = await browserPage(base);
+        if (viaBrowser) return viaBrowser;
         const hasPlayer = /\.(m3u8|mpd)/i.test(html) || /jwplayer|videojs|hls/i.test(html);
         throw new ResolveError(
           hasPlayer
-            ? 'That page streams its video, but the stream link is built by its JavaScript and could not be read ' +
-                'from the page. Open the player once, then paste the stream link itself.'
+            ? 'That page streams its video, but its player builds the link in JavaScript and this machine could ' +
+                'not read it. Open the player in your own browser once, copy the .m3u8 address it plays, and ' +
+                'paste that — or paste the page link again from a machine with `npm run browser:install` done.'
             : 'No video file was advertised on that page.',
           'NO_VIDEO_ON_PAGE',
         );
@@ -2116,6 +2229,83 @@ function preferPageName(urlName, pageName) {
   }
 
   /** Ask the headless browser what media a page actually plays, if it is there. */
+  /**
+   * What a page really plays, as a real browser sees it.
+   *
+   * The order matters, and getting it wrong is what put twelve ad segments in
+   * the picker:
+   *
+   *   1. the **rendered HTML** — a player keeps its playlist in an inline
+   *      script, and a site behind a bot check never gets that far with a plain
+   *      request. This is where missav's `surrit.com/…/playlist.m3u8` lives;
+   *   2. a plain **video URL in the DOM**, when the page advertises one;
+   *   3. the **network capture** — last, because a page full of adverts reports
+   *      those as media too, and they look exactly like files.
+   *
+   * Segments and ad creatives are dropped at every step.
+   */
+  async function browserPage(url) {
+    const dom = await pageHtmlViaBrowser(url);
+    const pageUrl = (dom && dom.url) || url;
+    const cookie = (dom && dom.cookie) || null;
+    const userAgent = (dom && dom.userAgent) || null;
+
+    if (dom && dom.html) {
+      const playlists = extractPlaylistUrls(dom.html, pageUrl).filter(
+        (candidate) => !isAdUrl(candidate) && !looksLikeMediaSegment(candidate),
+      );
+      if (playlists.length) {
+        const unique = [...new Set(playlists.map((item) => item.split('#')[0]))];
+        const chosen = unique.length > 1 ? await bestOf(unique, pageUrl) : unique[0];
+        const name =
+          pageDisplayName(dom.html) ||
+          fileNameFromTitle(dom.title || pageTitleOf(dom.html)) ||
+          nameForStream(chosen, {});
+        const file = streamFileEntry(chosen, { name, referer: pageUrl, cookie, userAgent });
+        return {
+          resolver: 'stream',
+          title: null,
+          pageTitle: dom.title || pageTitleOf(dom.html) || null,
+          files: [file],
+        };
+      }
+
+      const urls = extractVideoUrls(dom.html, pageUrl).filter(
+        (candidate) =>
+          !isPlaylistUrl(candidate) &&
+          !isAdUrl(candidate) &&
+          !looksLikeMediaSegment(candidate) &&
+          VIDEO_EXT.test(new URL(candidate).pathname),
+      );
+      if (urls.length) {
+        const displayName = pageDisplayName(dom.html) || fileNameFromTitle(dom.title || '');
+        const files = urls.slice(0, 10).map((videoUrl, index) => {
+          let name = `video-${index + 1}.mp4`;
+          try {
+            const last = decodeURIComponent(new URL(videoUrl).pathname.split('/').filter(Boolean).pop() || '');
+            if (last && VIDEO_EXT.test(last)) name = last;
+          } catch {
+            /* keep default */
+          }
+          if (index === 0 && displayName) name = preferPageName(name, displayName);
+          return {
+            id: videoUrl,
+            name,
+            size: 0,
+            mime: '',
+            kind: 'video',
+            ref: { resolver: 'direct', url: videoUrl, name, referer: pageUrl, cookie, userAgent },
+          };
+        });
+        return { resolver: 'browser', title: null, pageTitle: dom.title || null, files };
+      }
+    }
+
+    const media = await pageBrowserFiles(url);
+    if (media && media.length) return { resolver: 'browser', title: null, files: media };
+    return null;
+  }
+
   /** One entry for a stream: the shape the page and the browser both produce. */
   function streamFileEntry(streamUrl, { name, referer, cookie, userAgent, quality, mime } = {}) {
     const fileName = String(name || nameForStream(streamUrl, { height: Number(quality) || 0 }))
@@ -2150,7 +2340,9 @@ function preferPageName(urlName, pageName) {
       const playable = media.filter((item) => {
         if (!item || !item.url || isAdUrl(item.url)) return false;
         if (isPlaylistUrl(item.url)) return true;
-        return !/\.ts(?:\?|#|$)/i.test(item.url);
+        /* Everything else must be a whole file: a segment is a piece of one,
+           and an advert pretending to be a file is not the video. */
+        return !looksLikeMediaSegment(item.url);
       });
 
       /* A stream wins over anything else the browser saw: the .mp4s on such a
@@ -2195,7 +2387,14 @@ function preferPageName(urlName, pageName) {
           size: Number(item.size) || 0,
           mime: item.contentType || '',
           kind: 'video',
-          ref: { resolver: 'direct', url: item.url, name },
+          ref: {
+            resolver: 'direct',
+            url: item.url,
+            name,
+            referer: item.referer || url,
+            cookie: item.cookie || (result && result.cookie) || null,
+            userAgent: item.userAgent || (result && result.userAgent) || null,
+          },
         };
       });
       return files.length ? files : null;
@@ -2238,6 +2437,8 @@ function preferPageName(urlName, pageName) {
     /* streams */
     isPlaylistUrl,
     isAdUrl,
+    isAdCreativeUrl,
+    looksLikeMediaSegment,
     extractPlaylistUrls,
     parsePlaylistText,
     pickBestVariant,

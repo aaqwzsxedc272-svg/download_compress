@@ -1328,7 +1328,10 @@ async function fetchThenCompress(job, ref) {
        only stable measure of how far along it is. */
     const streamOptions = {
       signal: controller.signal,
-      extraHeaders: refHeaders,
+      /* refHeaders is what the resolver learned (referer, cookie, UA); the
+         resolver also returns the exact header set its playlist request was
+         accepted with, and the segments are guarded the same way. */
+      extraHeaders: { ...refHeaders, ...(ref.streamHeaders || {}) },
       duration: Number(ref.duration) || 0,
       onProgress: ({ seconds, bytes }) => {
         const total = Number(ref.duration) || 0;
@@ -1374,6 +1377,8 @@ async function fetchThenCompress(job, ref) {
                   cookie: clearance.cookie,
                   ...(clearance.userAgent ? { 'user-agent': clearance.userAgent } : {}),
                 });
+                /* The playlist was read before the clearance existed; the URL
+                   is still right, and the headers are now the ones that work. */
                 info = await sources.downloadStream(candidate, paths.source, streamOptions);
               }
             }

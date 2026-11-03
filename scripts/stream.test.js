@@ -185,6 +185,23 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
       return res.end('nope');
     }
 
+    /* A CDN that only serves its segments to the site that embeds them — the
+       shape of the refusal the report was about ("the video server refused the
+       request (it wants the page it belongs to as the referer)"). Everything
+       under /locked/ answers 403 unless the Referer names this host. */
+    if (url.pathname.startsWith('/locked/')) {
+      const referer = req.headers.referer || '';
+      if (!referer.startsWith(`http://127.0.0.1:${MEDIA_PORT}`)) {
+        res.writeHead(403, { 'content-type': 'text/plain' });
+        return res.end('referer required');
+      }
+      const file = path.join(MEDIA_DIR, url.pathname.replace('/locked/', 'stream/'));
+      if (!fs.existsSync(file)) return res.writeHead(404).end();
+      const type = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
+      res.writeHead(200, { 'content-type': type, 'content-length': String(fs.statSync(file).size) });
+      return fs.createReadStream(file).pipe(res);
+    }
+
     if (url.pathname.startsWith('/stream/')) {
       const file = path.join(MEDIA_DIR, url.pathname.replace('/stream/', 'stream/'));
       if (!fs.existsSync(file)) return res.writeHead(404).end();
@@ -333,6 +350,44 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
       'with a video of its own',
       Boolean(second?.outputBytes) && second.outputBytes > 0,
       `${second?.outputBytes} bytes`,
+    );
+
+    /* ------------------------------------ 5. a CDN that demands a referer
+       The report: pasting the stream link alone answered "the video server
+       refused the request (it wants the page it belongs to as the referer)".
+       A bare stream has no page, so the plausible referer is tried instead of
+       giving up on the first 403 — and whatever is accepted is sent to the
+       segments as well, because they are guarded the same way. */
+    const lockedUrl = `http://127.0.0.1:${MEDIA_PORT}/locked/playlist.m3u8`;
+    const lockedList = await (await fetch(`${BASE}/api/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: lockedUrl }),
+    })).json();
+    check(
+      'a stream that refuses a plain request is still read',
+      Boolean(lockedList.files?.length),
+      lockedList.error || `${lockedList.files?.length} files`,
+    );
+    const lockedJob = await (await fetch(`${BASE}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: 'url', url: lockedUrl, presetId: 'small' }),
+    })).json();
+    check('and can be queued on its own', Boolean(lockedJob.job?.id), lockedJob.error || '');
+    const lockedDone = await waitFor(async () => {
+      const job = lockedJob.job?.id ? await getJob(lockedJob.job.id) : null;
+      return job && ['done', 'hosted', 'error'].includes(job.status) ? job : null;
+    }, { timeoutMs: 300000 });
+    check(
+      'the segments come down too, with the header that was accepted',
+      ['done', 'hosted'].includes(lockedDone?.status),
+      lockedDone?.error || lockedDone?.status,
+    );
+    check(
+      'and it is a video, not an empty file',
+      Boolean(lockedDone?.outputBytes) && lockedDone.outputBytes > 0,
+      `${lockedDone?.outputBytes} bytes`,
     );
   } finally {
     if (proc) proc.kill('SIGKILL');

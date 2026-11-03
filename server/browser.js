@@ -173,7 +173,11 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
     });
   }
 
-  const MEDIA = /\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|3gp|ogv)(\?|#|$)/i;
+  /* A player's playlist is fetched with XHR, not as "media", so it is only seen
+     here if playlists are in this pattern: that omission is why a streaming page
+     reported a dozen ad *segments* and no stream at all. */
+  const MEDIA = /\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|m4s|3gp|ogv|m3u8|mpd)(\?|#|$)/i;
+  const PLAYLIST_TYPE = /(?:mpegurl|dash\+xml|x-mpegurl)/i;
   const seen = new Map();
 
   const browser = await pw.chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -211,9 +215,9 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
     });
     page.on('response', async (response) => {
       const type = (response.headers()['content-type'] || '').toLowerCase();
-      if (type.startsWith('video/') || type === 'application/octet-stream') {
+      if (type.startsWith('video/') || type === 'application/octet-stream' || PLAYLIST_TYPE.test(type)) {
         remember(response.url(), {
-          force: type.startsWith('video/'),
+          force: type.startsWith('video/') || PLAYLIST_TYPE.test(type),
           contentType: type,
           size: response.headers()['content-length'],
         });
@@ -225,13 +229,23 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
     const cookieHeader =
       (await context.cookies().catch(() => [])).map((c) => `${c.name}=${c.value}`).join('; ') || '';
 
-    // Some players only start on a click; try the usual suspects once.
+    // Some players only start on a click; try the usual suspects once. A
+    // player that needs a real play() call is the difference between seeing
+    // its segments and seeing nothing at all.
     for (const selector of ['video', 'button[class*="play" i]', '[class*="player" i]']) {
       const target = page.locator(selector).first();
       if (await target.count().catch(() => 0)) {
         await target.click({ timeout: 1500, force: true }).catch(() => {});
       }
     }
+    await page
+      .evaluate(() => {
+        for (const video of document.querySelectorAll('video')) {
+          video.muted = true;
+          Promise.resolve(video.play && video.play()).catch(() => {});
+        }
+      })
+      .catch(() => {});
     await page.waitForTimeout(3000);
 
     // Read what the DOM advertises too: <video src>, <source>, og:video, and —
@@ -278,6 +292,8 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
     const cookies = await context.cookies().catch(() => []);
     return {
       media: [...seen.values()],
+      title: await page.title().catch(() => null),
+      url: page.url(),
       cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
       /* Cloudflare ties cf_clearance to this string: the download has to use
          the same one or the cookie is worthless. */
@@ -345,7 +361,16 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
     }
     await page.waitForTimeout(settleMs);
 
-    const html = await page.content().catch(() => '');
+    /* The player is often in an iframe on another host, and that frame's HTML
+       is where its playlist lives — the main document's HTML would miss it. */
+    const mainHtml = await page.content().catch(() => '');
+    const frameHtml = [];
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      const content = await frame.content().catch(() => '');
+      if (content && content.length > 200) frameHtml.push(content);
+    }
+    const html = [mainHtml, ...frameHtml].join('\n<!-- frame -->\n');
     const cookies = await context.cookies().catch(() => []);
     return {
       url: page.url(),

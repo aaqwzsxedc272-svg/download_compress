@@ -15,6 +15,8 @@ const {
   extractVideoUrls,
   extractPlaylistUrls,
   isAdUrl,
+  isAdCreativeUrl,
+  looksLikeMediaSegment,
   parsePlaylistText,
   pickBestVariant,
   variantHeight,
@@ -792,6 +794,96 @@ seg0.ts
     assert.match(result.files[0].ref.url, /\/high\/playlist\.m3u8$/, result.files[0].ref.url);
   });
 
+  /* The report, in full: twelve "files", 1.4 MB altogether, one a 300x250
+     banner and the rest numbered 240p pieces — and no video. The page is behind
+     a bot check, so the server got 403 and went straight to the browser's
+     network log; the playlist was in the page's own HTML all along. */
+  const AD_SEGMENTS = [
+    'https://cdn7.trafficjunky.net/9558-0-300x250.medium.mp4',
+    'https://cdn7.trafficjunky.net/117761513_240p_h264_init_2Ysckw54fQhbxoSl.mp4',
+    'https://cdn7.trafficjunky.net/117761513_240p_h264_1324_kztiJgf5nAdkJ7y9_1793730536.mp4',
+    'https://cdn7.trafficjunky.net/117761513_240p_h264_1325_LibgG90slDw5LFmt_1793730538.mp4',
+    'https://cdn7.trafficjunky.net/251503909_240p_h264_init_wfSzWIChY87UeYKh.mp4',
+    'https://cdn7.trafficjunky.net/251503909_240p_h264_488_RrP3lrNAEhZ4asgM_1793730538.mp4',
+    'https://cdn7.trafficjunky.net/223164248_240p_h264_4157_yPD3lVPI803J5dOJ_1793730537.mp4',
+  ];
+
+  await test('a bot-checked page is read through the browser HTML, not its ad requests', async () => {
+    clearStreamCache();
+    /* The plain request is refused, as Cloudflare does for missav. */
+    stubFetch(() => ({ raw: '<html><title>Just a moment...</title></html>', type: 'text/html', status: 403 }));
+    setPageHtmlBrowser(async () => ({
+      title: 'DANDYA-027 A title - MissAV',
+      url: 'https://missav.ws/dm72/en/dandya-027',
+      cookie: 'cf_clearance=abc',
+      userAgent: 'Chrome-test',
+      html: `<html><head><title>DANDYA-027 A title - MissAV</title></head><body>
+        <video src="https://cdn7.trafficjunky.net/9558-0-300x250.medium.mp4"></video>
+        <script>
+          var m3u8 = "https://surrit.com/91f6b5f7-5ca7-4c3f-b4b0-2d42d98222f0/playlist.m3u8";
+          player.setup({ file: m3u8 });
+        </script></body></html>`,
+    }));
+    /* ...and the network log is nothing but ad segments. */
+    setPageBrowser(async () => ({
+      media: AD_SEGMENTS.map((url) => ({ url, contentType: 'video/mp4' })),
+      cookie: 'cf_clearance=abc',
+      userAgent: 'Chrome-test',
+    }));
+    try {
+      const result = await resolve('https://missav.ws/dm72/en/dandya-027#1b83c59d-f570-4957-b6be-8ad4c24f63de_desktop-watch-next-side');
+      assert.equal(result.files.length, 1, `${result.files.length} files offered`);
+      assert.equal(result.resolver, 'stream');
+      assert.match(result.files[0].ref.url, /surrit\.com\/.*\/playlist\.m3u8$/);
+      assert.equal(result.files[0].ref.referer, 'https://missav.ws/dm72/en/dandya-027');
+      assert.equal(result.files[0].ref.cookie, 'cf_clearance=abc');
+      assert.match(result.files[0].name, /^DANDYA-027/);
+      assert.equal(result.pageTitle, 'DANDYA-027 A title - MissAV');
+    } finally {
+      setPageHtmlBrowser(null);
+      setPageBrowser(null);
+    }
+  });
+
+  await test('and when the page really offers nothing but ads, it says so instead', async () => {
+    clearStreamCache();
+    stubFetch(() => ({ raw: '<html><title>Just a moment...</title></html>', type: 'text/html', status: 403 }));
+    setPageHtmlBrowser(async () => ({
+      title: 'Blocked',
+      url: 'https://missav.ws/en/x',
+      html: '<html><body><video></video></body></html>',
+    }));
+    setPageBrowser(async () => ({ media: AD_SEGMENTS.map((url) => ({ url, contentType: 'video/mp4' })) }));
+    try {
+      await assert.rejects(resolve('https://missav.ws/en/x'), (err) => err.code === 'BAD_STATUS');
+    } finally {
+      setPageHtmlBrowser(null);
+      setPageBrowser(null);
+    }
+  });
+
+  await test('every one of the twelve files in the report is refused as a video', () => {
+    for (const url of AD_SEGMENTS) {
+      assert.ok(
+        looksLikeMediaSegment(url) || isAdCreativeUrl(url) || isAdUrl(url),
+        `offered anyway: ${url}`,
+      );
+    }
+  });
+
+  const segmentsAPageAdvertised = [
+    'https://x.example/117761513_240p_h264_1324_kztiJgf5nAdkJ7y9_1793730536.mp4',
+  ];
+
+  await test('a segment advertised in the HTML is not offered as a file either', async () => {
+    clearStreamCache();
+    stubFetch(() => ({
+      raw: `<html><head><title>A page</title></head><body><video src="${segmentsAPageAdvertised[0]}"></video></body></html>`,
+      type: 'text/html',
+    }));
+    await assert.rejects(resolve('https://x.example/watch'), (err) => err.code === 'NO_VIDEO_ON_PAGE');
+  });
+
   await test('the segments a browser saw are not listed as hundreds of files', async () => {
     clearStreamCache();
     stubFetch(() => ({ raw: '<html><body>player page</body></html>', type: 'text/html' }));
@@ -811,6 +903,41 @@ seg0.ts
     } finally {
       setPageBrowser(null);
     }
+  });
+
+  await test('a stream that refuses a bare request is retried with the CDN as its own referer', async () => {
+    clearStreamCache();
+    const seen = [];
+    stubFetch((url, init) => {
+      seen.push((init.headers && (init.headers.referer || init.headers.Referer)) || null);
+      const referer = (init.headers && (init.headers.referer || init.headers.Referer)) || '';
+      if (!referer.startsWith('https://surrit.com')) {
+        return { raw: 'referer required', type: 'text/plain', status: 403 };
+      }
+      return { raw: MEDIA, type: 'application/vnd.apple.mpegurl' };
+    });
+    const info = await inspectPlaylist('https://surrit.com/91f6/playlist.m3u8');
+    assert.ok(info.duration > 0, 'the playlist was read');
+    assert.equal(seen[0], null, 'the first attempt carried no referer');
+    assert.ok(
+      seen.some((value) => value && value.startsWith('https://surrit.com')),
+      `no referer attempt: ${JSON.stringify(seen)}`,
+    );
+    /* The headers that worked are handed back for the download, because the
+       segments are guarded exactly the same way. */
+    assert.ok(info.headers && /surrit\.com/.test(info.headers.referer || ''), JSON.stringify(info.headers));
+  });
+
+  await test('and when every attempt is refused, it says what to do next', async () => {
+    clearStreamCache();
+    stubFetch(() => ({ raw: 'no', type: 'text/plain', status: 403 }));
+    await assert.rejects(
+      inspectPlaylist('https://surrit.com/other/playlist.m3u8'),
+      (err) =>
+        err.code === 'STREAM_FORBIDDEN' &&
+        /paste the page/i.test(err.message) &&
+        !/^HTTP 403/.test(err.message),
+    );
   });
 
   await test('a stream whose playlist is really a web page says so', async () => {

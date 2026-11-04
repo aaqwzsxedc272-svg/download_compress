@@ -289,6 +289,28 @@ filtered out before anything looked at them, and the ad was what remained.
 * **Live and DRM are refused up front**: a live stream has no end to save, and a protected one
   cannot be saved by any downloader. Both say so instead of failing twenty minutes later.
 
+**The session the page hands out comes with it.** A page that answers 200 sets its cookies on the
+way in — missav hands over `missav_session`, `cf_clearance` and a couple of bot-mitigation cookies
+with the HTML itself — and the CDN that serves the film then asks for them. They used to be read
+with the page and thrown away, which is exactly why `resolve` said "1 file" and `stream` said
+FORBIDDEN a second later: same page, different session. The page's cookies and user agent are now
+kept and sent to its CDN, stored on the file reference, and printed by the doctor
+(`accepted: referer … · origin … · cookie missav_session`).
+
+**A stream that cannot be read is never offered.** Finding a playlist in the HTML is not the same
+as being able to open it. If it refuses, one browser visit is made — the player earns the session
+and reports the URL it actually requested — and only what could really be read reaches the picker.
+A file that cannot be fetched is an error in the picker half a minute early, not a job that fails
+later.
+
+**The video the page is playing wins.** `capturePage` now reads every `<video>` element: its
+`currentSrc` and its `duration`. On a page carrying the film plus an ad player, a trailer and a
+"next video" embed, that is the one fact the adverts cannot fake. Ranking order: not a preview →
+how long it runs → **same video the player is playing** → close to the reported length → picture
+size → bitrate. The reported ad CDNs (`saawsedge.com`, `storagexhd.com` and the rest of that
+family) are refused outright, because a permissive ad host is the only stream that answers when
+the film's CDN refuses — which is how "it caught the wrong video" happens.
+
 **The headers a playlist answered to are kept, not just used once.** Resolving a link and
 downloading it are two different requests, minutes apart, from a possibly different connection — and a
 CDN that issues a session cookie on the first one refuses the second without it. That is the shape of
@@ -962,19 +984,23 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
-- `npm run test:browser` — 4 checks against a fake Playwright: a page event listener cannot throw
+- `npm run test:browser` — 5 checks against a fake Playwright: a page event listener cannot throw
   out of a capture, a malformed event is recorded rather than rethrown, one visit returns the HTML,
-  the cookies, the title and the media the player asked for (including a playlist fetched by XHR),
-  and `captureMedia` survives the same junk.
+  the cookies, the title, the media the player asked for (including a playlist fetched by XHR) and
+  the `<video>` element's own `currentSrc`/`duration`, and `captureMedia` survives the same junk.
 - `npm run test:crash` — 10 checks against a real server process: an uncaught exception and an
   unhandled rejection are survived, the API keeps answering afterwards, both are written to
   `data/crash.log` with the build, and SIGTERM still stops it.
-- `npm run test:resolve` — 68 resolver tests against stubbed APIs (real response shapes),
+- `npm run test:resolve` — 73 resolver tests against stubbed APIs (real response shapes),
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before
   a minted link, plus the page-title naming rule and fileditch's minted-link/player routes. It also
   replays the missav report: a bot-checked page whose network log is twelve ad segments, a page that
-  offers a 1080p preview next to a 720p film, and the referer a browser would actually send.
+  offers a 1080p preview next to a 720p film, and the referer a browser would actually send. It also
+  covers the second report — the cookies a page hands out reaching its CDN, a playlist that cannot be
+  read never reaching the picker, the browser taking over when it can, the ad CDNs
+  (`saawsedge`, `storagexhd`) being refused, and the film the page's own `<video>` is playing beating
+  a better-encoded stranger.
 - `npm run test:hooks` — 20 checks that the browser is registered once and reaches every caller:
   a JS-built download button is found, the cookie and its user agent are carried to the fetch, the
   rendered DOM is cached, the doctor resolves the same link the worker does, with no browser

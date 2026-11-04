@@ -770,7 +770,22 @@
      path words that give them away. A page that streams its video through an
      HLS master and also carries one of these is a page whose "video" is the HLS
      one — which is the whole bug behind "it only detected an ad". */
-  const AD_HOST = /(?:^|\.)(?:doubleclick|googlesyndication|googleadservices|adservice|adnxs|adsystem|amazon-adsystem|exoclick|juicyads|tsyndicate|trafficjunky|realsrv|adsterra|popads|popcash|clickadu|adcash|propellerads|onclickads|mgid|taboola|outbrain|revcontent|zergnet|criteo|smartadserver|rubiconproject|pubmatic|openx|yieldmo|sharethrough|teads|spotxchange|springserve|advertising|adserver|adnium|hilltopads|adspyglass|clickaine|adnanny)\./i;
+  const AD_HOST =
+    /(?:^|\.)(?:doubleclick|googlesyndication|googleadservices|adservice|adnxs|adsystem|amazon-adsystem|exoclick|juicyads|tsyndicate|trafficjunky|realsrv|adsterra|popads|popcash|clickadu|adcash|propellerads|onclickads|mgid|taboola|outbrain|revcontent|zergnet|criteo|smartadserver|rubiconproject|pubmatic|openx|yieldmo|sharethrough|teads|spotxchange|springserve|advertising|adserver|adnium|hilltopads|adspyglass|clickaine|adnanny)\./i;
+
+  /**
+   * The movie-trailer networks these pages embed, which are *not* named after
+   * an ad exchange and answer with perfectly good HLS.
+   *
+   * From a report on a missav page: next to surrit.com's film the browser had
+   * requested `edge-hls.saawsedge.com/hls/…`, `media-hls.saawsedge.com/b-hls-07/…`
+   * and `cdn.storagexhd.com/files/video/…`. Every one of those is an advert
+   * dressed as a stream — `b-hls-07` is a banner player — and a permissive CDN
+   * like that reads fine when the film's CDN refuses, which is how "it caught
+   * the wrong video" happens: the wrong one is the only one that answers.
+   */
+  const AD_STREAM_HOST =
+    /(?:^|\.)(?:saawsedge|storagexhd|cdnssedge|growcdnssedge|sacdnssedge|dynsrv|exdynsrv|doppiocdn|whitetrafsa|stripchat|trafficfactory|adsco|adspirit|popmyads|tsyndicate|adsterra|bidvertiser|galaksion|hilltopads)\./i;
   const AD_PATH = /(?:^|[/_.-])(?:ads?|advert|adverts|advertisement|advertising|preroll|pre-roll|midroll|postroll|vast|vpaid|popunder|popup|banner|sponsor|promo)(?:[/_.-]|$)/i;
 
   function isAdUrl(url) {
@@ -781,6 +796,7 @@
       return false;
     }
     if (AD_HOST.test(parsed.hostname)) return true;
+    if (AD_STREAM_HOST.test(parsed.hostname)) return true;
     if (isAdCreativeUrl(url)) return true;
     const path = `${parsed.pathname}${parsed.search}`;
     return AD_PATH.test(path) && !/\.(m3u8|mpd)$/i.test(parsed.pathname);
@@ -1418,8 +1434,8 @@
     return 0; // a preview, an advert, or unknown
   }
 
-  async function rankStreams(urls, referer) {
-    const headers = streamHeaders({ referer });
+  async function rankStreams(urls, referer, { cookie = null, playing = [] } = {}) {
+    const headers = streamHeaders({ referer, cookie });
     const results = await Promise.all(
       urls
         .slice(0, 4)
@@ -1429,13 +1445,61 @@
             .catch(() => null),
         ),
     );
+    /* `host/path-root`: a player fetches its segments from a directory and its
+       manifest from the one above, so the first path segment is the video's
+       identity on that CDN. Two of these differ for two different videos. */
+    const keysOf = (urls2) =>
+      new Set(
+        (urls2 || [])
+          .map((raw) => {
+            try {
+              const parsed = new URL(String(raw));
+              return `${parsed.hostname}/${parsed.pathname.split('/').filter(Boolean)[0] || ''}`;
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean),
+      );
+    const playingKeys = keysOf(playing.map((item) => item && (item.url || item.src)));
+    const measured = (playing || []).map((item) => Number(item && item.duration) || 0).sort((a, b) => b - a)[0] || 0;
+
+    const keyOf = (entry) => {
+      try {
+        const parsed = new URL(entry.url);
+        return `${parsed.hostname}/${parsed.pathname.split('/').filter(Boolean)[0] || ''}`;
+      } catch {
+        return null;
+      }
+    };
+
     return results.filter(Boolean).sort((a, b) => {
+      /* 1. A preview is never the film, whatever it looks like. */
       const previewA = isPreviewUrl(a.url) ? 1 : 0;
       const previewB = isPreviewUrl(b.url) ? 1 : 0;
       if (previewA !== previewB) return previewA - previewB;
+
+      /* 2. Length class: a film beats a spot. */
       const classA = durationClass(a.info);
       const classB = durationClass(b.info);
       if (classA !== classB) return classB - classA;
+
+      /* 3. The same video the page's own player is playing. This separates the
+         film from an advert rendered beside it; it deliberately does NOT
+         separate qualities of the same film, which is rule 5's job. */
+      const playA = playingKeys.has(keyOf(a)) ? 0 : 1;
+      const playB = playingKeys.has(keyOf(b)) ? 0 : 1;
+      if (playA !== playB) return playA - playB;
+
+      /* 4. If the player reported its length, a different length is a
+         different video. */
+      if (measured > 30) {
+        const closeA = a.info.duration ? Math.abs(a.info.duration - measured) / measured < 0.2 : false;
+        const closeB = b.info.duration ? Math.abs(b.info.duration - measured) / measured < 0.2 : false;
+        if (closeA !== closeB) return closeA ? -1 : 1;
+      }
+
+      /* 5. Quality, then bitrate, then the longer one. */
       const byHeight = (b.info.height || 0) - (a.info.height || 0);
       if (byHeight) return byHeight;
       const byBandwidth = (b.info.bandwidth || 0) - (a.info.bandwidth || 0);
@@ -1444,8 +1508,8 @@
     });
   }
 
-  async function bestOf(urls, referer) {
-    const ranked = await rankStreams(urls, referer);
+  async function bestOf(urls, referer, evidence = {}) {
+    const ranked = await rankStreams(urls, referer, evidence);
     return ranked.length ? ranked[0].url : urls[0];
   }
 
@@ -2289,6 +2353,13 @@ function preferPageName(urlName, pageName) {
       if (contentType && !/(text\/html|application\/xhtml|text\/plain)/.test(contentType)) {
         throw new ResolveError('That address served a file, not a web page.', 'NOT_A_PAGE');
       }
+      /* The page hands out its session on the way in — missav sets
+         `missav_session`, `cf_clearance` and a couple of bot-mitigation
+         cookies with the HTML itself. The CDN that serves the film then asks
+         for them. Dropping them here is why resolving a link "worked" and the
+         job a moment later was refused: same page, different session. */
+      const pageCookie = mergeCookies(null, res);
+      const pageUserAgent = UA;
       const html = await res.text();
       const base = res.url || url;
       const displayName = pageDisplayName(html);
@@ -2313,21 +2384,38 @@ function preferPageName(urlName, pageName) {
            quality selector. Quality first, so the best of them is chosen here
            and the rest are not offered as separate files to choose between. */
         const unique = [...new Set(playlists.map((url) => url.split('#')[0]))];
-        const ranked = unique.length > 1 ? await rankStreams(unique, base) : [];
+        const ranked = unique.length > 1 ? await rankStreams(unique, base, { cookie: pageCookie }) : [];
         const chosen = ranked.length ? ranked[0].url : unique[0];
         const titleName = displayName || fileNameFromTitle(pageTitleOf(html) || '');
-        const info = await inspectPlaylist(chosen, {
-          headers: streamHeaders({ referer: base }),
-        }).catch(() => null);
+        const readAs = { referer: base, cookie: pageCookie, userAgent: pageUserAgent };
+        let info = null;
+        let readError = null;
+        try {
+          info = await inspectPlaylist(chosen, { headers: streamHeaders(readAs) });
+        } catch (err) {
+          readError = err;
+        }
+        if (!info) {
+          /* Found, but not readable from here. That is not a file to offer:
+             offering it makes the picker lie and the job fail a minute later.
+             One browser visit is what cures it — it plays the page, keeps the
+             session the player earned, and reports the URL the player itself
+             asked for (which need not be the one the HTML named). */
+          const viaBrowser = await browserPage(url);
+          if (viaBrowser) return { ...viaBrowser, pageTitle: viaBrowser.pageTitle || pageTitleOf(html) || null };
+          throw readError;
+        }
         const files = [
           streamFileEntry(chosen, {
             name: titleName || undefined,
             referer: base,
-            headers: (info && info.headers) || null,
-            quality: info && info.height ? info.height : null,
-            duration: info && info.duration ? info.duration : 0,
-            estimatedBytes: info && info.estimatedBytes ? info.estimatedBytes : 0,
-            preview: Boolean(info && info.duration > 0 && info.duration < 90),
+            cookie: pageCookie,
+            userAgent: pageUserAgent,
+            headers: info.headers || null,
+            quality: info.height ? info.height : null,
+            duration: info.duration || 0,
+            estimatedBytes: info.estimatedBytes || 0,
+            preview: Boolean(info.duration > 0 && info.duration < 90),
           }),
         ];
         /* The page's own <title> travels with the job: the card shows the tab
@@ -2526,13 +2614,16 @@ function preferPageName(urlName, pageName) {
          can disagree: a page states its preview in the markup and builds the
          film's playlist in JavaScript, so taking the HTML alone picks the
          sample. They are ranked together, longest first. */
+      const playing = Array.isArray(dom.playing) ? dom.playing : [];
       const playlists = [
         ...extractPlaylistUrls(dom.html, pageUrl),
+        ...playing.map((item) => item && (item.url || item.src)).filter(isPlaylistUrl),
         ...(Array.isArray(dom.media) ? dom.media.map((item) => item && item.url).filter(isPlaylistUrl) : []),
       ].filter((candidate) => candidate && !isAdUrl(candidate) && !looksLikeMediaSegment(candidate));
       if (playlists.length) {
         const unique = [...new Set(playlists.map((item) => item.split('#')[0]))];
-        const chosen = unique.length > 1 ? await bestOf(unique, pageUrl) : unique[0];
+        const chosen =
+          unique.length > 1 ? await bestOf(unique, pageUrl, { cookie, playing }) : unique[0];
         const name =
           pageDisplayName(dom.html) ||
           fileNameFromTitle(dom.title || pageTitleOf(dom.html)) ||
@@ -2645,7 +2736,7 @@ function preferPageName(urlName, pageName) {
    */
   async function filesFromBrowserMedia(
     rawMedia,
-    { cookie = null, userAgent = null, title = null, fallbackUrl = null } = {},
+    { cookie = null, userAgent = null, title = null, fallbackUrl = null, playing = [] } = {},
   ) {
     const media = Array.isArray(rawMedia) ? rawMedia : [];
     const pageUrl = fallbackUrl || '';
@@ -2668,7 +2759,8 @@ function preferPageName(urlName, pageName) {
        picture, exactly like a page that names them in HTML. */
     const playlistUrls = [...new Set(playable.filter((item) => isPlaylistUrl(item.url)).map((item) => item.url))];
     if (playlistUrls.length) {
-      const chosen = playlistUrls.length > 1 ? await bestOf(playlistUrls, pageUrl) : playlistUrls[0];
+      const chosen =
+        playlistUrls.length > 1 ? await bestOf(playlistUrls, pageUrl, { cookie, playing }) : playlistUrls[0];
       const item = playable.find((entry) => entry.url === chosen) || { url: chosen };
       /* The browser knows the clearance cookie it earned, and the user agent
          that earned it — both are needed again by the CDN. */
@@ -2786,6 +2878,7 @@ function preferPageName(urlName, pageName) {
     variantHeight,
     inspectPlaylist,
     rankStreams,
+    streamHeaders,
     nameForStream,
     fileNameFromTitle,
     clearStreamCache,

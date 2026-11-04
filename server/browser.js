@@ -289,6 +289,17 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
     // Read what the DOM advertises too: <video src>, <source>, og:video, and —
     // when asked — the anchors, which is where a "Download" button points once
     // JavaScript has built it.
+    const playing = await page
+      .evaluate(() =>
+        [...document.querySelectorAll('video')].map((v) => ({
+          url: v.currentSrc || v.src || '',
+          duration: Number(v.duration) || 0,
+          paused: Boolean(v.paused),
+          readyState: Number(v.readyState) || 0,
+        })),
+      )
+      .catch(() => []);
+
     const dom = await page
       .evaluate((withAnchors) => {
         const out = [];
@@ -333,6 +344,7 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
     const cookies = await context.cookies().catch(() => []);
     return {
       media: [...seen.values()],
+      playing,
       title: await page.title().catch(() => null),
       url: page.url(),
       cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
@@ -472,6 +484,21 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
       }
     }
 
+    /* Which stream is the film? The page answers that itself: a <video>
+       element that is playing says so, and reports how long the video is. On a
+       page with three players (the film, a banner, a trailer) that is the one
+       fact an advert cannot fake. */
+    const playing = await page
+      .evaluate(() =>
+        [...document.querySelectorAll('video')].map((v) => ({
+          url: v.currentSrc || v.src || '',
+          duration: Number(v.duration) || 0,
+          paused: Boolean(v.paused),
+          readyState: Number(v.readyState) || 0,
+        })),
+      )
+      .catch(() => []);
+
     /* The player is often in an iframe on another host, and that frame's HTML
        is where its playlist lives — the main document's HTML would miss it. */
     const mainHtml = await page.content().catch(() => '');
@@ -488,6 +515,7 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
       title: await page.title().catch(() => title),
       html,
       media: [...seen.values()],
+      playing,
       cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null,
       /* cf_clearance is bound to the user agent that earned it, so the
          download has to use this exact string. */

@@ -235,12 +235,13 @@ async function diagnose(url, { browser } = {}) {
     const resolved = await resolveAgain(url).catch(() => null);
     const ref = resolved?.files?.[0]?.ref;
     steps.stream = await timed(async () => {
+      const { streamHeaders } = require('../shared/resolve');
       const info = await inspectPlaylist(ref.url, {
-        headers: {
-          ...(ref.referer ? { referer: ref.referer } : {}),
-          ...(ref.cookie ? { cookie: ref.cookie } : {}),
-          ...(ref.userAgent ? { 'user-agent': ref.userAgent } : {}),
-        },
+        /* The same set the job will send — including the cookies the page
+           handed out and the ones a successful read was accepted with. A
+           doctor that tests different headers than the download is a doctor
+           that reports the wrong thing. */
+        headers: { ...streamHeaders(ref), ...(ref.streamHeaders || {}) },
       });
       return {
         quality: info.height ? `${info.height}p` : 'unknown',
@@ -288,6 +289,13 @@ async function diagnose(url, { browser } = {}) {
       return {
         title: dom.title,
         challenged: dom.challenged,
+        playing: (dom.playing || [])
+          .filter((item) => item && item.url)
+          .map((item) => ({
+            url: redact(item.url),
+            durationSeconds: Math.round(Number(item.duration) || 0),
+            paused: Boolean(item.paused),
+          })),
         htmlBytes: (dom.html || '').length,
         cookies: String(dom.cookie || '')
           .split(';')
@@ -448,7 +456,7 @@ function render({ url, steps }) {
         `stream    ${v.quality} · ${durationText(v.durationSeconds)} · ${MB(v.estimatedBytes)} · ` +
           `${v.segments} segments`,
       );
-      lines.push(`          playing ${v.chosen}`);
+      lines.push(`          downloading ${v.chosen}`);
       if (v.variants.length > 1) {
         lines.push(`          qualities offered: ${v.variants.map((variant) => variant.quality).join(', ')}`);
       }
@@ -497,6 +505,11 @@ function render({ url, steps }) {
       const v = b.value;
       lines.push(`browser   “${v.title}” · challenged: ${yes(v.challenged)} · ${v.htmlBytes} bytes · ${v.anchors} anchors`);
       lines.push(`          cookies: ${v.cookies.join(', ') || 'none'}`);
+      for (const item of v.playing || []) {
+        lines.push(
+          `          playing ${durationText(item.durationSeconds)}${item.paused ? ' (paused)' : ''} ${item.url}`,
+        );
+      }
       for (const item of v.media) {
         lines.push(`          media ${item.contentType || '?'} ${item.size ? MB(item.size) : ''} ${item.hasCookie ? '(cookie)' : ''} ${item.url}`);
       }

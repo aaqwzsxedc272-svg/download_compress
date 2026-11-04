@@ -1101,6 +1101,147 @@ ${Array.from({ length: 20 }, (_, i) => `#EXTINF:6.006,\nhttps://cdn.example/prev
     assert.equal(ref.streamHeaders.origin, 'https://missav.ws');
   });
 
+  /* The report, verbatim: the doctor showed `resolve` succeeding with a list of
+     cookies from the page and `stream` failing with STREAM_FORBIDDEN — the page
+     had handed out its session and the playlist request went out without it. */
+  await test('the cookies the page hands out are sent to its CDN', async () => {
+    clearStreamCache();
+    const seen = [];
+    stubFetch((url, init) => {
+      const cookie = ((init && init.headers) || {}).cookie || '';
+      seen.push({ url, cookie });
+      if (url.startsWith('https://missav.ws/')) {
+        return {
+          raw: `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+            <script>player.setup({file:"https://surrit.com/91f6/playlist.m3u8"});</script></body></html>`,
+          type: 'text/html',
+          headers: {
+            'set-cookie': 'missav_session=abc123; Path=/; HttpOnly, cf_clearance=xyz; Path=/',
+          },
+        };
+      }
+      if (!/missav_session=abc123/.test(cookie)) {
+        return { raw: 'nope', type: 'text/plain', status: 403 };
+      }
+      return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+    });
+    const result = await resolve('https://missav.ws/en/dandya-045');
+    assert.equal(result.files.length, 1);
+    const streamCall = seen.find((call) => call.url.includes('surrit.com'));
+    assert.ok(streamCall, 'the playlist was never read');
+    assert.match(streamCall.cookie, /missav_session=abc123/, streamCall.cookie);
+    /* ...and it is on the file, so the download sends it too. */
+    assert.match(String(result.files[0].ref.cookie || ''), /missav_session=abc123/);
+    assert.match(String(result.files[0].ref.streamHeaders.cookie || ''), /missav_session=abc123/);
+  });
+
+  await test('a playlist that cannot be read is never offered as a file', async () => {
+    clearStreamCache();
+    /* The page names a stream, and that stream refuses everything. No browser
+       to fall back to: the honest answer is an error, not a picker entry that
+       fails a minute later. */
+    stubFetch((url) => {
+      if (url.startsWith('https://missav.ws/')) {
+        return {
+          raw: `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+            <script>player.setup({file:"https://surrit.com/91f6/playlist.m3u8"});</script></body></html>`,
+          type: 'text/html',
+        };
+      }
+      return { raw: 'forbidden', type: 'text/plain', status: 403 };
+    });
+    await assert.rejects(resolve('https://missav.ws/en/dandya-045'), (err) => err.code === 'STREAM_FORBIDDEN');
+  });
+
+  await test('and when the browser can read it, resolving succeeds instead', async () => {
+    clearStreamCache();
+    stubFetch((url) => {
+      if (url.startsWith('https://missav.ws/')) {
+        return {
+          raw: `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+            <script>player.setup({file:"https://surrit.com/91f6/playlist.m3u8"});</script></body></html>`,
+          type: 'text/html',
+        };
+      }
+      /* Plain requests are refused; the browser's playlists come from our stub. */
+      return { raw: 'forbidden', type: 'text/plain', status: 403 };
+    });
+    setPageHtmlBrowser(async () => ({
+      title: 'DANDYA-045 - MissAV',
+      url: 'https://missav.ws/en/dandya-045',
+      cookie: 'cf_clearance=from-browser',
+      userAgent: 'Chrome-test',
+      html: '<html><head><title>DANDYA-045 - MissAV</title></head><body><video></video></body></html>',
+      media: [{ url: 'https://surrit.com/91f6/playlist.m3u8', contentType: 'application/vnd.apple.mpegurl' }],
+      playing: [{ url: 'https://surrit.com/91f6/720p/video.m3u8', duration: 7200, paused: false }],
+    }));
+    try {
+      const result = await resolve('https://missav.ws/en/dandya-045');
+      assert.equal(result.files.length, 1, result.files.map((f) => f.name).join(', '));
+      /* Whichever the ranking lands on, it is the film's own stream — the
+         master or the variant the player was playing — never an advert. */
+      assert.match(result.files[0].ref.url, /surrit\.com\/91f6\//);
+      assert.equal(result.files[0].ref.cookie, 'cf_clearance=from-browser');
+      /* The fake fetch still refuses; the failure message names the reason. */
+      assert.match(result.files[0].note, /stream|min/);
+    } finally {
+      setPageHtmlBrowser(null);
+    }
+  });
+
+  /* "It caught the wrong video": two streams that both read perfectly, both
+     two hours long, one at 1080p. Nothing in the URLs says which is the film —
+     but the page's own player was playing one of them, and that is the answer. */
+  await test('the stream the page itself is playing wins over a better-looking stranger', async () => {
+    clearStreamCache();
+    const DECOY = FILM_PLAYLIST.replace(/cdn\.example\/film/g, 'cdn.othersite.example/decoy');
+    stubFetch((url) => {
+      if (url.startsWith('https://missav.ws/')) {
+        return { raw: 'Just a moment...', type: 'text/html', status: 403 };
+      }
+      if (url.includes('othersite')) {
+        return {
+          raw: DECOY.replace(/#EXTINF:6\.006/g, '#EXTINF:6.006').replace(
+            '#EXT-X-TARGETDURATION:6',
+            '#EXT-X-TARGETDURATION:6\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080\n1080p/index.m3u8',
+          ),
+          type: 'application/vnd.apple.mpegurl',
+        };
+      }
+      return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+    });
+    setPageHtmlBrowser(async () => ({
+      title: 'DANDYA-045 - MissAV',
+      url: 'https://missav.ws/en/dandya-045',
+      cookie: 'cf_clearance=abc',
+      html: '<html><head><title>DANDYA-045 - MissAV</title></head><body><video></video></body></html>',
+      media: [
+        { url: 'https://cdn.othersite.example/decoy/playlist.m3u8', contentType: 'application/vnd.apple.mpegurl' },
+        { url: 'https://surrit.com/91f6/720p/video.m3u8', contentType: 'application/vnd.apple.mpegurl' },
+      ],
+      /* The page's <video> is playing the surrit one, and says how long it is. */
+      playing: [{ url: 'https://surrit.com/91f6/720p/video.m3u8', duration: 7200, paused: false }],
+    }));
+    try {
+      const result = await resolve('https://missav.ws/en/dandya-045');
+      assert.equal(result.files.length, 1);
+      assert.match(result.files[0].ref.url, /surrit\.com\/91f6\/720p\/video\.m3u8$/);
+    } finally {
+      setPageHtmlBrowser(null);
+    }
+  });
+
+  await test('the ad CDNs from the report are refused as videos', () => {
+    for (const url of [
+      'https://edge-hls.saawsedge.com/hls/217827286/master/217827286.m3u8',
+      'https://media-hls.saawsedge.com/b-hls-07/217827286/217827286.m3u8',
+      'https://media-hls.saawsedge.com/b-hls-07/217827286/217827286.mp4',
+      'https://cdn.storagexhd.com/files/video/9732-0.mp4',
+    ]) {
+      assert.equal(isAdUrl(url), true, `offered anyway: ${url}`);
+    }
+  });
+
   await test('a stream whose playlist is really a web page says so', async () => {
     clearStreamCache();
     stubFetch(() => ({ raw: '<!doctype html><html><body>nope</body></html>', type: 'text/html' }));

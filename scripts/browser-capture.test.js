@@ -41,7 +41,7 @@ async function test(name, fn) {
  * `onGoto` runs while `goto()` is still on the stack, which is when a real page
  * starts making requests — that is the moment a listener bug is reachable.
  */
-function makePage({ html = '', title = '', url = 'https://example.test/watch', cookies = [], onGoto = null } = {}) {
+function makePage({ html = '', title = '', url = 'https://example.test/watch', cookies = [], onGoto = null, playing = [] } = {}) {
   const handlers = new Map();
   const frame = { content: async () => html };
   const page = {
@@ -57,7 +57,10 @@ function makePage({ html = '', title = '', url = 'https://example.test/watch', c
     waitForSelector: async () => null,
     waitForTimeout: async () => null,
     locator: () => ({ first: () => ({ count: async () => 0, click: async () => null }) }),
-    evaluate: async () => ({ media: [], anchors: [] }),
+    evaluate: async (fn) => {
+      if (String(fn).includes('querySelectorAll') && String(fn).includes('readyState')) return playing;
+      return { media: [], anchors: [] };
+    },
     on: (event, handler) => {
       if (!handlers.has(event)) handlers.set(event, []);
       handlers.get(event).push(handler);
@@ -153,6 +156,23 @@ function withFakePlaywright(fake) {
     assert.ok(urls.includes('https://cdn.example/video.mp4'), urls.join(', '));
     assert.ok(urls.includes('https://cdn.example/playlist.m3u8'), urls.join(', '));
     assert.equal(result.media.length, 2, JSON.stringify(urls));
+  });
+
+  await test('capturePage reports the video the page was actually playing', async () => {
+    const made = makePage({
+      title: 'x',
+      html: '<html></html>',
+      playing: [{ url: 'https://surrit.com/91f6/720p/video.m3u8', duration: 7200, paused: false, readyState: 4 }],
+    });
+    const loaded = withFakePlaywright(fakePlaywright(made));
+    try {
+      const result = await loaded.helper.capturePage('https://missav.ws/en/dandya-045');
+      assert.equal((result.playing || []).length, 1, JSON.stringify(result.playing));
+      assert.equal(result.playing[0].duration, 7200);
+      assert.match(result.playing[0].url, /surrit\.com/);
+    } finally {
+      loaded.restore();
+    }
   });
 
   await test('a playlist requested as XHR is recorded too', async () => {

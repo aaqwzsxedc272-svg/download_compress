@@ -583,6 +583,108 @@ async function downloadStream(
   return { url, total: stat.size, tookMs: result.tookMs };
 }
 
+
+/**
+ * Remux a playlist of *local* files into one MP4.
+ *
+ * This is the second half of the browser download: once the pieces are on
+ * disk, ffmpeg has no reason to touch the network — and on a CDN that refuses
+ * ffmpeg's HTTP client, touching the network is the whole problem. `-c copy`
+ * still keeps every frame exactly as the host encoded it.
+ */
+async function remuxLocalPlaylist(playlistPath, destPath, { signal, onProgress, duration = 0 } = {}) {
+  const fsp = require('node:fs/promises');
+  const path = require('node:path');
+  const temp = `${destPath}.remux.part`;
+  await fsp.rm(temp, { force: true }).catch(() => {});
+  await fsp.mkdir(path.dirname(destPath), { recursive: true }).catch(() => {});
+
+  const args = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-nostdin',
+    '-y',
+    /* The pieces keep the extension their CDN used (.ts, .m4s, …). */
+    '-allowed_extensions',
+    'ALL',
+    '-protocol_whitelist',
+    'file,crypto',
+    '-i',
+    playlistPath,
+    '-map',
+    '0:v:0?',
+    '-map',
+    '0:a:0?',
+    '-c',
+    'copy',
+    '-movflags',
+    '+faststart',
+    '-f',
+    'mp4',
+    '-progress',
+    'pipe:1',
+    '-nostats',
+    temp,
+  ];
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    let buffer = '';
+    let seconds = 0;
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', onAbort);
+      fn(value);
+    };
+    const onAbort = () => {
+      child.kill('SIGKILL');
+      finish(reject, Object.assign(new Error('Stopped.'), { code: 'CANCELLED' }));
+    };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const [key, value] = line.split('=');
+        if (key !== 'out_time_us' && key !== 'out_time_ms') continue;
+        const next = Number(value) / 1e6;
+        if (Number.isFinite(next) && next > seconds) seconds = next;
+        if (onProgress && duration > 0) onProgress(Math.min(0.99, seconds / duration));
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 20000) stderr = stderr.slice(-20000);
+    });
+    child.on('error', (err) => finish(reject, err));
+    child.on('close', async (code) => {
+      if (signal && signal.aborted) return;
+      if (code !== 0) {
+        await fsp.rm(temp, { force: true }).catch(() => {});
+        const detail = usefulLine(stderr);
+        return finish(
+          reject,
+          Object.assign(new Error(`ffmpeg could not write the stream (${detail || `exit ${code}`}).`), {
+            code: 'FFMPEG_FAILED',
+            detail,
+          }),
+        );
+      }
+      await fsp.rename(temp, destPath).catch(async (err) => finish(reject, err));
+      const stat = await fsp.stat(destPath).catch(() => ({ size: 0 }));
+      return finish(resolve, { bytes: stat.size, seconds });
+    });
+  });
+}
+
 module.exports = {
   UA,
   normalizeUrl,
@@ -595,6 +697,7 @@ module.exports = {
   probeRemote,
   downloadHttp,
   downloadStream,
+  remuxLocalPlaylist,
   isBlockedHost,
   freeDiskBytes,
   filenameFrom,

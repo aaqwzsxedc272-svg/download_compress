@@ -31,7 +31,7 @@ function install() {
     return installed;
   }
 
-  const { setGofileBrowser, setPageBrowser, setPageHtmlBrowser } = require('../shared/resolve'); // eslint-disable-line global-require
+  const { setGofileBrowser, setPageBrowser, setPageHtmlBrowser, setStreamBrowser } = require('../shared/resolve'); // eslint-disable-line global-require
 
   /* gofile mints its API token in an obfuscated browser script. */
   setGofileBrowser((code) => browser.gofileFolder(code));
@@ -40,6 +40,10 @@ function install() {
      JavaScript, behind a bot check). */
   setPageBrowser((url) => browser.captureMedia(url));
   setPageHtmlBrowser((url) => browser.capturePage(url, { waitFor: 'a[href], video, source' }));
+  /* Read a playlist that refuses every request we can make. Not a nicety: the
+     CDN in the field answers Chromium and refuses Node with the same headers,
+     so without this a pasted .m3u8 link is a dead end. */
+  setStreamBrowser((pageUrl, url) => browser.fetchInBrowser(pageUrl, url, { want: 'text' }));
 
   installed = { available: true, engine: 'playwright' };
   return installed;

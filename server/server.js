@@ -1185,11 +1185,80 @@ async function browserClearance(pageUrl) {
 
 /** The page this stream belongs to, as far as the job knows. */
 function streamPageUrl(job, ref) {
-  return (
-    (job && job.url) ||
-    (ref && (ref.page || ref.referer)) ||
-    null
-  );
+  const known = (job && job.url) || (ref && (ref.page || ref.referer)) || null;
+  if (known) return known;
+  /* A stream pasted on its own has no page — but some CDNs are known to belong
+     to one, and opening that page is what earns the session they want. */
+  try {
+    return require('../shared/resolve').knownParentReferer(ref && ref.url) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The last resort, and the one that works when a CDN will only talk to a real
+ * browser: fetch the pieces *inside* Chromium, remux them locally.
+ *
+ * See `browser.streamDownload` for why headers cannot fix this. Returns null
+ * when there is no browser to try, so the caller can keep its own error.
+ */
+async function downloadStreamThroughBrowser(job, ref, candidate, paths, { signal } = {}) {
+  let browser = null;
+  try {
+    browser = require('./browser');
+  } catch {
+    return null;
+  }
+  if (!browser.available()) return null;
+
+  const pageUrl = streamPageUrl(job, ref) || null;
+  const dir = path.join(path.dirname(paths.source), 'stream-parts');
+  jobsStore.updateJob(job, {
+    streamViaBrowser: true,
+    stage: 'Fetching the stream through a real browser — this CDN refuses anything else',
+    progress: 0,
+  });
+  await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+
+  try {
+    const fetched = await browser.streamDownload(pageUrl, (ref && ref.url) || candidate, {
+      destDir: dir,
+      duration: Number(ref && ref.duration) || 0,
+      signal,
+      onProgress: ({ seconds, bytes }) => {
+        const total = Number(ref && ref.duration) || 0;
+        job.progress = total > 0 ? Math.min(0.95, (Number(seconds) || 0) / total) : 0;
+        job.sourceBytes = bytes || job.sourceBytes;
+        const mb = Math.round((bytes || 0) / 1048576);
+        job.stage = total > 0
+          ? `Fetching the stream through a browser · ${Math.min(99, Math.round((seconds / total) * 100))}%`
+          : `Fetching the stream through a browser (${mb} MB)`;
+        if (Date.now() - (job._lastEmit || 0) > 600) {
+          job._lastEmit = Date.now();
+          jobsStore.updateJob(job, {});
+        }
+      },
+    });
+
+    jobsStore.updateJob(job, { stage: 'Assembling the video', progress: 0.96 });
+    const out = await sources.remuxLocalPlaylist(fetched.playlistPath, paths.source, {
+      signal,
+      duration: fetched.duration || Number(ref && ref.duration) || 0,
+      onProgress: (value) => {
+        job.progress = 0.96 + Math.min(0.03, value * 0.03);
+        jobsStore.updateJob(job, {});
+      },
+    });
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    return { total: out.bytes, bytes: out.bytes, seconds: out.seconds, viaBrowser: true, segments: fetched.segments };
+  } catch (err) {
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    console.error(`[job ${job.id}] browser stream failed: ${err.code || 'ERR'} ${err.message}`);
+    /* Stopping the job is not a failure to explain: it was asked for. */
+    if (err.code === 'CANCELLED' || (signal && signal.aborted)) throw err;
+    return { failed: true, error: err };
+  }
 }
 
 /**
@@ -1475,6 +1544,30 @@ async function fetchThenCompress(job, ref) {
                 const retryUrl = ref.url || candidate;
                 info = await sources.downloadStream(retryUrl, paths.source, streamOptions);
                 if (retryUrl !== candidate) job.downloadUrl = retryUrl;
+              }
+            }
+            if (!info) {
+              /* Everything a request can change has been tried: the page's
+                 cookies, the clearance a browser earned, this CDN's own
+                 referer. What is left is the client itself — so fetch the
+                 pieces inside Chromium and remux them here. */
+              /* Some refusals are not about the client and a browser cannot fix
+                 them: DRM stays DRM, a live stream has no end, and a job the
+                 user stopped should stop. */
+              const pointless = ['STREAM_DRM', 'STREAM_LIVE', 'STREAM_EMPTY', 'STREAM_NO_VARIANTS', 'CANCELLED'];
+              const viaBrowser = pointless.includes(streamErr.code)
+                ? null
+                : await downloadStreamThroughBrowser(job, ref, candidate, paths, {
+                    signal: controller.signal,
+                  });
+              if (viaBrowser && !viaBrowser.failed) {
+                info = { total: viaBrowser.total };
+                job.streamViaBrowser = true;
+                if (viaBrowser.seconds) job.streamDuration = viaBrowser.seconds;
+              } else if (viaBrowser && viaBrowser.failed) {
+                /* Say what the browser said: it is a better sentence than
+                   "forbidden", and it is true. */
+                streamErr.message = `${streamErr.message} (a real browser was tried too: ${viaBrowser.error.message})`;
               }
             }
             if (!info) throw streamErr;

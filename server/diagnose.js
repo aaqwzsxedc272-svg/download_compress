@@ -293,18 +293,49 @@ async function diagnose(url, { browser } = {}) {
     steps.segment = await timed(async () => {
       const headers = { ...streamHeaders(ref || {}), ...((ref && ref.streamHeaders) || {}) };
       const probe = await probeFirstSegment({ url: steps.stream.value.mediaUrl }, headers);
-      const piece = probe.segment
-        ? await fetch(probe.segment, { headers: { ...headers, range: 'bytes=0-1023' } })
-            .then((res) => ({ total: Number((res.headers.get('content-range') || '').split('/')[1] || 0) }))
-            .catch(() => ({ total: 0 }))
-        : { total: 0 };
+      /* When the playlist itself is refused here — the surrit shape — the
+         playlist that was read in a browser already knows where its first piece
+         lives. Testing that piece asks the question that matters: will the
+         bytes arrive? */
+      const fromStored = !probe.segment && Boolean(ref && ref.firstSegment);
+      const segmentUrl = probe.segment || (ref && ref.firstSegment) || null;
+      const answer = segmentUrl
+        ? await fetch(segmentUrl, { headers: { ...headers, range: 'bytes=0-1023' } })
+            .then((res) => ({
+              status: res.status,
+              total: Number((res.headers.get('content-range') || '').split('/')[1] || 0),
+            }))
+            .catch(() => ({ status: 0, total: 0 }))
+        : { status: probe.status, total: 0 };
       return {
-        ok: probe.ok === true,
-        unknown: probe.ok === null,
+        ok: fromStored ? answer.status >= 200 && answer.status < 300 : probe.ok === true,
+        /* A 403 to a piece we know the address of is evidence; a request that
+           never answered is not. */
+        unknown: fromStored ? answer.status === 0 : probe.ok === null,
+        fromStored,
+        status: fromStored ? answer.status : probe.status,
+        where: fromStored ? 'the first piece of the video' : probe.where || 'the stream',
+        first: segmentUrl ? redact(segmentUrl) : null,
+        /* Unredacted, for the in-browser probe below; never printed. */
+        firstUnredacted: segmentUrl,
+        sizeEach: answer.total,
+      };
+    });
+  }
+
+  /* 4d. The same segment, fetched *inside* a browser. Together with 4c this
+     splits the two possibilities cleanly: refused here and refused there means
+     a dead link; refused here and served there means the CDN is refusing the
+     client, not the request — and only a browser-mediated download can work. */
+  if (steps.segment && steps.segment.ok && steps.segment.value.first && steps.browser.available && browser !== 'skip') {
+    const target = steps.segment.value.firstUnredacted;
+    steps.browserSegment = await timed(async () => {
+      const helper = require('./browser');
+      const probe = await helper.probeInBrowser(url, target);
+      return {
         status: probe.status,
-        where: probe.where || 'the stream',
-        first: probe.segment ? redact(probe.segment) : null,
-        sizeEach: piece.total,
+        bytes: probe.bytes,
+        ok: probe.status >= 200 && probe.status < 300,
       };
     });
   }
@@ -373,6 +404,22 @@ function verdictFor(steps) {
     return browser
       ? 'The download button was not found even in a browser — the page may have changed. Send this whole block.'
       : 'The download button only appears in a real browser, and this machine has none — run `npm run browser:install`.';
+  }
+  if (
+    steps.browserSegment &&
+    steps.browserSegment.ok &&
+    steps.browserSegment.value.ok &&
+    steps.segment &&
+    steps.segment.ok &&
+    !steps.segment.value.ok &&
+    !steps.segment.value.unknown
+  ) {
+    return (
+      `Decisive: the CDN serves this video to a real browser (HTTP ${steps.browserSegment.value.status}) and ` +
+      `refuses it to the app (HTTP ${steps.segment.value.status}) with the same headers. It is refusing the ` +
+      '*client*, not the request — TLS/HTTP fingerprinting, which no header can fix. The app now downloads ' +
+      'these through the browser itself (that is `npm start`, not the doctor), so paste the page and it should work.'
+    );
   }
   if (steps.segment && steps.segment.ok && !steps.segment.value.ok && steps.stream && steps.stream.ok) {
     const v = steps.segment.value;
@@ -527,6 +574,11 @@ function render({ url, steps }) {
         lines.push(
           `segment   HTTP ${v.status} · ${v.sizeEach ? `${MB(v.sizeEach)} each` : 'size unknown'} — the bytes really arrive`,
         );
+      } else if (v.fromStored) {
+        lines.push(
+          `segment   HTTP ${v.status || '?'} — the playlist is read in a browser and this first piece is refused ` +
+            `here${v.first ? ` · ${v.first}` : ''}`,
+        );
       } else if (v.unknown) {
         lines.push(`segment   could not be probed (${v.status || 'no answer'}) — not evidence either way`);
       } else {
@@ -534,6 +586,18 @@ function render({ url, steps }) {
           `segment   HTTP ${v.status || '?'} — ${v.where} refused${v.first ? ` · ${v.first}` : ''}`,
         );
       }
+    }
+  }
+
+  if (steps.browserSegment) {
+    if (!steps.browserSegment.ok) lines.push(`browserSeg FAILED — ${steps.browserSegment.error}`);
+    else {
+      const v = steps.browserSegment.value;
+      lines.push(
+        v.ok
+          ? `browserSeg HTTP ${v.status} · ${MB(v.bytes)} — a real browser IS served this`
+          : `browserSeg HTTP ${v.status} — a real browser is refused too`,
+      );
     }
   }
 

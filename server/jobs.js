@@ -280,6 +280,9 @@ function publicView(job) {
     downloadSpeed: job.downloadSpeed || null,
     downloadEta: job.downloadEta || null,
     downloadResumed: Boolean(job.downloadResumed),
+    /* True when the video had to be fetched inside a browser because its CDN
+       refuses every request the app can make. The card says so. */
+    streamViaBrowser: Boolean(job.streamViaBrowser),
     projection: job.projection || null,
     hostedUrl: job.hostedUrl || null,
     /* Keep this job's files through the sweeper (the storage panel toggles it). */

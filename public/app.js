@@ -332,6 +332,10 @@ function updateCard(entry, job) {
     }
   }
   if (job.source === 'relay') bits.push('via your browser');
+  /* Not the same thing: the *server's* browser fetched the video because the
+     CDN refuses every other client. It is the one fact that explains why a
+     download that answered 403 took two minutes and then worked. */
+  if (job.streamViaBrowser) bits.push('the CDN only talks to a browser — it was fetched there');
   if (job.downloadResumed) bits.push('download continued where it stopped');
   if (job.resumed) bits.push('picked up after a restart');
   metaEl.innerHTML = bits.join('<span style="opacity:.3">·</span>');

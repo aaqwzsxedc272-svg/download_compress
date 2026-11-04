@@ -345,6 +345,46 @@ The whole shape is tested end to end against a real server, a real master playli
 segments cut by ffmpeg (`npm run test:stream`), and `npm run doctor -- <link>` now prints the
 quality, the length and the estimated size of the stream it found.
 
+### When the CDN will only talk to a browser
+
+Some CDNs refuse the *client*, not the request. `surrit.com` — where missav's films live, behind
+DDoS-Guard — serves its playlist and every segment to a real Chromium and answers 403 to Node and
+to ffmpeg **with the page's cookies, referer and user agent**. Identical headers, different TLS
+fingerprint and HTTP/2 settings; no header can fix that. Every earlier attempt to fix it by adding
+a cookie was fixing the wrong thing.
+
+So the bytes are fetched by the client the CDN accepts:
+
+1. The page is opened in Chromium and its player is allowed to run — that is what earns the
+   session, and it is the only reason a page is opened at all.
+2. The master playlist, the chosen quality, the AES-128 key and every segment are fetched with
+   `fetch(…, { credentials: 'include' })` **inside** that page: same cookie jar, same TLS stack,
+   the same request the player makes. Each piece comes back base64 (the only way bytes cross
+   into Node) and is written straight to disk — a 2.5 GB film never sits in memory.
+   A CDN that sends no `Access-Control-Allow-Origin` makes that request a `TypeError`
+   rather than a 403 — the response is opaque to the page — so each URL has a second way in:
+   a **top-level navigation**, which is never CORS-checked and is still Chromium sending the
+   request with the same cookie jar. Bytes come back from the navigation directly, so nothing
+   is copied twice.
+3. The playlist is rewritten to point at the local pieces, and ffmpeg remuxes them with
+   `-allowed_extensions ALL -protocol_whitelist file,crypto -c copy` — it touches no network at
+   all, so the CDN cannot refuse it a second time. The normal pipeline takes it from there.
+
+It runs when the ordinary download has already failed, in the same job: a 403 is a detour, not an
+ending. `fetching` says so while it happens (*Fetching the stream through a browser · 42 %*), the
+card records it, and the pieces are deleted the moment the file is assembled. If the browser is
+refused too, the job says both things — *the video server refused the request … (a real browser was
+tried too: …)* — because at that point the link really is dead.
+
+A **pasted** playlist gets the same treatment one level earlier: `.m3u8` links are read through
+the browser when no request of ours can read them, so a bare surrit link resolves instead of being
+refused before a job exists.
+
+`npm run test:browser:stream` and `npm run test:browser:job` cover it with a fake Playwright — no
+100 MB download, no live site — against a real encrypted HLS stream on a fixture CDN that refuses a
+cookie-and-referer request and serves one that comes from a browser. The second test runs the whole
+app: page in, playable 720p MP4 out, the advert untouched, the pieces gone.
+
 ## A failure is not a dead end
 
 A 4K file on a small machine is hours of work, and the reported failure — `ENOENT … stat
@@ -767,6 +807,21 @@ real browser sees. Then it says what the combination means. `GET /api/diagnose-l
 the same thing as JSON, with `&format=text` for the block above. Signed tokens are redacted —
 they are short-lived credentials.
 
+Then it asks the *same piece* of a real browser. That pair of lines is the whole diagnosis:
+
+```
+segment     HTTP 403 — a segment refused · https://surrit.com/…/720p/video0.ts
+browserSeg  HTTP 200 · 1.8 MB — a real browser IS served this
+VERDICT     Decisive: the CDN serves this video to a real browser (HTTP 200) and refuses it to the
+            app (HTTP 403) with the same headers. It is refusing the *client*, not the request —
+            TLS/HTTP fingerprinting, which no header can fix. The app now downloads these through
+            the browser itself (that is `npm start`, not the doctor), so paste the page and it
+            should work.
+```
+
+Refused in both lines means the link is dead; refused here and served there means the app is
+right to fetch it through the browser, and that is what `npm start` will do.
+
 `npm run test:fallback` covers the observe-the-media path against a fake host that refuses plain
 requests, `npm run test:resolve` covers the resolver (challenge detected → browser asked → cookie
 carried → a normal page never costs a browser → an anchor the page offers outranks any derived
@@ -1062,6 +1117,19 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   answers 403 unless the request carries a referer is read anyway — the accepted headers are reused
   for every segment — and a CDN that issues a session cookie on the first request is read, queued from
   the picker's own reference and downloaded, because the cookie travels with that reference.
+- `npm run test:browser:stream` — 10 checks against a fake Playwright and a fixture CDN that refuses
+  a request carrying the page's cookie and referer and serves one that comes from a browser: the
+  same URL is refused to Node and served in-page, the best quality is the only one fetched, every
+  piece lands on disk with the key, a CDN whose responses are opaque to the page (no CORS) is
+  read by navigation and produces the same MP4, the rewritten playlist points at nothing but local files, real
+  ffmpeg remuxes them into a 720p MP4, a refused piece and a DRM stream and a nested playlist are
+  each named by their own code, a pasted playlist that Node cannot read resolves anyway, and the
+  doctor prints `browserSeg HTTP 200` with the *refusing the client* verdict.
+- `npm run test:browser:job` — 13 checks running the whole app against that CDN: the job finishes
+  instead of dying on a 403, it records that the browser did the fetching, the non-browser requests
+  really were refused and the segments really did arrive through the browser, the advert is fetched
+  zero times, only the 720p rendition is used, the assembled source is a video rather than a
+  playlist, the encoder makes a smaller 720p file out of it, and the pieces are gone afterwards.
 - `npm run test:progress` — 12 checks: real ffmpeg progress blocks (recorded from this build) are
   read one event per block with the time and the speed together, a speed-only update cannot reset
   the position to zero, `N/A` is not mistaken for 0%, and a real encode reports a climbing

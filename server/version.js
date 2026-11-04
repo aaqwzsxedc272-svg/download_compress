@@ -89,4 +89,128 @@ function banner() {
   );
 }
 
-module.exports = { describe, banner, readCommit };
+/* ---------------------------------------------------------------- freshness
+ *
+ * "I tested it and it is still broken" has now twice meant "the codespace was
+ * running the build before the fix". The banner answers *which* build; it never
+ * answered whether that build is the published one. So the checkout asks its
+ * remote, once, a few seconds after the server starts: a short `git ls-remote`
+ * (no fetch, no working-tree change), a five-minute memo, and silence when the
+ * answer cannot be had. Being offline is normal; being stale is not.
+ */
+
+const REMOTE_TTL_MS = 5 * 60 * 1000;
+const REMOTE_TIMEOUT_MS = 6000;
+
+/** The branch this checkout is on, or null when it is detached. */
+function readBranch() {
+  try {
+    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 4000,
+    })
+      .toString()
+      .trim();
+    return branch && branch !== 'HEAD' ? branch : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Run git asynchronously; resolves to stdout, rejects otherwise. */
+function gitAsync(args) {
+  const { execFile } = require('node:child_process');
+  return new Promise((resolve, reject) => {
+    execFile(
+      'git',
+      args,
+      { cwd: ROOT, timeout: REMOTE_TIMEOUT_MS, windowsHide: true },
+      (err, stdout) => (err ? reject(err) : resolve(String(stdout || ''))),
+    );
+  });
+}
+
+let remoteCheckedAt = 0;
+let remoteResult = null;
+let remoteRunning = null;
+
+/**
+ * Is the checkout the published one?
+ *
+ * @param {{run?: (args: string[]) => Promise<string>, force?: boolean}} options
+ * @returns {Promise<{branch, head, latest, behind, checkedAt, reason?}>}
+ */
+async function checkRemote({ run, force = false } = {}) {
+  const now = Date.now();
+  if (!force && remoteResult && now - remoteCheckedAt < REMOTE_TTL_MS) return remoteResult;
+  if (remoteRunning && !force) return remoteRunning;
+
+  const execute = run || gitAsync;
+  const branch = readBranch();
+  /* A tarball, a detached checkout or a machine without git: nothing to say. */
+  if (!branch) {
+    remoteResult = { branch: null, head: describe().commit, latest: null, behind: false, checkedAt: now };
+    remoteCheckedAt = now;
+    return remoteResult;
+  }
+
+  remoteRunning = (async () => {
+    let latest = null;
+    let reason = null;
+    try {
+      const out = await execute(['ls-remote', '--heads', 'origin', branch]);
+      /* "<sha>\trefs/heads/<branch>" */
+      const line = String(out)
+        .split('\n')
+        .map((entry) => entry.trim())
+        .find((entry) => entry.endsWith(`refs/heads/${branch}`));
+      if (line) latest = line.split(/\s+/)[0].slice(0, 7);
+    } catch (err) {
+      reason = err && err.code === 'ENOENT' ? 'git is not installed' : 'the remote could not be reached';
+    }
+    const head = describe().commit;
+    const result = {
+      branch,
+      head,
+      latest,
+      /* Only a real difference counts as behind. A short hash compared to a
+         full one, or a missing remote, must never nag the user. */
+      behind: Boolean(head && latest && head !== latest),
+      checkedAt: Date.now(),
+      ...(reason ? { reason } : {}),
+    };
+    remoteResult = result;
+    remoteCheckedAt = Date.now();
+    return result;
+  })();
+
+  try {
+    return await remoteRunning;
+  } finally {
+    remoteRunning = null;
+  }
+}
+
+/** One line for the console, and for the doctor: are the fixes in *this* box? */
+function freshnessLine(status) {
+  if (!status) return null;
+  if (!status.branch) return null;
+  if (status.behind) {
+    return (
+      `[build] This checkout is ${status.head || 'unknown'} but origin/${status.branch} is ${status.latest} — ` +
+      'you are running older code. Run: git pull'
+    );
+  }
+  if (!status.latest) return null; // offline, or no git: say nothing
+  return `Build: ${status.head} · up to date with origin/${status.branch}`;
+}
+
+/** The last answer, without asking again — for /api/health, which must not wait. */
+function knownRemote() {
+  return remoteResult;
+}
+
+module.exports = { describe, banner, readCommit, readBranch, checkRemote, knownRemote, freshnessLine };
+
+

@@ -3172,12 +3172,24 @@ async function boot() {
         bits.push(`resume ${v.features.resumableEncode ? '✓' : 'off'}`);
         bits.push(`browser ${v.features.cloudflareBrowser ? '✓' : '—'}`);
       }
+      /* A checkout older than the published one is the single most expensive
+         thing this page can hide: the fix is written, the tab is running the
+         build before it. Say it where the build is named. */
+      if (v.update && v.update.behind) {
+        bits.push(`older than origin — run git pull`);
+        build.classList.add('is-stale');
+      }
       build.textContent = bits.join(' · ');
       build.title =
         `Squeeze ${v.version || ''}${v.commit ? ` at ${v.commit}` : ''}\n` +
         `resumable encode: ${v.features?.resumableEncode ? 'on' : 'off'}\n` +
         `headless browser: ${v.browser && v.browser.available ? 'available' : (v.browser && v.browser.why) || 'not installed'}\n` +
-        `started: ${v.startedAt}`;
+        `started: ${v.startedAt}` +
+        (v.update && v.update.behind
+          ? `\n\nTHIS CHECKOUT IS OLDER THAN THE PUBLISHED BRANCH\n` +
+            `  here: ${v.update.head}   origin/${v.update.branch}: ${v.update.latest}\n` +
+            `  run: git pull && npm start`
+          : '');
     }
 
     const pill = $('#enginePill');

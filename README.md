@@ -477,6 +477,24 @@ on · browser no`), the footer of the page (`build 19d1471 · resume ✓ · brow
 `GET /api/version`. The commit is read from `.git` at startup, and reports `null` rather than a
 guess when the code is not a checkout.
 
+**And whether that build is the published one.** Twice now, "it still does not work" meant "the
+codespace never pulled": the fix was written, pushed and tested, and the machine was running the
+commit before it. So a few seconds after startup the checkout asks its remote — one
+`git ls-remote`, no fetch, no working-tree change, six-second timeout, memoised for five minutes —
+and answers in three places:
+
+```
+build    1.0.0 · 2e11725
+update   this checkout is c911021; origin/arena/e992889e-download-compress is 2e11725 —
+         these results are from older code. Run: git pull, then npm start
+```
+
+The page footer turns amber with *older than origin — run git pull* in its tooltip, and the
+doctor's **verdict** says it before it says anything about the link, because an opinion formed by
+old code is worth nothing. A tarball, a detached checkout, a machine without git or a box with no
+network says nothing at all — being offline is normal, and a report that cries wolf is ignored the
+way a wrong report always is. `BUILD_CHECK=0` turns it off.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -490,6 +508,7 @@ guess when the code is not a checkout.
 | `MAX_UPLOAD_MB` | `6144` | Largest accepted video, in megabytes |
 | `MAX_CONCURRENT` | `1` | Simultaneous encodes (one per CPU core is a good rule) |
 | `ALLOW_PRIVATE_HOSTS` | off | Permit `127.0.0.1` / metadata addresses (tests only) |
+| `BUILD_CHECK` | on | `0` stops the startup check against `origin` (offline boxes, tarballs) |
 | `HOSTED_LOCAL_KEEP_MINUTES` | 120 | How long a local copy stays after its upload finishes |
 | `FINISHED_KEEP_MINUTES` | 180 | How long a finished, unuploaded job stays |
 | `KEEP_UNFINISHED_HOURS` | 24 | How long an unfinished job's files are kept |
@@ -1096,7 +1115,9 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   frees exactly the file's size, a pinned job survives the bulk clean, and the meter is simulated
   across a month boundary (2 core-hours per hour on 2 cores, GB-months as an average, a restart
   that must not credit the hours it was not running, the quota and the month surviving a restart).
-- `npm run test:ui` — 35 checks of the browser code in jsdom: the disk pill, the presets, "just download"
+- `npm run test:ui` — 36 checks of the browser code in jsdom: the disk pill, the presets, the footer
+  turned amber when this checkout is behind the published branch (with `git pull` in its tooltip),
+  "just download"
   greying the encoder controls, the size list in the picker, the per-picker switch sending
   `noCompress`, the email button, the webhook panel, and a running job's card showing its link,
   the name its browser tab will carry, its own "Save the original too" button (which must not
@@ -1130,6 +1151,11 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   really were refused and the segments really did arrive through the browser, the advert is fetched
   zero times, only the 720p rendition is used, the assembled source is a video rather than a
   playlist, the encoder makes a smaller 720p file out of it, and the pieces are gone afterwards.
+- `npm run test:update` — 10 checks: a checkout matching its remote is not nagged, a stale one
+  names both hashes and the command, an offline box is told nothing (and the reason kept), missing
+  git is named rather than guessed, a remote answering for another branch is not evidence, the
+  answer is remembered so a page load costs nothing, and the doctor prints the stale line **and**
+  leads its verdict with it.
 - `npm run test:progress` — 12 checks: real ffmpeg progress blocks (recorded from this build) are
   read one event per block with the time and the speed together, a speed-only update cannot reset
   the position to zero, `N/A` is not mistaken for 0%, and a real encode reports a climbing

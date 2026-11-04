@@ -1214,6 +1214,24 @@ async function downloadStreamThroughBrowser(job, ref, candidate, paths, { signal
 
   const pageUrl = streamPageUrl(job, ref) || null;
   const dir = path.join(path.dirname(paths.source), 'stream-parts');
+
+  /* The pieces and the remuxed file exist at the same time, so this needs about
+     twice the film while it runs. A film that cannot fit must say so in two
+     seconds, not forty minutes. */
+  const estimate = Number((ref && (ref.estimatedBytes || ref.size)) || 0);
+  if (estimate > 0) {
+    const free = await sources.freeDiskBytes(jobsStore.DATA_DIR).catch(() => 0);
+    if (free > 0 && free < estimate * 2.05) {
+      throw Object.assign(
+        new Error(
+          `Not enough disk space for this stream: about ${formatGb(estimate)} to fetch and the same again to ` +
+            `assemble, but ${formatGb(free)} is free. Finished videos whose link is ready can be removed.`,
+        ),
+        { code: 'NO_DISK' },
+      );
+    }
+  }
+
   jobsStore.updateJob(job, {
     streamViaBrowser: true,
     stage: 'Fetching the stream through a real browser — this CDN refuses anything else',
@@ -1257,6 +1275,13 @@ async function downloadStreamThroughBrowser(job, ref, candidate, paths, { signal
     console.error(`[job ${job.id}] browser stream failed: ${err.code || 'ERR'} ${err.message}`);
     /* Stopping the job is not a failure to explain: it was asked for. */
     if (err.code === 'CANCELLED' || (signal && signal.aborted)) throw err;
+    /* A full disk is a fact about this machine, not a verdict on the link. */
+    if (err.code === 'ENOSPC' || /no space left on device/i.test(String(err.message || ''))) {
+      throw Object.assign(
+        new Error(`The disk filled up while fetching the stream. ${err.message}`),
+        { code: 'NO_DISK' },
+      );
+    }
     return { failed: true, error: err };
   }
 }
@@ -1554,7 +1579,14 @@ async function fetchThenCompress(job, ref) {
               /* Some refusals are not about the client and a browser cannot fix
                  them: DRM stays DRM, a live stream has no end, and a job the
                  user stopped should stop. */
-              const pointless = ['STREAM_DRM', 'STREAM_LIVE', 'STREAM_EMPTY', 'STREAM_NO_VARIANTS', 'CANCELLED'];
+              const pointless = [
+                'STREAM_DRM',
+                'STREAM_LIVE',
+                'STREAM_EMPTY',
+                'STREAM_NO_VARIANTS',
+                'NO_DISK',
+                'CANCELLED',
+              ];
               const viaBrowser = pointless.includes(streamErr.code)
                 ? null
                 : await downloadStreamThroughBrowser(job, ref, candidate, paths, {
@@ -1878,7 +1910,7 @@ app.get('/api/health', async (req, res) => {
     autoHost: AUTO_HOST,
     email: notify.describe(),
     publish: await publish.describe(),
-    version: version.describe(),
+    version: { ...version.describe(), update: version.knownRemote() },
     browserHosters: ['gofile', 'pixeldrain'],
     /* Cloudflare-protected hosts need this one to be true. */
     browserAvailable: (() => {
@@ -3437,6 +3469,18 @@ async function main() {
   console.log(`Squeeze listening on http://0.0.0.0:${PORT} (yt-dlp: ${ytdlp ? ytdlp.version : 'not installed'})`);
   /* The first line after a crash: which build is this, and are the fixes in? */
   console.log(version.banner());
+  /* ...and is it the *published* build? Twice now, "still broken" meant "the
+     machine never pulled". Asked in the background so a slow remote cannot
+     delay the first request. */
+  if (process.env.BUILD_CHECK !== '0') {
+    version
+      .checkRemote()
+      .then((status) => {
+        const line = version.freshnessLine(status);
+        if (line) console.log(line);
+      })
+      .catch(() => {});
+  }
 
   const mail = mailsettings.describe();
   if (mail.configured) {

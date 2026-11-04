@@ -10,6 +10,7 @@
   --accent: #c8f560;
   --accent-ink: #0b0e0a;
   --danger: #ff8a7a;
+  --warn: #e8b04b;
   --radius: 18px;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Roboto Mono", Menlo, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
@@ -1201,6 +1202,14 @@ input.is-off {
   font-size: 11px;
   color: var(--dim);
   opacity: 0.8;
+}
+
+/* This checkout is older than the published branch: the fix exists, this tab
+   is not running it. That is worth a colour, not a whisper. */
+.footer-build.is-stale {
+  color: var(--warn, #e8b04b);
+  opacity: 1;
+  font-weight: 600;
 }
 
 /* ------------------------------------------------- storage & session sheet */

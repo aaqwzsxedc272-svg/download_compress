@@ -53,10 +53,23 @@ async function timed(fn) {
  * @param {string} url  the link the user pasted
  * @returns {Promise<object>} every stage, with a text rendering attached
  */
-async function diagnose(url, { browser } = {}) {
+async function diagnose(url, { browser, remote = undefined } = {}) {
   const steps = {};
   const version = require('./version').describe();
   steps.version = version;
+
+  /* Is this checkout the published one? The most expensive bug of the last
+     week was not in the code: it was a machine running the build before the
+     fix, and a doctor that said nothing about it. */
+  steps.remote = await (async () => {
+    if (remote !== undefined) return remote;
+    try {
+      const { checkRemote } = require('./version');
+      return await checkRemote();
+    } catch {
+      return null;
+    }
+  })();
 
   /* Has this process survived something? A caught crash that nobody sees is a
      crash waiting to be reported again as "it stopped by itself". */
@@ -391,6 +404,12 @@ function verdictFor(steps) {
   const files = resolve && resolve.ok ? resolve.value.files : [];
   const offered = files[0] && files[0].refUrl;
 
+  if (steps.remote && steps.remote.behind) {
+    return (
+      `This machine is running ${steps.remote.head}, but the published code is ${steps.remote.latest} — ` +
+      'the fix may already be written. Run `git pull` and `npm start`, then run this again.'
+    );
+  }
   if (!browser && plain && plain.challenge) {
     return 'This host is checking for a browser and this machine has none — run `npm run browser:install`.';
   }
@@ -473,6 +492,14 @@ function render({ url, steps }) {
     `build     ${steps.version.version || '?'}${steps.version.commit ? ` · ${steps.version.commit}` : ' · no commit (not a git checkout?)'}`,
   );
   lines.push(`node      ${steps.version.node} · resumable encode ${yes(steps.version.features.resumableEncode)}`);
+  if (steps.remote && steps.remote.behind) {
+    lines.push(
+      `update    this checkout is ${steps.remote.head}; origin/${steps.remote.branch} is ${steps.remote.latest} — ` +
+        'these results are from older code. Run: git pull, then npm start',
+    );
+  } else if (steps.remote && steps.remote.latest) {
+    lines.push(`update    up to date with origin/${steps.remote.branch} (${steps.remote.latest})`);
+  }
   if (steps.survived && steps.survived.count > 0) {
     lines.push(
       `survived  ${steps.survived.count} error(s) that would have stopped the server — last: ${steps.survived.last}`,

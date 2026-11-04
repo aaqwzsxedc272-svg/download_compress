@@ -51,6 +51,16 @@ const HEALTH = {
   hosters: [{ id: 'pixeldrain', label: 'pixeldrain' }],
   platformDownloads: false,
   email: { configured: true, to: 'aaqwzsxedc272@gmail.com' },
+  version: {
+    commit: 'c911021',
+    version: '1.0.0',
+    startedAt: '2026-11-04T03:00:00.000Z',
+    features: { resumableEncode: true, cloudflareBrowser: true },
+    browser: { available: true },
+    /* This checkout is one commit behind the published branch — the state that
+       cost a day of "it still does not work". */
+    update: { branch: 'arena/e992889e-download-compress', head: 'c911021', latest: '2e11725', behind: true },
+  },
 };
 
 const LINKS = {
@@ -313,6 +323,16 @@ async function boot({
     if (!/GB/.test(disk)) throw new Error(`disk pill says "${disk}"`);
     if (!/encoder ready/.test(doc.getElementById('engineText').textContent)) {
       throw new Error('engine pill did not update');
+    }
+  });
+
+  await test('the footer says when this checkout is behind the published branch', async () => {
+    const build = doc.getElementById('buildInfo');
+    if (!/build c911021/.test(build.textContent)) throw new Error(`build not named: "${build.textContent}"`);
+    if (!/git pull/.test(build.textContent)) throw new Error(`no pull hint: "${build.textContent}"`);
+    if (!build.classList.contains('is-stale')) throw new Error('the stale build looks like any other');
+    if (!/here: c911021/.test(build.title) || !/2e11725/.test(build.title)) {
+      throw new Error(`the tooltip does not carry both hashes: "${build.title}"`);
     }
   });
 

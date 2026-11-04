@@ -1057,6 +1057,50 @@ ${Array.from({ length: 20 }, (_, i) => `#EXTINF:6.006,\nhttps://cdn.example/prev
     }
   });
 
+  await test('a refusal that hands out a cookie is retried with that cookie', async () => {
+    clearStreamCache();
+    const calls = [];
+    stubFetch((url, init) => {
+      const cookie = ((init && init.headers) || {}).cookie || '';
+      calls.push(cookie);
+      /* Every request that does not replay the gate is refused — but the
+         refusal itself is where the cookie is issued, which is exactly how
+         DDoS-Guard and friends behave. */
+      if (!/gate=open/.test(cookie)) {
+        return {
+          raw: 'session required',
+          type: 'text/plain',
+          status: 403,
+          headers: { 'set-cookie': 'gate=open; Path=/; Max-Age=3600' },
+        };
+      }
+      return { raw: MEDIA, type: 'application/vnd.apple.mpegurl' };
+    });
+    const info = await inspectPlaylist('https://surrit.com/91f6/playlist.m3u8');
+    assert.ok(info.duration > 0, 'the playlist was read');
+    assert.ok(calls.length >= 2, `only ${calls.length} request(s)`);
+    assert.ok(/gate=open/.test(calls[calls.length - 1]), calls.join(' | '));
+    /* And it is handed back, or the download would have to earn it again. */
+    assert.ok(/gate=open/.test(info.headers.cookie || ''), JSON.stringify(info.headers));
+  });
+
+  await test('what the resolver learned is stored on the file, not just used once', async () => {
+    clearStreamCache();
+    stubFetch((url) => {
+      if (url.includes('playlist.m3u8')) return { raw: FILM_PLAYLIST, type: 'application/vnd.apple.mpegurl' };
+      return {
+        raw: `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+          <script>player.setup({file:"https://surrit.com/91f6/playlist.m3u8"});</script></body></html>`,
+        type: 'text/html',
+      };
+    });
+    const result = await resolve('https://missav.ws/en/dandya-045');
+    const ref = result.files[0].ref;
+    assert.ok(ref.streamHeaders, 'no accepted header set on the ref');
+    assert.match(String(ref.streamHeaders.referer || ''), /^https:\/\/missav\.ws\/?$/);
+    assert.equal(ref.streamHeaders.origin, 'https://missav.ws');
+  });
+
   await test('a stream whose playlist is really a web page says so', async () => {
     clearStreamCache();
     stubFetch(() => ({ raw: '<!doctype html><html><body>nope</body></html>', type: 'text/html' }));

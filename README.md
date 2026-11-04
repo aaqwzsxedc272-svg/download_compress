@@ -289,6 +289,18 @@ filtered out before anything looked at them, and the ad was what remained.
 * **Live and DRM are refused up front**: a live stream has no end to save, and a protected one
   cannot be saved by any downloader. Both say so instead of failing twenty minutes later.
 
+**The headers a playlist answered to are kept, not just used once.** Resolving a link and
+downloading it are two different requests, minutes apart, from a possibly different connection — and a
+CDN that issues a session cookie on the first one refuses the second without it. That is the shape of
+"it resolved, then the job said STREAM_FORBIDDEN". So the accepted header set (referer, origin,
+`Sec-Fetch-*`, and every cookie handed out — including by the refusals themselves) is stored on the
+file reference, reused by the resolver and sent to every segment by ffmpeg.
+
+If the stream still refuses at download time, the page is opened once in a real browser: that earns
+whatever clearance the CDN wants and reports the playlist URL the player actually requested, which
+may not be the one the HTML named. One launch, one retry, then an honest failure that says which of
+the two situations it is.
+
 Passing a stream link on its own works too: a bare playlist carries no referer, so a CDN that only
 serves the site that embeds it used to answer 403. The plausible referers are now tried (the CDN's
 own origin, then a same-site request shape), and **whatever header set was accepted is reused for
@@ -957,7 +969,7 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:crash` — 10 checks against a real server process: an uncaught exception and an
   unhandled rejection are survived, the API keeps answering afterwards, both are written to
   `data/crash.log` with the build, and SIGTERM still stops it.
-- `npm run test:resolve` — 66 resolver tests against stubbed APIs (real response shapes),
+- `npm run test:resolve` — 68 resolver tests against stubbed APIs (real response shapes),
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before
   a minted link, plus the page-title naming rule and fileditch's minted-link/player routes. It also
@@ -1004,13 +1016,14 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   and survives, a two-hour-old crash keeps its files for *Try again*, a day-old one is cleaned
   up, a pinned job is never swept, a job with an encoder on it survives even when its status says
   finished, and every busy status is in the protected set.
-- `npm run test:stream` — 26 checks end to end: a page carrying an advert and an HLS master on
+- `npm run test:stream` — 31 checks end to end: a page carrying an advert and an HLS master on
   another host resolves to the stream (not the ad), the ad is requested **zero** times, the 720p
   variant is fetched and the 360p one is not, the segments become one MP4 with audio at 720p, the
   result is named after the page rather than `playlist.m3u8`, and a pasted `.m3u8` works by
   itself, the same stream queued from the picker by its reference finishes too, and a CDN that
   answers 403 unless the request carries a referer is read anyway — the accepted headers are reused
-  for every segment.
+  for every segment — and a CDN that issues a session cookie on the first request is read, queued from
+  the picker's own reference and downloaded, because the cookie travels with that reference.
 - `npm run test:progress` — 12 checks: real ffmpeg progress blocks (recorded from this build) are
   read one event per block with the time and the speed together, a speed-only update cannot reset
   the position to zero, `N/A` is not mistaken for 0%, and a real encode reports a climbing

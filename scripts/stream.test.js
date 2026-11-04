@@ -202,6 +202,27 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
       return fs.createReadStream(file).pipe(res);
     }
 
+    /* A CDN that hands out a session cookie on the first request and refuses
+       every request afterwards that does not replay it. This is the shape of
+       the field report: resolving the link worked, the job that ran a minute
+       later failed with STREAM_FORBIDDEN, because the cookie earned at resolve
+       time was never carried into the download. */
+    if (url.pathname.startsWith('/session/')) {
+      const cookie = req.headers.cookie || '';
+      if (!/gate=open/.test(cookie)) {
+        res.writeHead(403, {
+          'content-type': 'text/plain',
+          'set-cookie': 'gate=open; Path=/; Max-Age=3600',
+        });
+        return res.end('session required');
+      }
+      const file = path.join(MEDIA_DIR, url.pathname.replace('/session/', 'stream/'));
+      if (!fs.existsSync(file)) return res.writeHead(404).end();
+      const type = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
+      res.writeHead(200, { 'content-type': type, 'content-length': String(fs.statSync(file).size) });
+      return fs.createReadStream(file).pipe(res);
+    }
+
     if (url.pathname.startsWith('/stream/')) {
       const file = path.join(MEDIA_DIR, url.pathname.replace('/stream/', 'stream/'));
       if (!fs.existsSync(file)) return res.writeHead(404).end();
@@ -388,6 +409,55 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
       'and it is a video, not an empty file',
       Boolean(lockedDone?.outputBytes) && lockedDone.outputBytes > 0,
       `${lockedDone?.outputBytes} bytes`,
+    );
+
+    /* ------------------------------- 6. a CDN that hands out a session cookie
+       The report exactly: resolving the link answered, the job a minute later
+       said STREAM_FORBIDDEN. The cookie issued by the first response is the
+       difference, and it has to survive from the resolve to the download. */
+    const sessionUrl = `http://127.0.0.1:${MEDIA_PORT}/session/playlist.m3u8`;
+    const sessionList = await (await fetch(`${BASE}/api/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: sessionUrl }),
+    })).json();
+    check(
+      'a CDN that issues a session cookie is read anyway',
+      Boolean(sessionList.files?.length),
+      sessionList.error || `${sessionList.files?.length} files`,
+    );
+    check(
+      'and the cookie travels with the file it listed',
+      Boolean(sessionList.files?.[0]?.ref),
+      sessionList.files?.[0]?.ref ? Object.keys(sessionList.files[0].ref).join(',') : 'no ref',
+    );
+
+    /* Queue it from the reference the picker would post — that is the path that
+       drops fields if anyone forgets one. */
+    const sessionJob = await (await fetch(`${BASE}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'ref',
+        ref: sessionList.files?.[0]?.ref,
+        name: sessionList.files?.[0]?.name,
+        presetId: 'small',
+      }),
+    })).json();
+    check('a job queued from that reference starts', Boolean(sessionJob.job?.id), sessionJob.error || '');
+    const sessionDone = await waitFor(async () => {
+      const job = sessionJob.job?.id ? await getJob(sessionJob.job.id) : null;
+      return job && ['done', 'hosted', 'error'].includes(job.status) ? job : null;
+    }, { timeoutMs: 300000 });
+    check(
+      'and it downloads, because the cookie earned at resolve goes with it',
+      ['done', 'hosted'].includes(sessionDone?.status),
+      sessionDone?.error || sessionDone?.status,
+    );
+    check(
+      'with a real video at the end',
+      Boolean(sessionDone?.outputBytes) && sessionDone.outputBytes > 0,
+      `${sessionDone?.outputBytes} bytes`,
     );
   } finally {
     if (proc) proc.kill('SIGKILL');

@@ -1102,6 +1102,14 @@ function reportJobError(job, err) {
       : job.isStream && err.code === 'FFMPEG_FAILED'
         ? `The stream stopped partway through (${err.detail || 'ffmpeg could not read it to the end'}). ` +
           'Nothing was saved, so the link starts again from the beginning.'
+      : job.isStream && /^STREAM_/.test(String(err.code || ''))
+        ? `The video server refused the stream${
+            job.ref && job.ref.accessRefreshedAt ? ', even after the page was opened in a browser' : ''
+          }. ` +
+          (job.ref && job.ref.accessRefreshedAt
+            ? 'That CDN wants a cookie earned on your own connection: open the page in your browser, copy the ' +
+              '.m3u8 address the player requests, and paste that link instead.'
+            : 'That link is served only to the page it belongs to. Paste the page the video plays on instead.')
       : err.code === 'FFMPEG_FAILED'
       ? `ffmpeg could not process this file${err.codecNote ? ` (${err.codecNote})` : ''}.` +
         `${ffmpegDetail ? ` It said: ${ffmpegDetail}` : ''} Try another preset, or a different source file.`
@@ -1145,16 +1153,77 @@ async function browserClearance(pageUrl) {
     const browser = require('./browser');
     if (!browser.available()) return null;
     const captured = await browser.captureMedia(pageUrl, { timeoutMs: 45000 });
-    if (!captured || !captured.cookie) return null;
-    const playlist = (captured.media || []).find((item) => isPlaylistUrl(item.url));
+    if (!captured) return null;
+
+    /* What the page's own player asked for, in the order that decides which one
+       is the film: the same ranking the resolver uses, so an advert or a
+       preview beside it cannot win here either. */
+    const urls = [
+      ...new Set((captured.media || []).map((item) => item && item.url).filter((u) => u && isPlaylistUrl(u))),
+    ];
+    let playlist = urls[0] || null;
+    if (urls.length > 1) {
+      const { rankStreams } = require('../shared/resolve');
+      const ranked = await rankStreams(urls, pageUrl).catch(() => []);
+      if (ranked.length) playlist = ranked[0].url;
+    }
+
+    const entry = (captured.media || []).find((item) => item && item.url === playlist) || null;
+    if (!captured.cookie && !playlist) return null;
     return {
-      cookie: captured.cookie,
+      cookie: captured.cookie || null,
       userAgent: captured.userAgent || null,
-      referer: (playlist && playlist.referer) || pageUrl,
+      /* A browser sends the page's origin for a cross-site subresource; the
+         capture recorded whatever this CDN actually accepted. */
+      referer: (entry && entry.referer) || pageUrl,
+      playlist,
     };
   } catch {
     return null;
   }
+}
+
+/** The page this stream belongs to, as far as the job knows. */
+function streamPageUrl(job, ref) {
+  return (
+    (job && job.url) ||
+    (ref && (ref.page || ref.referer)) ||
+    null
+  );
+}
+
+/**
+ * The stream refused a request that the resolver had already succeeded at.
+ *
+ * That happens for one of two reasons, and both are cured the same way: the
+ * session cookie the CDN issued during resolution was not carried into the job,
+ * or the link is only served to a browser that played the page itself. One
+ * browser launch answers both — it plays the page, keeps the cookies, and
+ * reports the playlist URL the player actually requested, which may not even be
+ * the URL we stored.
+ *
+ * Returns true when `ref` now carries something new worth retrying.
+ */
+async function recoverStreamAccess(job, ref, { stage } = {}) {
+  const pageUrl = streamPageUrl(job, ref);
+  if (!pageUrl) return false;
+  const clearance = await browserClearance(pageUrl);
+  if (!clearance) return false;
+
+  const changed =
+    Boolean(clearance.playlist) ||
+    Boolean(clearance.cookie && clearance.cookie !== ref.cookie);
+
+  if (clearance.playlist) ref.url = clearance.playlist;
+  if (clearance.cookie) ref.cookie = clearance.cookie;
+  if (clearance.userAgent) ref.userAgent = clearance.userAgent;
+  if (clearance.referer) ref.referer = clearance.referer;
+  /* Learned afresh, so the stale set must not outrank it. */
+  ref.streamHeaders = null;
+  ref.accessRefreshedAt = Date.now();
+  jobsStore.updateJob(job, { ref });
+  if (stage) jobsStore.updateJob(job, { stage });
+  return changed;
 }
 
 /**
@@ -1170,7 +1239,26 @@ async function fetchThenCompress(job, ref) {
 
     /* Every URL that might serve this file, best first. Most hosts have one;
        fileditch has a handful because its signed links rot in half an hour. */
-    let candidates = await directCandidates(ref).catch(async () => [await directUrl(ref)]);
+    const streamRef = Boolean(ref && String(ref.resolver) === 'stream');
+    /* Marked before anything can fail: a stream job that dies while *resolving*
+       is still a stream job, and its error has to be the sentence about the
+       page it belongs to, not a generic one. */
+    if (streamRef && !job.isStream) jobsStore.updateJob(job, { isStream: true });
+    let candidates;
+    try {
+      candidates = await directCandidates(ref);
+    } catch (resolveErr) {
+      if (!streamRef) throw resolveErr;
+      /* The playlist answered when the link was pasted and refuses now. Before
+         failing the job, play the page once in a real browser and use what its
+         player actually loaded — that is the one thing that cures a missing
+         session cookie and a link that is only served to a browser. */
+      const recovered = await recoverStreamAccess(job, ref, {
+        stage: 'The stream refused the request — opening the page once to earn its clearance',
+      });
+      if (!recovered) throw resolveErr;
+      candidates = await directCandidates(ref).catch(async () => [await directUrl(ref)]);
+    }
     let url = candidates[0];
     /* A stream has no Content-Length: its size is the length of the video times
        the bitrate of the variant that was chosen. Resolving the variant here
@@ -1364,22 +1452,26 @@ async function fetchThenCompress(job, ref) {
           try {
             info = await sources.downloadStream(candidate, paths.source, streamOptions);
           } catch (streamErr) {
-            /* The stream's CDN may be behind the same bot check as its page.
-               One browser launch is worth it: it is the difference between a
-               403 and the video. Nothing is retried twice. */
-            if (!ref.cookie) {
-              const clearance = await browserClearance(job.url || url);
-              if (clearance) {
-                jobsStore.updateJob(job, { stage: 'The video CDN wanted a browser — trying with its clearance' });
-                Object.assign(ref, clearance);
+            /* The stream's CDN may be behind the same bot check as its page, or
+               may have refused the segments after answering the playlist. One
+               browser launch is worth it: it is the difference between a 403 and
+               the video. Retried once, at most — the browser is not free. */
+            if (!ref.accessRefreshedAt) {
+              const recovered = await recoverStreamAccess(job, ref, {
+                stage: 'The video CDN wanted a browser — trying with its clearance',
+              });
+              if (recovered) {
                 Object.assign(streamOptions.extraHeaders, {
-                  referer: clearance.referer,
-                  cookie: clearance.cookie,
-                  ...(clearance.userAgent ? { 'user-agent': clearance.userAgent } : {}),
+                  referer: ref.referer,
+                  ...(ref.cookie ? { cookie: ref.cookie } : {}),
+                  ...(ref.userAgent ? { 'user-agent': ref.userAgent } : {}),
+                  ...(ref.streamHeaders || {}),
                 });
-                /* The playlist was read before the clearance existed; the URL
-                   is still right, and the headers are now the ones that work. */
-                info = await sources.downloadStream(candidate, paths.source, streamOptions);
+                /* The playlist may have moved: the player asked for a different
+                   URL than the one the page's HTML named. */
+                const retryUrl = ref.url || candidate;
+                info = await sources.downloadStream(retryUrl, paths.source, streamOptions);
+                if (retryUrl !== candidate) job.downloadUrl = retryUrl;
               }
             }
             if (!info) throw streamErr;

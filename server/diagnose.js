@@ -252,6 +252,19 @@ async function diagnose(url, { browser } = {}) {
           quality: variant.height ? `${variant.height}p` : variant.name || 'unknown',
           bandwidth: variant.bandwidth,
         })),
+        /* What the CDN accepted, in the same words the download will send.
+           "resolve worked, the job failed" is almost always a cookie or a
+           referer that was in one request and not the other. */
+        accepted: (() => {
+          const headers = ref && ref.streamHeaders;
+          if (!headers || typeof headers !== 'object') return null;
+          const cookie = String(headers.cookie || '');
+          return {
+            referer: headers.referer || null,
+            origin: headers.origin || null,
+            cookie: cookie ? cookie.split(';').map((part) => part.split('=')[0].trim()).filter(Boolean) : [],
+          };
+        })(),
         /* The playlists the page offered and how long each one runs — the
            difference between the film and the sample beside it. */
         candidates: (resolved.streamCandidates || []).map((entry) => ({
@@ -438,6 +451,13 @@ function render({ url, steps }) {
       lines.push(`          playing ${v.chosen}`);
       if (v.variants.length > 1) {
         lines.push(`          qualities offered: ${v.variants.map((variant) => variant.quality).join(', ')}`);
+      }
+      if (v.accepted) {
+        lines.push(
+          `          accepted: referer ${v.accepted.referer || '(none)'}` +
+            `${v.accepted.origin ? ` · origin ${v.accepted.origin}` : ''}` +
+            ` · cookie ${v.accepted.cookie.length ? v.accepted.cookie.join(', ') : 'none'}`,
+        );
       }
       if (v.candidates && v.candidates.length > 1) {
         /* Which of the page's playlists won, and what it beat. A sample beside

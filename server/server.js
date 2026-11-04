@@ -1211,7 +1211,7 @@ async function recoverStreamAccess(job, ref, { stage } = {}) {
   if (!clearance) return false;
 
   const changed =
-    Boolean(clearance.playlist) ||
+    Boolean(clearance.playlist && clearance.playlist !== ref.url) ||
     Boolean(clearance.cookie && clearance.cookie !== ref.cookie);
 
   if (clearance.playlist) ref.url = clearance.playlist;
@@ -1220,7 +1220,10 @@ async function recoverStreamAccess(job, ref, { stage } = {}) {
   if (clearance.referer) ref.referer = clearance.referer;
   /* Learned afresh, so the stale set must not outrank it. */
   ref.streamHeaders = null;
-  ref.accessRefreshedAt = Date.now();
+  /* Only when there is something to retry with: this flag is what the error
+     message reads to decide whether a browser was really tried, and what stops
+     the recovery from being attempted twice. */
+  if (changed) ref.accessRefreshedAt = Date.now();
   jobsStore.updateJob(job, { ref });
   if (stage) jobsStore.updateJob(job, { stage });
   return changed;

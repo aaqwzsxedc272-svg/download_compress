@@ -297,6 +297,18 @@ FORBIDDEN a second later: same page, different session. The page's cookies and u
 kept and sent to its CDN, stored on the file reference, and printed by the doctor
 (`accepted: referer … · origin … · cookie missav_session`).
 
+**A manifest that opens is not a video that downloads.** A CDN can serve the playlist to anyone and
+gate every segment behind a session — that is what "resolve said 1 file, the job said FORBIDDEN"
+looks like one level down. So a real segment is fetched with the exact headers the download will send,
+before the file is offered. If it refuses, one browser visit earns the session and takes over; with no
+browser to earn it, the file is still offered but the card says *its CDN may ask for a session — the
+download will try a browser*, instead of pretending it is ready. The doctor prints the same probe:
+
+```
+segment   HTTP 206 · 1.8 MB each — the bytes really arrive
+segment   HTTP 403 — a segment refused · https://surrit.com/…/720p/video0.ts
+```
+
 **A stream that cannot be read is never offered.** Finding a playlist in the HTML is not the same
 as being able to open it. If it refuses, one browser visit is made — the player earns the session
 and reports the URL it actually requested — and only what could really be read reaches the picker.
@@ -991,7 +1003,7 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:crash` — 10 checks against a real server process: an uncaught exception and an
   unhandled rejection are survived, the API keeps answering afterwards, both are written to
   `data/crash.log` with the build, and SIGTERM still stops it.
-- `npm run test:resolve` — 73 resolver tests against stubbed APIs (real response shapes),
+- `npm run test:resolve` — 75 resolver tests against stubbed APIs (real response shapes),
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before
   a minted link, plus the page-title naming rule and fileditch's minted-link/player routes. It also
@@ -1042,7 +1054,7 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   and survives, a two-hour-old crash keeps its files for *Try again*, a day-old one is cleaned
   up, a pinned job is never swept, a job with an encoder on it survives even when its status says
   finished, and every busy status is in the protected set.
-- `npm run test:stream` — 31 checks end to end: a page carrying an advert and an HLS master on
+- `npm run test:stream` — 34 checks end to end: a page carrying an advert and an HLS master on
   another host resolves to the stream (not the ad), the ad is requested **zero** times, the 720p
   variant is fetched and the 360p one is not, the segments become one MP4 with audio at 720p, the
   result is named after the page rather than `playlist.m3u8`, and a pasted `.m3u8` works by

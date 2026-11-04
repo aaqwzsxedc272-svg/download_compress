@@ -249,6 +249,9 @@ async function diagnose(url, { browser } = {}) {
         estimatedBytes: info.estimatedBytes,
         segments: info.segments,
         chosen: redact(info.url),
+        /* Kept unredacted for the segment probe below; redacted again when it
+           is printed. */
+        mediaUrl: info.url,
         variants: (info.variants || []).map((variant) => ({
           quality: variant.height ? `${variant.height}p` : variant.name || 'unknown',
           bandwidth: variant.bandwidth,
@@ -275,6 +278,33 @@ async function diagnose(url, { browser } = {}) {
           chosen: ref && entry.url === ref.url,
           url: redact(entry.url),
         })),
+      };
+    });
+  }
+
+  /* 4c. One real segment, with the headers the download will send.
+     This is the question a playlist cannot answer: a CDN can serve the manifest
+     to anyone and gate every piece of the video behind a cookie. "The stream
+     was found" and "the bytes will arrive" are different claims, and this is
+     the one that decides whether the job will finish. */
+  if (steps.stream && steps.stream.ok) {
+    const { streamHeaders, resolve: resolveAgain, probeFirstSegment } = require('../shared/resolve');
+    const ref = (await resolveAgain(url).catch(() => null))?.files?.[0]?.ref;
+    steps.segment = await timed(async () => {
+      const headers = { ...streamHeaders(ref || {}), ...((ref && ref.streamHeaders) || {}) };
+      const probe = await probeFirstSegment({ url: steps.stream.value.mediaUrl }, headers);
+      const piece = probe.segment
+        ? await fetch(probe.segment, { headers: { ...headers, range: 'bytes=0-1023' } })
+            .then((res) => ({ total: Number((res.headers.get('content-range') || '').split('/')[1] || 0) }))
+            .catch(() => ({ total: 0 }))
+        : { total: 0 };
+      return {
+        ok: probe.ok === true,
+        unknown: probe.ok === null,
+        status: probe.status,
+        where: probe.where || 'the stream',
+        first: probe.segment ? redact(probe.segment) : null,
+        sizeEach: piece.total,
       };
     });
   }
@@ -343,6 +373,14 @@ function verdictFor(steps) {
     return browser
       ? 'The download button was not found even in a browser — the page may have changed. Send this whole block.'
       : 'The download button only appears in a real browser, and this machine has none — run `npm run browser:install`.';
+  }
+  if (steps.segment && steps.segment.ok && !steps.segment.value.ok && steps.stream && steps.stream.ok) {
+    const v = steps.segment.value;
+    return (
+      `The playlist opens, but ${v.where} refused (HTTP ${v.status}) with exactly the headers the download ` +
+      'sends. This CDN gates the video itself, not the manifest — the cookie or referer it wants has to come ' +
+      'from your own browser session. Send this block: the `accepted:` line above says what was tried.'
+    );
   }
   if (steps.stream) {
     if (!steps.stream.ok) return `The stream was found but could not be read: ${steps.stream.error}. Send this block.`;
@@ -477,6 +515,24 @@ function render({ url, steps }) {
               `${entry.preview ? ' · a preview by name' : ''} · ${entry.url}`,
           );
         }
+      }
+    }
+  }
+
+  if (steps.segment) {
+    if (!steps.segment.ok) lines.push(`segment   FAILED — ${steps.segment.error}`);
+    else {
+      const v = steps.segment.value;
+      if (v.ok) {
+        lines.push(
+          `segment   HTTP ${v.status} · ${v.sizeEach ? `${MB(v.sizeEach)} each` : 'size unknown'} — the bytes really arrive`,
+        );
+      } else if (v.unknown) {
+        lines.push(`segment   could not be probed (${v.status || 'no answer'}) — not evidence either way`);
+      } else {
+        lines.push(
+          `segment   HTTP ${v.status || '?'} — ${v.where} refused${v.first ? ` · ${v.first}` : ''}`,
+        );
       }
     }
   }

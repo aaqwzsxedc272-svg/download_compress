@@ -1242,6 +1242,71 @@ ${Array.from({ length: 20 }, (_, i) => `#EXTINF:6.006,\nhttps://cdn.example/prev
     }
   });
 
+  /* "The manifest opened, so the file is fine" is the assumption that produced
+     a job failing with STREAM_FORBIDDEN a minute after the picker said 1 file.
+     A CDN can serve the playlist to anyone and gate every segment. */
+  const SEGMENTS_GATED = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+${Array.from({ length: 30 }, (_, i) => `#EXTINF:6.006,\nhttps://cdn.example/gated/seg${i}.ts`).join('\n')}
+#EXT-X-ENDLIST
+`;
+
+  await test('a playlist that opens is not enough — the segments are tried too', async () => {
+    clearStreamCache();
+    stubFetch((url) => {
+      if (url.startsWith('https://missav.ws/')) {
+        return {
+          raw: `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+            <script>player.setup({file:"https://cdn.example/gated/playlist.m3u8"});</script></body></html>`,
+          type: 'text/html',
+        };
+      }
+      if (url.includes('playlist.m3u8') || url.includes('/gated/')) {
+        if (url.includes('.ts')) return { raw: 'no', type: 'text/plain', status: 403 };
+        return { raw: SEGMENTS_GATED, type: 'application/vnd.apple.mpegurl' };
+      }
+      return { raw: '', type: 'text/plain', status: 404 };
+    });
+    /* No browser to earn a session with: the file is still offered — the
+       download retries with one — but the card says the CDN may ask. */
+    const result = await resolve('https://missav.ws/en/dandya-045');
+    assert.equal(result.files.length, 1);
+    assert.match(result.files[0].note, /may ask for a session/);
+  });
+
+  await test('and with a browser, resolving earns the session instead of warning', async () => {
+    clearStreamCache();
+    stubFetch((url) => {
+      if (url.startsWith('https://missav.ws/')) {
+        return {
+          raw: `<html><head><title>DANDYA-045 - MissAV</title></head><body>
+            <script>player.setup({file:"https://cdn.example/gated/playlist.m3u8"});</script></body></html>`,
+          type: 'text/html',
+        };
+      }
+      if (url.includes('.ts')) return { raw: 'no', type: 'text/plain', status: 403 };
+      return { raw: SEGMENTS_GATED, type: 'application/vnd.apple.mpegurl' };
+    });
+    setPageHtmlBrowser(async () => ({
+      title: 'DANDYA-045 - MissAV',
+      url: 'https://missav.ws/en/dandya-045',
+      cookie: 'missav_session=earned',
+      userAgent: 'Chrome-test',
+      html: '<html><head><title>DANDYA-045 - MissAV</title></head><body><video></video></body></html>',
+      media: [{ url: 'https://cdn.example/gated/playlist.m3u8', contentType: 'application/vnd.apple.mpegurl' }],
+      playing: [{ url: 'https://cdn.example/gated/seg0.ts', duration: 180, paused: false }],
+    }));
+    try {
+      const result = await resolve('https://missav.ws/en/dandya-045');
+      assert.equal(result.files.length, 1);
+      assert.equal(result.files[0].ref.cookie, 'missav_session=earned');
+      assert.doesNotMatch(result.files[0].note, /may ask for a session/);
+    } finally {
+      setPageHtmlBrowser(null);
+    }
+  });
+
   await test('a stream whose playlist is really a web page says so', async () => {
     clearStreamCache();
     stubFetch(() => ({ raw: '<!doctype html><html><body>nope</body></html>', type: 'text/html' }));

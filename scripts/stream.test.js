@@ -207,6 +207,24 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
        the field report: resolving the link worked, the job that ran a minute
        later failed with STREAM_FORBIDDEN, because the cookie earned at resolve
        time was never carried into the download. */
+    /* A CDN that serves the *manifest* to anyone and gates every segment: the
+       playlist opens, the video does not. This is the shape that reads as
+       "resolved fine, job failed" — the segments are the thing to test. */
+    if (url.pathname.startsWith('/gated/')) {
+      const file = path.join(MEDIA_DIR, url.pathname.replace('/gated/', 'stream/'));
+      if (!fs.existsSync(file)) return res.writeHead(404).end();
+      const isSegment = !file.endsWith('.m3u8');
+      if (isSegment && !/gate=open/.test(req.headers.cookie || '')) {
+        res.writeHead(403, { 'content-type': 'text/plain' });
+        return res.end('cookie required');
+      }
+      /* The manifest hands out the cookie, exactly as these CDNs do. */
+      const headers = { 'content-type': file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t' };
+      if (!isSegment && !/gate=open/.test(req.headers.cookie || '')) headers['set-cookie'] = 'gate=open; Path=/';
+      res.writeHead(200, headers);
+      return fs.createReadStream(file).pipe(res);
+    }
+
     if (url.pathname.startsWith('/session/')) {
       const cookie = req.headers.cookie || '';
       if (!/gate=open/.test(cookie)) {
@@ -458,6 +476,39 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
       'with a real video at the end',
       Boolean(sessionDone?.outputBytes) && sessionDone.outputBytes > 0,
       `${sessionDone?.outputBytes} bytes`,
+    );
+    /* ------------------------------- 7. the manifest is public, the video is not
+       The reported shape again, one level down: /gated/ answers the playlist to
+       anyone and refuses every segment until the session cookie is replayed. */
+    const gatedUrl = `http://127.0.0.1:${MEDIA_PORT}/gated/playlist.m3u8`;
+    const gatedList = await (await fetch(`${BASE}/api/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: gatedUrl }),
+    })).json();
+    check(
+      'a manifest that opens but whose segments are gated is still resolved',
+      Boolean(gatedList.files?.length),
+      gatedList.error || `${gatedList.files?.length} files`,
+    );
+    const gatedJob = await (await fetch(`${BASE}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: 'ref', ref: gatedList.files?.[0]?.ref, name: gatedList.files?.[0]?.name, presetId: 'small' }),
+    })).json();
+    const gatedDone = await waitFor(async () => {
+      const job = gatedJob.job?.id ? await getJob(gatedJob.job.id) : null;
+      return job && ['done', 'hosted', 'error'].includes(job.status) ? job : null;
+    }, { timeoutMs: 300000 });
+    check(
+      'and its segments come down, because the cookie from the manifest is replayed',
+      ['done', 'hosted'].includes(gatedDone?.status),
+      gatedDone?.error || gatedDone?.status,
+    );
+    check(
+      'with a video at the end',
+      Boolean(gatedDone?.outputBytes) && gatedDone.outputBytes > 0,
+      `${gatedDone?.outputBytes} bytes`,
     );
   } finally {
     if (proc) proc.kill('SIGKILL');

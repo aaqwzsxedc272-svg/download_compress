@@ -1182,6 +1182,45 @@
     return 0;
   }
 
+  /**
+   * Can the bytes actually be fetched, not just the manifest?
+   *
+   * A CDN may serve a playlist to anyone and gate every segment behind a
+   * session. Reading the manifest therefore proves nothing about the download,
+   * and offering the file anyway is how a job fails a minute after the picker
+   * said "1 file found". One kilobyte of one segment answers it for the price
+   * of a request.
+   *
+   * Returns { ok, status } — `ok: null` means the probe could not be made to
+   * work at all (an odd playlist, a host that ignores ranges), which is not
+   * evidence of a refusal and must not be treated as one.
+   */
+  async function probeFirstSegment(info, headers = {}) {
+    if (!info || !info.url) return { ok: null, status: 0 };
+    let media = null;
+    try {
+      const res = await fetchWithTimeout(info.url, { headers: { 'user-agent': UA, ...headers }, redirect: 'follow' }, 8000);
+      if (!res.ok) return { ok: false, status: res.status, where: 'the media playlist' };
+      media = parsePlaylistText(await res.text(), info.url);
+    } catch {
+      return { ok: null, status: 0 };
+    }
+    const first = media && media.segments && media.segments[0];
+    if (!first) return { ok: null, status: 0 };
+    try {
+      const piece = await fetchWithTimeout(
+        first,
+        { headers: { 'user-agent': UA, ...headers, range: 'bytes=0-1023' }, redirect: 'follow' },
+        8000,
+      );
+      if (piece.body) piece.body.cancel().catch(() => {});
+      const ok = piece.ok || piece.status === 206;
+      return { ok, status: piece.status, where: 'a segment', segment: first };
+    } catch {
+      return { ok: null, status: 0 };
+    }
+  }
+
   /** `name=value` pairs from a response's Set-Cookie, on top of the ones we had. */
   function mergeCookies(existing, res) {
     const jar = new Map();
@@ -2405,6 +2444,19 @@ function preferPageName(urlName, pageName) {
           if (viaBrowser) return { ...viaBrowser, pageTitle: viaBrowser.pageTitle || pageTitleOf(html) || null };
           throw readError;
         }
+
+        /* The manifest opened. That is not the same as the video being
+           fetchable: a CDN can serve the playlist and gate every segment. */
+        let segmentNote = null;
+        const probe = await probeFirstSegment(info, streamHeaders(readAs));
+        if (probe.ok === false) {
+          const viaBrowser = await browserPage(url);
+          if (viaBrowser) return { ...viaBrowser, pageTitle: viaBrowser.pageTitle || pageTitleOf(html) || null };
+          /* No browser to earn the session with. The file is still worth
+             offering — the download retries with a browser too — but the card
+             says so, instead of pretending the stream is ready. */
+          segmentNote = 'its CDN may ask for a session — the download will try a browser';
+        }
         const files = [
           streamFileEntry(chosen, {
             name: titleName || undefined,
@@ -2416,6 +2468,7 @@ function preferPageName(urlName, pageName) {
             duration: info.duration || 0,
             estimatedBytes: info.estimatedBytes || 0,
             preview: Boolean(info.duration > 0 && info.duration < 90),
+            caveat: segmentNote,
           }),
         ];
         /* The page's own <title> travels with the job: the card shows the tab
@@ -2697,7 +2750,7 @@ function preferPageName(urlName, pageName) {
   /** One entry for a stream: the shape the page and the browser both produce. */
   function streamFileEntry(
     streamUrl,
-    { name, referer, cookie, userAgent, quality, mime, duration, estimatedBytes, preview, headers } = {},
+    { name, referer, cookie, userAgent, quality, mime, duration, estimatedBytes, preview, headers, caveat } = {},
   ) {
     const fileName = String(name || nameForStream(streamUrl, { height: Number(quality) || 0 }))
       .replace(/\.(m3u8|mpd)$/i, '.mp4');
@@ -2712,7 +2765,9 @@ function preferPageName(urlName, pageName) {
       /* The length is what tells a film apart from a sample, so it belongs on
          the card, not only in the encoder. */
       duration: Number(duration) || 0,
-      note: preview ? 'a short preview, not the film' : minutes ? `stream · ${minutes} min` : 'stream',
+      note: [preview ? 'a short preview, not the film' : minutes ? `stream · ${minutes} min` : 'stream', caveat]
+        .filter(Boolean)
+        .join(' · '),
       ref: {
         resolver: 'stream',
         url: streamUrl,
@@ -2877,6 +2932,7 @@ function preferPageName(urlName, pageName) {
     pickBestVariant,
     variantHeight,
     inspectPlaylist,
+    probeFirstSegment,
     rankStreams,
     streamHeaders,
     nameForStream,

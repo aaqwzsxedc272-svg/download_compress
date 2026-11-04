@@ -11,6 +11,9 @@
  * Used by `npm run doctor -- <url>` and by GET /api/diagnose-link.
  */
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 const UA = 'Squeeze/1.0 (diagnostics)';
 
 const MB = (bytes) => (Number(bytes) > 0 ? `${(Number(bytes) / 1048576).toFixed(1)} MB` : 'size unknown');
@@ -54,6 +57,20 @@ async function diagnose(url, { browser } = {}) {
   const steps = {};
   const version = require('./version').describe();
   steps.version = version;
+
+  /* Has this process survived something? A caught crash that nobody sees is a
+     crash waiting to be reported again as "it stopped by itself". */
+  steps.survived = (() => {
+    try {
+      const file = path.join(require('./jobs').DATA_DIR, 'crash.log');
+      if (!fs.existsSync(file)) return { count: 0, last: null };
+      const entries = fs.readFileSync(file, 'utf8').trim().split(/\n\n+/).filter(Boolean);
+      const last = entries[entries.length - 1] || '';
+      return { count: entries.length, last: last.split('\n').slice(0, 2).join(' · ').slice(0, 240) };
+    } catch {
+      return { count: 0, last: null };
+    }
+  })();
 
   /* The app registers its browser hooks at startup; a diagnostic that skipped
      this ran the resolver with no browser at all and reported a working link as
@@ -350,6 +367,11 @@ function render({ url, steps }) {
     `build     ${steps.version.version || '?'}${steps.version.commit ? ` · ${steps.version.commit}` : ' · no commit (not a git checkout?)'}`,
   );
   lines.push(`node      ${steps.version.node} · resumable encode ${yes(steps.version.features.resumableEncode)}`);
+  if (steps.survived && steps.survived.count > 0) {
+    lines.push(
+      `survived  ${steps.survived.count} error(s) that would have stopped the server — last: ${steps.survived.last}`,
+    );
+  }
   const browser = steps.browser;
   const wiredBug = browser.wired === false && browser.module === true;
   lines.push(

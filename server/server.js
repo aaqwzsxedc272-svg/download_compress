@@ -3204,6 +3204,42 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
+/* ------------------------------------------------------------------ survival */
+
+/**
+ * A bug in one observer must not end the process, and the process must not hide
+ * that it happened.
+ *
+ * What this is for, concretely: a page listener inside the browser helper threw
+ * a ReferenceError, Playwright's event loop surfaced it as an uncaught
+ * exception, and Node exited — taking with it a running job and the server
+ * itself, with nothing but a stack trace in a terminal that may not even be
+ * open. A crashed process is worse than a noisy one: the download can be
+ * resumed, but the person has to notice first.
+ *
+ * So: log loudly, keep running, and record it where the app can show it. If the
+ * same fault repeats it is visible in `npm run doctor` instead of being retold.
+ */
+const CRASH_LOG = path.join(jobsStore.DATA_DIR, 'crash.log');
+
+function recordCrash(kind, err) {
+  const when = new Date().toISOString();
+  const message = err && err.stack ? err.stack : String(err);
+  console.error(`\n[survived] ${kind} — the server is still running:\n${message}\n`);
+  try {
+    jobsStore.DATA_DIR && require('fs').mkdirSync(jobsStore.DATA_DIR, { recursive: true });
+    require('fs').appendFileSync(
+      CRASH_LOG,
+      `${when} ${kind} · ${version.describe().commit || '?'}\n${message}\n\n`,
+    );
+  } catch {
+    /* the log is best effort; the console line above is not */
+  }
+}
+
+process.on('uncaughtException', (err) => recordCrash('uncaughtException', err));
+process.on('unhandledRejection', (reason) => recordCrash('unhandledRejection', reason));
+
 /* --------------------------------------------------------------------- boot */
 
 async function main() {

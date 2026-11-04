@@ -37,6 +37,39 @@ function load() {
 
 const available = () => Boolean(load() && load().chromium);
 
+/* Module scope, because more than one capture path watches a page now. These
+   lived inside captureMedia, and when capturePage grew its own watcher the
+   reference below was resolved at *event* time — inside a Playwright callback,
+   where a ReferenceError does not fail the capture, it kills the server. */
+const MEDIA = /\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|m4s|3gp|ogv|m3u8|mpd)(\?|#|$)/i;
+const PLAYLIST_TYPE = /(?:mpegurl|dash\+xml|x-mpegurl)/i;
+
+/**
+ * Wrap a page event listener so nothing it does can escape.
+ *
+ * A Playwright listener runs on the event loop, not inside the async function
+ * that opened the page: a throw there is an uncaught exception, and an uncaught
+ * exception takes the whole server with it — including a download that has been
+ * running for twenty minutes. The listener's job is to *observe*, so a failure
+ * to observe must never be fatal.
+ */
+let lastListenerError = null;
+function safeListener(name, fn) {
+  return (...args) => {
+    try {
+      const result = fn(...args);
+      if (result && typeof result.catch === 'function') {
+        result.catch((err) => {
+          lastListenerError = { name, message: err && err.message, at: Date.now() };
+        });
+      }
+    } catch (err) {
+      lastListenerError = { name, message: err && err.message, at: Date.now() };
+    }
+  };
+}
+const listenerErrors = () => lastListenerError;
+
 /** Turn one gofile contents payload into our file shape. */
 function mapContents(payload, code) {
   if (!payload || payload.status !== 'ok' || !payload.data) return null;
@@ -80,15 +113,19 @@ async function gofileFolder(code, { timeoutMs = 60_000 } = {}) {
     const page = await context.newPage();
     const payloads = [];
 
-    page.on('response', async (response) => {
-      const url = response.url();
-      if (!/api\.gofile\.io\/contents\//i.test(url)) return;
-      try {
-        payloads.push(await response.json());
-      } catch {
-        /* not json, ignore */
-      }
-    });
+    page.on(
+      'response',
+      safeListener('gofile.response', (response) => {
+        const url = response.url();
+        if (!/api\.gofile\.io\/contents\//i.test(url)) return;
+        response
+          .json()
+          .then((payload) => payloads.push(payload))
+          .catch(() => {
+            /* not json, ignore */
+          });
+      }),
+    );
 
     await page.goto(`https://gofile.io/d/${code}`, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
 
@@ -173,11 +210,6 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
     });
   }
 
-  /* A player's playlist is fetched with XHR, not as "media", so it is only seen
-     here if playlists are in this pattern: that omission is why a streaming page
-     reported a dozen ad *segments* and no stream at all. */
-  const MEDIA = /\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpe?g|ts|m4s|3gp|ogv|m3u8|mpd)(\?|#|$)/i;
-  const PLAYLIST_TYPE = /(?:mpegurl|dash\+xml|x-mpegurl)/i;
   const seen = new Map();
 
   const browser = await pw.chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -204,25 +236,31 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
       });
     };
 
-    page.on('request', (request) => {
-      const headers = request.headers();
-      const meta = {
-        force: request.resourceType() === 'media',
-        referer: headers.referer || '',
-        cookie: headers.cookie || '',
-      };
-      remember(request.url(), meta);
-    });
-    page.on('response', async (response) => {
-      const type = (response.headers()['content-type'] || '').toLowerCase();
-      if (type.startsWith('video/') || type === 'application/octet-stream' || PLAYLIST_TYPE.test(type)) {
-        remember(response.url(), {
-          force: type.startsWith('video/') || PLAYLIST_TYPE.test(type),
-          contentType: type,
-          size: response.headers()['content-length'],
-        });
-      }
-    });
+    page.on(
+      'request',
+      safeListener('media.request', (request) => {
+        const headers = request.headers();
+        const meta = {
+          force: request.resourceType() === 'media',
+          referer: headers.referer || '',
+          cookie: headers.cookie || '',
+        };
+        remember(request.url(), meta);
+      }),
+    );
+    page.on(
+      'response',
+      safeListener('media.response', (response) => {
+        const type = (response.headers()['content-type'] || '').toLowerCase();
+        if (type.startsWith('video/') || type === 'application/octet-stream' || PLAYLIST_TYPE.test(type)) {
+          remember(response.url(), {
+            force: type.startsWith('video/') || PLAYLIST_TYPE.test(type),
+            contentType: type,
+            size: response.headers()['content-length'],
+          });
+        }
+      }),
+    );
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
     await page.waitForTimeout(settleMs);
@@ -274,10 +312,13 @@ async function captureMedia(url, { timeoutMs = 45_000, settleMs = 6000, includeA
         return { media: out, anchors };
       }, Boolean(includeAnchors))
       .catch(() => ({ media: [], anchors: [] }));
-    dom.media.forEach((u) => remember(u, { force: true }));
+    /* `|| ...`: evaluate() can resolve to nothing on a page whose document is
+       already gone, and reading `.media` of nothing is how one bad page becomes
+       a dead server. */
+    (dom || { media: [], anchors: [] }).media.forEach((u) => remember(u, { force: true }));
 
     if (includeAnchors) {
-      for (const anchor of dom.anchors) {
+      for (const anchor of (dom || {}).anchors || []) {
         const clean = String(anchor.href || '').split('#')[0];
         if (!/^https?:/i.test(clean)) continue;
         /* Either it names a file, or it is an opaque signed token (base64-ish,
@@ -362,24 +403,30 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
         cookie: meta.cookie || '',
       });
     };
-    page.on('request', (request) => {
-      const headers = request.headers();
-      remember(request.url(), {
-        force: request.resourceType() === 'media',
-        referer: headers.referer || '',
-        cookie: headers.cookie || '',
-      });
-    });
-    page.on('response', (response) => {
-      const type = (response.headers()['content-type'] || '').toLowerCase();
-      if (type.startsWith('video/') || type === 'application/octet-stream' || PLAYLIST_TYPE.test(type)) {
-        remember(response.url(), {
-          force: true,
-          contentType: type,
-          size: response.headers()['content-length'],
+    page.on(
+      'request',
+      safeListener('page.request', (request) => {
+        const headers = request.headers();
+        remember(request.url(), {
+          force: request.resourceType() === 'media',
+          referer: headers.referer || '',
+          cookie: headers.cookie || '',
         });
-      }
-    });
+      }),
+    );
+    page.on(
+      'response',
+      safeListener('page.response', (response) => {
+        const type = (response.headers()['content-type'] || '').toLowerCase();
+        if (type.startsWith('video/') || type === 'application/octet-stream' || PLAYLIST_TYPE.test(type)) {
+          remember(response.url(), {
+            force: true,
+            contentType: type,
+            size: response.headers()['content-length'],
+          });
+        }
+      }),
+    );
 
     const started = Date.now();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
@@ -452,5 +499,5 @@ async function capturePage(url, { timeoutMs = 60_000, settleMs = 2500, waitFor =
   }
 }
 
-module.exports = { available, gofileFolder, captureMedia, capturePage, UA };
+module.exports = { available, gofileFolder, captureMedia, capturePage, listenerErrors, UA };
 

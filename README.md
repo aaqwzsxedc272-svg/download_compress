@@ -683,6 +683,27 @@ one command that fixes it, instead of "that link is a web page".
 
 `/api/health` reports `browserAvailable`, so the page knows whether step 2 exists on this machine.
 
+### When something goes wrong, the server keeps running
+
+A page listener inside the browser helper once referenced a constant that lived in another function.
+Playwright runs listeners on the event loop, so that was not a failed capture — it was an uncaught
+exception, and Node exited. The server died mid-session, taking a running job with it, and the only
+trace was a terminal nobody was watching.
+
+Two rules came out of it, and both are tested:
+
+* **A listener may not throw.** Every page event handler goes through `safeListener()`, which records
+  the failure and lets the capture carry on. Its job is to observe; failing to observe is not fatal.
+* **The process may not die quietly.** `uncaughtException` and `unhandledRejection` are caught, logged
+  loudly, appended to `data/crash.log` with the build they happened on, and the server carries on.
+  `npm run doctor` prints `survived N error(s) — last: …` so it is visible instead of retold.
+
+`npm run test:browser` runs the browser helper against a **fake Playwright** (no 100 MB download, no
+network) and fires the events a page would — including malformed ones — so a listener bug is a failed
+test instead of a dead server. `npm run test:crash` raises a real exception inside a real server
+process and then talks to it over HTTP: it must still answer, must record the crash, and must still
+stop on SIGTERM.
+
 ### When a link still does not work: `npm run doctor`
 
 The app can only show one line of an error, and "it did not work" is not enough to tell a bot check
@@ -929,6 +950,13 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 
 ## Testing
 
+- `npm run test:browser` — 4 checks against a fake Playwright: a page event listener cannot throw
+  out of a capture, a malformed event is recorded rather than rethrown, one visit returns the HTML,
+  the cookies, the title and the media the player asked for (including a playlist fetched by XHR),
+  and `captureMedia` survives the same junk.
+- `npm run test:crash` — 10 checks against a real server process: an uncaught exception and an
+  unhandled rejection are survived, the API keeps answering afterwards, both are written to
+  `data/crash.log` with the build, and SIGTERM still stops it.
 - `npm run test:resolve` — 66 resolver tests against stubbed APIs (real response shapes),
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before

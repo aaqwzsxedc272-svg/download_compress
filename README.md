@@ -862,10 +862,16 @@ Now the job exists after a few seconds either way:
 * the read itself is remembered for two minutes, so pressing the button again (or pressing it twice)
   does not launch a second browser.
 
+The card is also written to `data/jobs.json` while it reads — a job with nothing on disk used to
+be dropped from the store, which is right for a request that never became work and wrong for one
+whose card you are watching. A restart in the middle therefore re-reads the link and carries on;
+nothing has been downloaded, so the cost is one page read, not gigabytes.
+
 `npm run test:slowlink` proves it against a real server: a page that takes 1.5 s to read, a server
 told to wait 400 ms — the 202, the instant second answer with zero extra reads, the job that is
-created in 400 ms and finishes on its own, the card's real state in between, and a malformed link
-still refused in 4 ms.
+created in 400 ms and finishes on its own, the card's real state in between, a malformed link
+still refused in 4 ms, and a `SIGKILL` in the middle of the read followed by a restart that
+finishes the file.
 
 `npm run test:fallback` covers the observe-the-media path against a fake host that refuses plain
 requests, `npm run test:resolve` covers the resolver (challenge detected → browser asked → cookie
@@ -1178,11 +1184,12 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   really were refused and the segments really did arrive through the browser, the advert is fetched
   zero times, only the 720p rendition is used, the assembled source is a video rather than a
   playlist, the encoder makes a smaller 720p file out of it, and the pieces are gone afterwards.
-- `npm run test:slowlink` — 22 checks against a real server and a fixture page that takes longer
+- `npm run test:slowlink` — 27 checks against a real server and a fixture page that takes longer
   to read than a request may live: the fast path is untouched, a slow page answers `202` inside the
   deadline, asking again answers in 3 ms with no extra read, the job endpoint answers in 400 ms
-  with a card that says it is reading, the job then finishes on its own with its video, and a link
-  that is not a link is still refused immediately.
+  with a card that says it is reading, the job then finishes on its own with its video, a link that
+  is not a link is still refused immediately, and a job killed mid-read is picked up by the restart
+  and finished — a card that is still reading is persisted, so a restart does not make it vanish.
 - `npm run test:update` — 10 checks: a checkout matching its remote is not nagged, a stale one
   names both hashes and the command, an offline box is told nothing (and the reason kept), missing
   git is named rather than guessed, a remote answering for another branch is not evidence, the

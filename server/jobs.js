@@ -79,7 +79,11 @@ let persistTimer = null;
 
 async function writeStore() {
   const records = [...jobs.values()]
-    .filter((job) => job.status !== 'queued' || job.sourceBytes)
+    /* A queued job with nothing on disk is a request that has not become work
+       yet — except while it is reading its link, when the card is the only
+       visible thing the user has. That one is kept, or a restart makes it
+       vanish from the list and the work with it. */
+    .filter((job) => job.status !== 'queued' || job.sourceBytes || job.resolving)
     .slice(-MAX_RECORDS)
     .map((job) => {
       const { abort, ...rest } = job; // eslint-disable-line no-unused-vars

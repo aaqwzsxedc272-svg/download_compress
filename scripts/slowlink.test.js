@@ -77,7 +77,7 @@ function run(args) {
   });
 }
 
-function startServer() {
+function startServer({ keep = false } = {}) {
   const proc = spawn(process.execPath, [path.join(ROOT, 'server', 'server.js')], {
     env: {
       ...process.env,
@@ -99,11 +99,13 @@ function startServer() {
     stderr += chunk;
   });
   proc.on('exit', (code) => {
-    if (code && code !== 0) {
+    if (code && code !== 0 && !proc.expected) {
       console.error(`server exited with ${code}: ${stderr.slice(-2000)}`);
       process.exit(1);
     }
   });
+  if (keep) proc.keep = true;
+  proc.log = () => stderr;
   return proc;
 }
 
@@ -263,7 +265,7 @@ function startFixture() {
       `${slowReads - readsBefore} read(s) of the page for the job itself`,
     );
 
-    /* ------------------------------------------------------- 4. a bad link still fails fast */
+    /* ------------------------------------------------------- 3b. a bad link still fails fast */
     const badStarted = Date.now();
     const bad = await fetch(`${BASE}/api/jobs`, {
       method: 'POST',
@@ -271,8 +273,56 @@ function startFixture() {
       body: JSON.stringify({ source: 'url', url: 'not-a-link' }),
     });
     check('a link that is not a link is still refused immediately', bad.status === 400, `HTTP ${bad.status} in ${Date.now() - badStarted} ms`);
+
+    /* ------------------------------------------- 4. a restart mid-read is not a dead card
+       Nothing has been fetched yet, so the cost of a restart here is one page
+       read. What must not happen is a card left on "Reading the link" forever. */
+    const killTarget = await fetch(`${BASE}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: 'url', url: `http://127.0.0.1:${MEDIA_PORT}/slow`, presetId: 'hq' }),
+    }).then((res) => res.json());
+    const killId = killTarget.job?.id;
+    check('a second slow job gets its own card', Boolean(killId) && killId !== jobId, killId);
+    /* Long enough for the card to be written to disk, well inside the read. */
+    await sleep(700);
+    proc.kill('SIGKILL');
+    /* The port has to be free before the replacement can bind it. */
+    const gone = await waitFor(
+      async () => {
+        try {
+          await fetch(`${BASE}/api/health`);
+          return null;
+        } catch {
+          return true;
+        }
+      },
+      { timeoutMs: 15000, intervalMs: 100 },
+    );
+    check('the machine really went away', Boolean(gone));
+
+    const second = startServer({ keep: true });
+    const up = await ready();
+    check('and the replacement comes up on the same data', Boolean(up));
+    const revived = await waitFor(async () => {
+      const job = await getJob(killId);
+      return job && ['done', 'hosted', 'error'].includes(job.status) ? job : null;
+    }, { timeoutMs: 60000 });
+    check('the job left mid-read is picked up after the restart', ['done', 'hosted'].includes(revived?.status), revived?.error || revived?.status);
+    check('and finishes with its video', Number(revived?.outputBytes) > 0, `${revived?.outputBytes} bytes`);
+    if (!['done', 'hosted'].includes(revived?.status)) {
+      console.log(`        [server log] ${second.log().slice(-800).replace(/\n/g, '\n        ')}`);
+    }
+    second.kill('SIGTERM');
+    second.expected = true;
+    await sleep(600);
+
   } finally {
-    proc.kill('SIGTERM');
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      /* already gone */
+    }
     fixture.close();
     await sleep(400);
     await fsp.rm(DATA_DIR, { recursive: true, force: true }).catch(() => {});

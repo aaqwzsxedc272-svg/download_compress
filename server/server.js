@@ -2463,6 +2463,31 @@ async function planUrlJob(url) {
 
 }
 
+/**
+ * Finish reading a link into a job that already exists, then run it.
+ *
+ * Used twice: by the job endpoint when the page was too slow to wait for, and
+ * at startup for a job that was still being read when the machine stopped.
+ * Nothing has been downloaded at this point, so a second attempt costs a page
+ * read, not gigabytes.
+ */
+function readLinkIntoJob(job) {
+  return planUrlJob(job.url)
+    .then(({ file, resolved }) => {
+      jobsStore.updateJob(job, {
+        ref: file.ref,
+        name: job.name || file.name,
+        sourceTitle: resolved.pageTitle || null,
+        resolving: false,
+      });
+      return fetchThenCompress(job, file.ref);
+    })
+    .catch((err) => {
+      jobsStore.updateJob(job, { resolving: false });
+      return reportJobError(job, err);
+    });
+}
+
 app.post('/api/jobs', async (req, res) => {
   const body = req.body || {};
   const source = body.source || 'url';
@@ -2647,8 +2672,14 @@ app.post('/api/jobs', async (req, res) => {
   });
   res.status(201).json({ job: jobsStore.publicView(job) });
 
+  /* The read is already in flight: attaching to it here would race the same
+     promise twice, so the job simply continues from the plan this request
+     started. */
   planned.then(({ value, error }) => {
-    if (error) return reportJobError(job, error);
+    if (error) {
+      jobsStore.updateJob(job, { resolving: false });
+      return reportJobError(job, error);
+    }
     const { file, resolved } = value;
     jobsStore.updateJob(job, {
       ref: file.ref,
@@ -3674,6 +3705,21 @@ async function main() {
  */
 async function resumeInterrupted() {
   if (process.env.RESUME_INTERRUPTED === '0') return;
+
+  /* Stopped while a link was still being read: nothing was fetched and nothing
+     is on disk, so the work to redo is one page read — and the card would
+     otherwise sit on "Reading the link" forever. */
+  const stillReading = jobsStore
+    .listJobs()
+    .filter((job) => job.resolving && job.url && !job.ref && job.source === 'url');
+  if (stillReading.length) {
+    console.log(`[resume] ${stillReading.length} job(s) were still reading their link — reading them again`);
+    for (const job of stillReading.reverse()) {
+      jobsStore.updateJob(job, { status: 'queued', stage: 'Reading the link again after the restart', progress: 0 });
+      readLinkIntoJob(job);
+    }
+  }
+
   const interrupted = jobsStore
     .listJobs()
     .filter((job) => job.interrupted && !job.hostedUrl);

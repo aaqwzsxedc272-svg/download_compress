@@ -185,6 +185,23 @@ function startFixture() {
     check('with its real name', /\.mp4$/.test(fast.files?.[0]?.name || ''), fast.files?.[0]?.name);
     check('and the page title kept for the card', /FAST-001/.test(fast.pageTitle || ''), fast.pageTitle);
 
+    /* The same on the job endpoint: a quick link is resolved before the answer,
+       so the card is complete the moment it appears. */
+    const fastJob = await (
+      await fetch(`${BASE}/api/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ source: 'url', url: `http://127.0.0.1:${MEDIA_PORT}/fast`, presetId: 'small' }),
+      })
+    ).json();
+    check(
+      'a quick link starts a job that already knows its file',
+      /\.mp4$/.test(fastJob.job?.name || '') && fastJob.job?.resolver,
+      `${fastJob.job?.name} · ${fastJob.job?.resolver}`,
+    );
+    check('and is not marked as still reading', fastJob.job?.resolving === false, String(fastJob.job?.resolving));
+    check('with the page title on the card', /FAST-001/.test(fastJob.job?.sourceTitle || ''), fastJob.job?.sourceTitle);
+
     /* --------------------------------------------------------- 2. the slow page
        The answer must arrive inside the deadline, saying what is happening. */
     const slowStarted = Date.now();

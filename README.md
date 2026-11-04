@@ -1184,10 +1184,10 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   really were refused and the segments really did arrive through the browser, the advert is fetched
   zero times, only the 720p rendition is used, the assembled source is a video rather than a
   playlist, the encoder makes a smaller 720p file out of it, and the pieces are gone afterwards.
-- `npm run test:slowlink` — 27 checks against a real server and a fixture page that takes longer
+- `npm run test:slowlink` — 30 checks against a real server and a fixture page that takes longer
   to read than a request may live: the fast path is untouched, a slow page answers `202` inside the
   deadline, asking again answers in 3 ms with no extra read, the job endpoint answers in 400 ms
-  with a card that says it is reading, the job then finishes on its own with its video, a link that
+  with a card that says it is reading while a quick link's job already knows its file and title, the job then finishes on its own with its video, a link that
   is not a link is still refused immediately, and a job killed mid-read is picked up by the restart
   and finished — a card that is still reading is persisted, so a restart does not make it vanish.
 - `npm run test:update` — 10 checks: a checkout matching its remote is not nagged, a stale one

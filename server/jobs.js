@@ -280,6 +280,9 @@ function publicView(job) {
     downloadSpeed: job.downloadSpeed || null,
     downloadEta: job.downloadEta || null,
     downloadResumed: Boolean(job.downloadResumed),
+    /* The link is still being read (a page behind a bot check takes a minute).
+       The card must not look stuck while it happens. */
+    resolving: Boolean(job.resolving),
     /* True when the video had to be fetched inside a browser because its CDN
        refuses every request the app can make. The card says so. */
     streamViaBrowser: Boolean(job.streamViaBrowser),

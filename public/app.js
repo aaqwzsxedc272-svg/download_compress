@@ -86,10 +86,19 @@ async function api(path, options = {}) {
     /* non-json */
   }
   if (!res.ok) {
-    throw Object.assign(new Error(data.error || `Request failed (${res.status})`), {
-      code: data.code,
-      status: res.status,
-    });
+    /* A 5xx from the host's proxy means the app never answered — the request
+       was still doing something. Saying "Request failed (504)" about a page
+       that was being read is true and useless; say what it means. */
+    const gateway = [502, 503, 504].includes(res.status) && !data.error;
+    throw Object.assign(
+      new Error(
+        gateway
+          ? `The host gave up waiting for this request (${res.status}) — the server was still working on it. ` +
+            'Start it again: what it already read is remembered.'
+          : data.error || `Request failed (${res.status})`,
+      ),
+      { code: data.code || (gateway ? 'GATEWAY_TIMEOUT' : undefined), status: res.status },
+    );
   }
   return data;
 }
@@ -1538,6 +1547,9 @@ async function resolveLink(url) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url }),
     });
+    /* 202: too slow to read inside one request. Not a failure — a job does the
+       same reading with somewhere to show it. */
+    if (result.pending) return { ...result, files: [], pending: true, mode: 'server' };
     sourceTabTitle = result.pageTitle || null;
     return { ...result, mode: 'server' };
   } catch (serverErr) {
@@ -1566,6 +1578,21 @@ async function handleLink(raw) {
     resolved = await resolveLink(url);
   } finally {
     hideTransfer();
+  }
+
+  if (resolved.pending) {
+    /* Nothing was refused: the page simply takes a browser and a minute. The
+       job is where that minute can be watched, so start it now. */
+    showTransfer(resolved.message || 'Reading the link…', null, shortHost(url));
+    const { job, reused } = await api('/api/jobs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: 'url', url, ...currentOptions() }),
+    });
+    hideTransfer();
+    noteReuse(reused);
+    trackJob(job);
+    return;
   }
 
   const videos = resolved.files.filter((file) => file.kind === 'video');

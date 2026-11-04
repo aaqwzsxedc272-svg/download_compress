@@ -1103,13 +1103,20 @@ function reportJobError(job, err) {
         ? `The stream stopped partway through (${err.detail || 'ffmpeg could not read it to the end'}). ` +
           'Nothing was saved, so the link starts again from the beginning.'
       : job.isStream && /^STREAM_/.test(String(err.code || ''))
-        ? `The video server refused the stream${
-            job.ref && job.ref.accessRefreshedAt ? ', even after the page was opened in a browser' : ''
-          }. ` +
-          (job.ref && job.ref.accessRefreshedAt
-            ? 'That CDN wants a cookie earned on your own connection: open the page in your browser, copy the ' +
-              '.m3u8 address the player requests, and paste that link instead.'
-            : 'That link is served only to the page it belongs to. Paste the page the video plays on instead.')
+        ? err.browserNote
+          ? /* The browser tried too, and was refused: this is no longer a
+               headers problem, and no longer advice this app can follow. */
+            'The video server refused the stream, and refused a real browser making the request too ' +
+            `(${String(err.browserNote).replace(/\.$/, '')}). ` +
+            'That gate is tied to your own connection — the page plays there, and nothing on this machine can ' +
+            'pretend to be you.'
+          : `The video server refused the stream${
+              job.ref && job.ref.accessRefreshedAt ? ', even after the page was opened in a browser' : ''
+            }. ` +
+            (job.ref && job.ref.accessRefreshedAt
+              ? 'That CDN wants a cookie earned on your own connection: open the page in your browser, copy the ' +
+                '.m3u8 address the player requests, and paste that link instead.'
+              : 'That link is served only to the page it belongs to. Paste the page the video plays on instead.')
       : err.code === 'FFMPEG_FAILED'
       ? `ffmpeg could not process this file${err.codecNote ? ` (${err.codecNote})` : ''}.` +
         `${ffmpegDetail ? ` It said: ${ffmpegDetail}` : ''} Try another preset, or a different source file.`
@@ -1599,6 +1606,7 @@ async function fetchThenCompress(job, ref) {
               } else if (viaBrowser && viaBrowser.failed) {
                 /* Say what the browser said: it is a better sentence than
                    "forbidden", and it is true. */
+                streamErr.browserNote = viaBrowser.error.message;
                 streamErr.message = `${streamErr.message} (a real browser was tried too: ${viaBrowser.error.message})`;
               }
             }
@@ -2143,6 +2151,28 @@ async function withSizes(result, { timeoutMs = 7000, limit = 12 } = {}) {
   return result;
 }
 
+/** Resolve after `ms`, never reject: a race partner, not a timer to clean up. */
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+/**
+ * Reading one page is expensive — a browser launch, a challenge, a player that
+ * has to be allowed to run — and it was being done twice for one link: once when
+ * the picker asked, once when the job started. Two minutes of memo, so pressing
+ * "start it anyway" does not pay for the browser a second time.
+ */
+const linkReads = new Map();
+const LINK_READ_TTL = 2 * 60 * 1000;
+function resolveLinkOnce(url) {
+  const hit = linkReads.get(url);
+  if (hit && Date.now() - hit.at < LINK_READ_TTL) return hit.promise;
+  const promise = resolve(url);
+  linkReads.set(url, { at: Date.now(), promise });
+  /* A refusal is worth remembering no more than a minute either; a link that
+     failed at 10:01 may work at 10:05 with a fresh session. */
+  promise.catch(() => linkReads.delete(url));
+  return promise;
+}
+
 /** A fileditch signed path or any opaque token: not worth a HEAD on its own. */
 function signedish(url) {
   try {
@@ -2157,10 +2187,39 @@ app.post('/api/resolve', async (req, res) => {
   const url = sources.normalizeUrl(req.body?.url);
   if (!url) return fail(res, 400, 'BAD_URL', 'That does not look like a valid link.');
   if (sources.isBlockedHost(url)) return fail(res, 400, 'BLOCKED_HOST', 'That address is not allowed.');
-  try {
-    const result = await withSizes(await fileBehindUrl(url, await resolve(url)), {
+  /* The same deadline the job endpoint honours. A page that needs a browser
+     takes a minute and a half to read; a request that waits for it is answered
+     by the host's proxy with a 504, which is what "Request failed (504)" was.
+     Saying "still reading, start the job and watch it there" is true and
+     useful; a gateway timeout is neither. */
+  const reading = (async () =>
+    withSizes(await fileBehindUrl(url, await resolveLinkOnce(url)), {
       timeoutMs: Number(process.env.SIZE_PROBE_MS) || 7000,
+    }))().then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  const first = await Promise.race([reading, wait(Number(process.env.RESOLVE_WAIT_MS) || 7000).then(() => null)]);
+
+  if (!first) {
+    return res.status(202).json({
+      pending: true,
+      url,
+      resolver: null,
+      files: [],
+      message:
+        'This link is still being read — the page needs a browser, and that takes a minute. ' +
+        'Start it anyway: the job reads the link itself and shows its progress.',
     });
+  }
+
+  const result = first.value;
+  if (first.error) {
+    const err = first.error;
+    const status = err.code === 'BAD_URL' ? 400 : 422;
+    return fail(res, status, err.code || 'RESOLVE_FAILED', err.message || 'Could not read that link.');
+  }
+  try {
     return res.json({
       resolver: result.resolver,
       title: result.title || null,
@@ -2301,6 +2360,109 @@ async function adoptJob(job, ref) {
   return 'resumed';
 }
 
+/**
+ * What is actually behind this link?
+ *
+ * A file host answers in a second. A page behind a bot check does not: the HTML
+ * needs a browser, the page's player has to be allowed to run, and the playlist
+ * it names lives on another host that may want its own visit. Tens of seconds,
+ * sometimes two minutes — and a request that waits that long is answered by the
+ * host's proxy with a 504, *not* by this app. The job the person asked for was
+ * never created, so "Request failed (504)" is what they saw instead of a video.
+ *
+ * This is why the answer is planned here and awaited with a deadline by both
+ * callers: the job endpoint creates the job first and lets this finish
+ * underneath it, and the picker endpoint says "still reading" instead of dying.
+ */
+async function planUrlJob(url) {
+  // 1. A known share host or an obvious file URL resolves on its own.
+  let resolved = await resolve(url, { allowPage: false });
+  resolved = await fileBehindUrl(url, resolved);
+
+  // 2. Otherwise ask the host what it is: a video file, or a page to scrape?
+  if (!resolved) {
+    if (sources.isBlockedHost(url)) {
+      throw Object.assign(new Error('That address is not allowed.'), { code: 'BLOCKED_HOST' });
+    }
+    const remote = await sources.probeRemote(url);
+
+    if (remote.reachable && !remote.isHtml) {
+      let name = 'video';
+      try {
+        name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'video');
+      } catch {
+        /* keep default */
+      }
+      resolved = {
+        resolver: 'direct',
+        title: null,
+        files: [
+          {
+            name,
+            size: remote.contentLength || 0,
+            mime: remote.contentType || '',
+            kind: 'video',
+            ref: { resolver: 'direct', url, name },
+          },
+        ],
+      };
+    } else if (remote.isHtml) {
+      try {
+        resolved = await resolveLinkOnce(url);
+      } catch (err) {
+        throw err;
+      }
+    } else {
+      // The server cannot even reach it: a real browser may still be able to.
+      try {
+        const browser = require('./browser');
+        if (browser.available()) {
+          const captured = await browser.captureMedia(url);
+          const media = (captured && captured.media) || [];
+          if (media.length) {
+            resolved = {
+              resolver: 'browser',
+              title: null,
+              files: media.slice(0, 12).map((item, index) => {
+                let name = `video-${index + 1}.mp4`;
+                try {
+                  const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
+                  if (last) name = last;
+                } catch {
+                  /* keep default */
+                }
+                return {
+                  id: item.url,
+                  name,
+                  size: Number(item.size) || 0,
+                  mime: item.contentType || '',
+                  kind: 'video',
+                  ref: { resolver: 'direct', url: item.url, name },
+                };
+              }),
+            };
+          }
+        }
+      } catch {
+        /* fall through to the browser relay */
+      }
+      if (!resolved) {
+        throw Object.assign(
+          new Error('This server cannot reach that host. Retrying through your browser instead.'),
+          { code: 'NEED_BROWSER' },
+        );
+      }
+    }
+  }
+
+  const file = resolved.files.find((f) => f.kind === 'video') || resolved.files[0];
+  if (!file) {
+    throw Object.assign(new Error('No video was found behind that link.'), { code: 'NO_VIDEO_FOUND' });
+  }
+  return { file, resolved };
+
+}
+
 app.post('/api/jobs', async (req, res) => {
   const body = req.body || {};
   const source = body.source || 'url';
@@ -2394,107 +2556,80 @@ app.post('/api/jobs', async (req, res) => {
     return res.status(201).json({ job: jobsStore.publicView(job) });
   }
 
-  // Plain file URLs: the server downloads them when it can.
-  // Work out what this link really points at, cheapest check first.
-  // 1. A known share host or an obvious file URL resolves on its own.
-  let resolved = null;
-  try {
-    resolved = await resolve(url, { allowPage: false });
-    resolved = await fileBehindUrl(url, resolved);
-  } catch (err) {
-    return fail(res, 422, err.code || 'RESOLVE_FAILED', err.message);
+  /* Read the link, but never make the browser wait for it.
+   *
+   * A file host answers in a second; missav takes a minute and a half, because
+   * the HTML needs a browser, the player has to run, and the playlist lives on
+   * another CDN that wants its own visit. `POST /api/jobs` used to await all of
+   * that before it created anything — so the host's proxy answered 504 first,
+   * the page said "Request failed (504)", and the job appeared afterwards from
+   * underneath a request that had already failed. That is the report.
+   *
+   * Now the job exists after a few seconds either way: a fast link resolves
+   * before the answer and behaves exactly as it always did, and a slow one gets
+   * a card straight away whose stage says what it is doing. The work continues
+   * whether or not anyone is still listening. */
+  const planned = planUrlJob(url).then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  const first = await Promise.race([planned, wait(Number(process.env.RESOLVE_WAIT_MS) || 7000).then(() => null)]);
+
+  if (first && first.error) {
+    const err = first.error;
+    const status = err.code === 'BAD_URL' || err.code === 'BLOCKED_HOST' ? 400 : 422;
+    return fail(res, status, err.code || 'RESOLVE_FAILED', err.message || 'Could not read that link.');
   }
 
-  // 2. Otherwise ask the host what it is: a video file, or a page to scrape?
-  if (!resolved) {
-    if (sources.isBlockedHost(url)) {
-      return fail(res, 400, 'BLOCKED_HOST', 'That address is not allowed.');
-    }
-    const remote = await sources.probeRemote(url);
+  if (first) {
+    const { file, resolved } = first.value;
 
-    if (remote.reachable && !remote.isHtml) {
-      let name = 'video';
-      try {
-        name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'video');
-      } catch {
-        /* keep default */
-      }
-      resolved = {
-        resolver: 'direct',
-        title: null,
-        files: [
-          {
-            name,
-            size: remote.contentLength || 0,
-            mime: remote.contentType || '',
-            kind: 'video',
-            ref: { resolver: 'direct', url, name },
-          },
-        ],
-      };
-    } else if (remote.isHtml) {
-      try {
-        resolved = await resolve(url);
-      } catch (err) {
-        return fail(res, 422, err.code || 'RESOLVE_FAILED', err.message);
-      }
-    } else {
-      // The server cannot even reach it: a real browser may still be able to.
-      try {
-        const browser = require('./browser');
-        if (browser.available()) {
-          const captured = await browser.captureMedia(url);
-          const media = (captured && captured.media) || [];
-          if (media.length) {
-            resolved = {
-              resolver: 'browser',
-              title: null,
-              files: media.slice(0, 12).map((item, index) => {
-                let name = `video-${index + 1}.mp4`;
-                try {
-                  const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
-                  if (last) name = last;
-                } catch {
-                  /* keep default */
-                }
-                return {
-                  id: item.url,
-                  name,
-                  size: Number(item.size) || 0,
-                  mime: item.contentType || '',
-                  kind: 'video',
-                  ref: { resolver: 'direct', url: item.url, name },
-                };
-              }),
-            };
-          }
-        }
-      } catch {
-        /* fall through to the browser relay */
-      }
-      if (!resolved) {
-        return fail(res, 409, 'NEED_BROWSER', 'This server cannot reach that host. Retrying through your browser instead.');
-      }
+    /* The same link, sent again — after a crash, or from a second tab. Continue
+       the job that is already holding this video instead of downloading and
+       encoding it a second time. */
+    const revisit = findReusable({
+      url,
+      ref: file.ref,
+      name: body.name || file.name,
+      presetId,
+      targetMb,
+      noCompress,
+    });
+    if (revisit) {
+      const how = await adoptJob(revisit, file.ref);
+      if (how) return res.status(200).json({ job: jobsStore.publicView(revisit), reused: how });
     }
+
+    const job = jobsStore.createJob({
+      source: 'url',
+      url,
+      hostOrder,
+      presetId,
+      targetMb,
+      noCompress,
+      name: body.name || file.name,
+      ref: file.ref,
+      /* What a browser tab shows for the *link* — the page's own <title>, not
+         the name of the file that comes out of it. */
+      sourceTitle: resolved.pageTitle || null,
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+    fetchThenCompress(job, file.ref);
+    return undefined;
   }
 
-  const file = resolved.files.find((f) => f.kind === 'video') || resolved.files[0];
-  if (!file) return fail(res, 422, 'NO_VIDEO_FOUND', 'No video was found behind that link.');
-
-  /* The same link, sent again — after a crash, or from a second tab. Continue
-     the job that is already holding this video instead of downloading and
-     encoding it a second time. */
-  const revisit = findReusable({
+  /* Still reading. The same link queued twice must still be one job, and the
+     ref is not known yet — the page is. */
+  const early = findReusable({
     url,
-    ref: file.ref,
-    name: body.name || file.name,
+    ref: null,
+    name: body.name || '',
     presetId,
     targetMb,
     noCompress,
   });
-  if (revisit) {
-    const how = await adoptJob(revisit, file.ref);
-    if (how) return res.status(200).json({ job: jobsStore.publicView(revisit), reused: how });
+  if (early && ACTIVE_STATUSES.has(early.status) && !early.ref) {
+    return res.status(200).json({ job: jobsStore.publicView(early), reused: 'running' });
   }
 
   const job = jobsStore.createJob({
@@ -2504,14 +2639,25 @@ app.post('/api/jobs', async (req, res) => {
     presetId,
     targetMb,
     noCompress,
-    name: body.name || file.name,
-    ref: file.ref,
-    /* What a browser tab shows for the *link* — the page's own <title>, not
-       the name of the file that comes out of it. */
-    sourceTitle: resolved.pageTitle || null,
+    name: body.name || null,
+  });
+  jobsStore.updateJob(job, {
+    stage: 'Reading the link — this page takes a browser, so give it a minute',
+    resolving: true,
   });
   res.status(201).json({ job: jobsStore.publicView(job) });
-  fetchThenCompress(job, file.ref);
+
+  planned.then(({ value, error }) => {
+    if (error) return reportJobError(job, error);
+    const { file, resolved } = value;
+    jobsStore.updateJob(job, {
+      ref: file.ref,
+      name: job.name || file.name,
+      sourceTitle: resolved.pageTitle || null,
+      resolving: false,
+    });
+    return fetchThenCompress(job, file.ref);
+  });
   return undefined;
 });
 
@@ -2529,7 +2675,10 @@ async function fileBehindUrl(url, resolved) {
   const remote = await sources.probeRemote(url);
   if (!remote.reachable || !remote.isHtml) return resolved;
   try {
-    const viaPage = await resolve(url);
+    /* The memoised read: a page that only answers slowly must not be read
+       twice for one request — once to find the file it names, once to check
+       that the file *is* a page. */
+    const viaPage = await resolveLinkOnce(url);
     if (viaPage && viaPage.files && viaPage.files.length) return viaPage;
   } catch {
     /* fall through to the browser */

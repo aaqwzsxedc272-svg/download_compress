@@ -509,6 +509,7 @@ way a wrong report always is. `BUILD_CHECK=0` turns it off.
 | `MAX_CONCURRENT` | `1` | Simultaneous encodes (one per CPU core is a good rule) |
 | `ALLOW_PRIVATE_HOSTS` | off | Permit `127.0.0.1` / metadata addresses (tests only) |
 | `BUILD_CHECK` | on | `0` stops the startup check against `origin` (offline boxes, tarballs) |
+| `RESOLVE_WAIT_MS` | `7000` | How long a paste may be read inside one request before it continues as a job |
 | `HOSTED_LOCAL_KEEP_MINUTES` | 120 | How long a local copy stays after its upload finishes |
 | `FINISHED_KEEP_MINUTES` | 180 | How long a finished, unuploaded job stays |
 | `KEEP_UNFINISHED_HOURS` | 24 | How long an unfinished job's files are kept |
@@ -841,6 +842,31 @@ VERDICT     Decisive: the CDN serves this video to a real browser (HTTP 200) and
 Refused in both lines means the link is dead; refused here and served there means the app is
 right to fetch it through the browser, and that is what `npm start` will do.
 
+### "Request failed (504)"
+
+That message is the host's proxy, not this app: it gave up waiting for a request that was still
+running. It was `POST /api/jobs` — which used to read the whole page, launch a browser, wait out the
+bot check and open the playlist *before* it created anything. On missav that is 60–120 seconds, so
+the proxy answered first, the page showed a gateway timeout, and the job appeared a minute later
+from underneath a request that had already failed. Two symptoms, one cause, and neither told the
+truth.
+
+Now the job exists after a few seconds either way:
+
+* a link that answers quickly resolves before the response, exactly as before;
+* a link that does not gets its card immediately, with the stage *Reading the link — this page takes
+  a browser, so give it a minute*, and the reading finishes underneath it, whether or not a tab is
+  still watching;
+* `/api/resolve` answers `202 {pending: true}` with a sentence saying so, and the page starts the
+  job instead of a picker — nothing was refused, that minute simply has somewhere to be shown;
+* the read itself is remembered for two minutes, so pressing the button again (or pressing it twice)
+  does not launch a second browser.
+
+`npm run test:slowlink` proves it against a real server: a page that takes 1.5 s to read, a server
+told to wait 400 ms — the 202, the instant second answer with zero extra reads, the job that is
+created in 400 ms and finishes on its own, the card's real state in between, and a malformed link
+still refused in 4 ms.
+
 `npm run test:fallback` covers the observe-the-media path against a fake host that refuses plain
 requests, `npm run test:resolve` covers the resolver (challenge detected → browser asked → cookie
 carried → a normal page never costs a browser → an anchor the page offers outranks any derived
@@ -1115,9 +1141,10 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   frees exactly the file's size, a pinned job survives the bulk clean, and the meter is simulated
   across a month boundary (2 core-hours per hour on 2 cores, GB-months as an average, a restart
   that must not credit the hours it was not running, the quota and the month surviving a restart).
-- `npm run test:ui` — 36 checks of the browser code in jsdom: the disk pill, the presets, the footer
+- `npm run test:ui` — 38 checks of the browser code in jsdom: the disk pill, the presets, the footer
   turned amber when this checkout is behind the published branch (with `git pull` in its tooltip),
-  "just download"
+  a 202 from the picker starting a job instead of dead-ending, "Request failed (504)" turned into a
+  sentence with a next step, "just download"
   greying the encoder controls, the size list in the picker, the per-picker switch sending
   `noCompress`, the email button, the webhook panel, and a running job's card showing its link,
   the name its browser tab will carry, its own "Save the original too" button (which must not
@@ -1151,6 +1178,11 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   really were refused and the segments really did arrive through the browser, the advert is fetched
   zero times, only the 720p rendition is used, the assembled source is a video rather than a
   playlist, the encoder makes a smaller 720p file out of it, and the pieces are gone afterwards.
+- `npm run test:slowlink` — 22 checks against a real server and a fixture page that takes longer
+  to read than a request may live: the fast path is untouched, a slow page answers `202` inside the
+  deadline, asking again answers in 3 ms with no extra read, the job endpoint answers in 400 ms
+  with a card that says it is reading, the job then finishes on its own with its video, and a link
+  that is not a link is still refused immediately.
 - `npm run test:update` — 10 checks: a checkout matching its remote is not nagged, a stale one
   names both hashes and the command, an offline box is told nothing (and the reason kept), missing
   git is named rather than guessed, a remote answering for another branch is not evidence, the

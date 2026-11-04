@@ -232,6 +232,9 @@ async function boot({
   cleanResult = { ok: true, freedBytes: 2 * 1024 ** 3, removedJobs: 1, kept: [] },
   deleteResult = { ok: true, freedBytes: 3 * 1024 ** 3, job: { id: 'jobBig' } },
   usageSettings = null,
+  /* What /api/resolve answers instead of a file list, when the server is still
+     reading the link (202). */
+  pending = null,
 } = {}) {
   const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
   const dom = new JSDOM(html, {
@@ -281,6 +284,7 @@ async function boot({
     }
     else if (target.includes('/api/publish')) body = { publish: { ...publishInfo, settings: liveSettings } };
     else if (target.includes('/api/links')) body = links;
+    else if (target.includes('/api/resolve') && pending) body = pending;
     else if (target.includes('/api/resolve') && resolved) body = resolved;
     else if (target.includes('/api/storage/clean')) body = cleanResult;
     else if (target.includes('/api/storage/jobs/') && init.method === 'DELETE') body = deleteResult;
@@ -400,6 +404,63 @@ async function boot({
     if (!/Opened your mail app/.test(button.textContent)) {
       throw new Error(`button says "${button.textContent}" — the mailto was not followed`);
     }
+  });
+
+  await test('a link the server is still reading starts a job instead of a gateway timeout', async () => {
+    /* The report: `Request failed (504)`. The server was reading a page that
+       needs a browser; the proxy gave up before the app answered. Now the app
+       answers 202 and the job is the place that minute is spent. */
+    const slow = await boot({
+      links: { links: [] },
+      pending: {
+        pending: true,
+        resolver: null,
+        files: [],
+        message: 'This link is still being read — the page needs a browser, and that takes a minute. Start it anyway.',
+      },
+    });
+    /* jsdom has no event streams; the card only needs close(). */
+    slow.window.EventSource = class {
+      constructor() {
+        this.readyState = 0;
+      }
+      close() {}
+    };
+    slow.doc.getElementById('urlInput').value = 'https://missav.ws/en/dandya-045';
+    slow.doc.getElementById('goBtn').dispatchEvent(new slow.window.Event('click'));
+    const postedTo = () => slow.calls.some((call) => call.url.includes('/api/jobs') && call.init.method === 'POST');
+    for (let i = 0; i < 60 && !postedTo(); i += 1) {
+      await new Promise((resolve) => slow.window.setTimeout(resolve, 25));
+    }
+    const posted = slow.calls.find((call) => call.url.includes('/api/jobs') && call.init.method === 'POST');
+    if (!posted) throw new Error('no job was started — the slow link dead-ended');
+    const body = JSON.parse(posted.init.body);
+    if (body.source !== 'url') throw new Error(`started as ${body.source}, not a link job`);
+    if (!/missav\.ws/.test(body.url || '')) throw new Error(`wrong url: ${body.url}`);
+    if (slow.doc.getElementById('pickerPanel')) throw new Error('a picker appeared for a link that has no files yet');
+    /* And no red banner: nothing failed. */
+    const alert = slow.doc.getElementById('alert');
+    if (!alert.hidden) throw new Error(`an error was shown: ${alert.textContent}`);
+  });
+
+  await test('a gateway timeout says what it means, not "Request failed (504)"', async () => {
+    const gw = await boot({ links: { links: [] } });
+    gw.window.fetch = async (url) => {
+      if (String(url).includes('/api/resolve')) {
+        return { ok: false, status: 504, json: async () => ({}), text: async () => 'Gateway Timeout' };
+      }
+      return { ok: true, status: 200, json: async () => ({ jobs: [] }), text: async () => '{}' };
+    };
+    gw.doc.getElementById('urlInput').value = 'https://missav.ws/en/dandya-045';
+    gw.doc.getElementById('goBtn').dispatchEvent(new gw.window.Event('click'));
+    for (let i = 0; i < 60 && gw.doc.getElementById('alert').hidden; i += 1) {
+      await new Promise((resolve) => gw.window.setTimeout(resolve, 25));
+    }
+    const alert = gw.doc.getElementById('alert');
+    if (alert.hidden) throw new Error('nothing was reported');
+    if (/Request failed \(504\)/.test(alert.textContent)) throw new Error(`still the raw message: ${alert.textContent}`);
+    if (!/gave up waiting/.test(alert.textContent)) throw new Error(`unhelpful: ${alert.textContent}`);
+    if (!/Start it again/.test(alert.textContent)) throw new Error(`no next step: ${alert.textContent}`);
   });
 
   await test('a page with several files gets a picker that shows every size', async () => {

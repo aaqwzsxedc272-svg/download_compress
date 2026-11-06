@@ -13,13 +13,21 @@
  * settings and scale by duration. A 12-second slice costs seconds, a wrong guess
  * costs an hour.
  *
- * The ladder, tried in order, all of it inside the quality rules:
+ * The ladder is two groups: the preset's own frame size, then 720p.
  *
  *   preset resolution @ preset CRF   (no quality cost at all)
  *   preset resolution @ CRF ceiling  (a small, invisible cost)
  *   720p @ preset CRF                (crisper, smaller, honest about the size)
  *   720p @ CRF ceiling
  *   give up and keep the original    (it is already as small as it gets)
+ *
+ * **Every rung of a group is measured before the group is judged.** Stopping at
+ * the first rung that saved 12% left the rest of the quality budget unspent:
+ * a 720p film whose re-encode at CRF 23 saved 12% was handed back at 12% when
+ * the same film at CRF 26 — still inside the quality rules — would have saved
+ * 25%. The frame size is chosen first (a 1080p file is not downscaled for a few
+ * more percent, because frame size is what people see), and inside one frame
+ * size the smallest result wins, because the CRF ceiling *is* the promise.
  */
 
 const fsp = require('node:fs/promises');
@@ -98,6 +106,27 @@ function ceilingFor(preset) {
 }
 
 /**
+ * The decision, separated from the measuring.
+ *
+ * `results` is the probes of *one* frame size, in the order they were offered.
+ * The smallest projection wins as long as it clears `minSaving`; when none
+ * does, the best saving is returned anyway so the caller can say what it found
+ * and keep the original.
+ *
+ * Being a plain function is the point: the rule is what regressed, and a rule
+ * that can only be tested by encoding an hour of video is a rule that will
+ * regress again.
+ */
+function chooseFromProbes(results, { minSaving = MIN_SAVING } = {}) {
+  if (!results || !results.length) return null;
+  const fits = results.filter((result) => result.saving >= minSaving);
+  if (fits.length) {
+    return fits.reduce((best, result) => (result.projectedBytes < best.projectedBytes ? result : best));
+  }
+  return results.reduce((best, result) => (result.saving > best.saving ? result : best));
+}
+
+/**
  * Choose settings that are predicted to save at least MIN_SAVING without
  * breaking a quality rule.
  *
@@ -138,14 +167,23 @@ async function chooseCrf({ input, meta, preset, sourceBytes, workDir, onProbe = 
 
   const ceiling = ceilingFor(preset);
 
-  /* The ladder. Each rung is a (resolution cap, CRF) pair, and a rung is only
+  /* The ladder, grouped by frame size and sharpest group first. A rung is only
      added when it actually changes something. */
-  const rungs = [];
-  const add = (maxShortSide, crf) => {
+  const groups = [];
+  const groupFor = (maxShortSide) => {
     const cap = maxShortSide == null ? null : Math.round(maxShortSide);
-    const key = `${label(cap)}@${crf}`;
-    if (rungs.some((rung) => rung.key === key)) return;
-    rungs.push({ key, maxShortSide: cap, crf });
+    let group = groups.find((item) => item.cap === cap);
+    if (!group) {
+      group = { cap, rungs: [] };
+      groups.push(group);
+    }
+    return group;
+  };
+  const add = (maxShortSide, crf) => {
+    const group = groupFor(maxShortSide);
+    const key = `${label(group.cap)}@${crf}`;
+    if (group.rungs.some((rung) => rung.key === key)) return;
+    group.rungs.push({ key, maxShortSide: group.cap, crf });
   };
 
   add(preset.maxShortSide || null, preset.crf);
@@ -158,46 +196,58 @@ async function chooseCrf({ input, meta, preset, sourceBytes, workDir, onProbe = 
     if (ceiling > preset.crf) add(MIN_SHORT_SIDE, ceiling);
   }
 
-  let best = null;
-  let probes = 0;
-  for (const rung of rungs) {
-    let bytesPerSecond;
-    try {
-      bytesPerSecond = await measureAt(input, {
+  let chosen = null;
+  let bestOverall = null;
+  const probes = [];
+  for (const group of groups) {
+    const measured = [];
+    for (const rung of group.rungs) {
+      let bytesPerSecond;
+      try {
+        bytesPerSecond = await measureAt(input, {
+          crf: rung.crf,
+          preset,
+          seconds: PROBE_SECONDS,
+          duration,
+          workDir,
+          meta,
+          maxShortSide: rung.maxShortSide,
+        });
+      } catch {
+        return nope; // probing is a nicety, never a blocker
+      }
+      const projectedBytes = Math.round(bytesPerSecond * duration + audioBytes);
+      const result = {
         crf: rung.crf,
-        preset,
-        seconds: PROBE_SECONDS,
-        duration,
-        workDir,
-        meta,
         maxShortSide: rung.maxShortSide,
-      });
-    } catch {
-      return nope; // probing is a nicety, never a blocker
+        projectedBytes,
+        saving: 1 - projectedBytes / sourceBytes,
+        probes: 0,
+        size: sizeAt(rung.maxShortSide),
+      };
+      onProbe(result);
+      measured.push(result);
+      probes.push(result);
+      if (!bestOverall || result.saving > bestOverall.saving) bestOverall = result;
     }
-    probes += 1;
-    const projectedBytes = Math.round(bytesPerSecond * duration + audioBytes);
-    const saving = 1 - projectedBytes / sourceBytes;
-    const result = {
-      crf: rung.crf,
-      maxShortSide: rung.maxShortSide,
-      projectedBytes,
-      saving,
-      probes: 0,
-      size: sizeAt(rung.maxShortSide),
-    };
-    onProbe(result);
-    if (!best || saving > best.saving) best = result;
-    if (saving >= MIN_SAVING) break;
+    const pick = chooseFromProbes(measured, { minSaving: MIN_SAVING });
+    /* A group only wins if something in it actually clears the bar; otherwise
+       the next (smaller) frame size gets its turn. */
+    if (pick && pick.saving >= MIN_SAVING) {
+      chosen = pick;
+      break;
+    }
   }
 
+  const best = chosen || bestOverall;
   if (!best) return nope;
-  best.probes = probes;
+  best.probes = probes.length;
   return best;
 }
 
 module.exports = {
   chooseCrf,
+  chooseFromProbes,
   measureAt,
   ceilingFor,
   MIN_SAVING,

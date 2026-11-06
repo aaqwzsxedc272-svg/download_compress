@@ -544,11 +544,22 @@ async function compressJob(job) {
           'This file is already about as small as it can be without losing quality, so the original is what gets shared.',
         );
       } else {
-        if (pick.saving < 0.15) {
-          notes.push(`Packed tightly already — ${Math.round(pick.saving * 100)}% is all that can come off without hurting the picture.`);
-        }
-        if (pick.maxShortSide && pick.crf > preset.crf) {
-          notes.push(`Straight re-encode is not enough for this one, so it runs slightly flatter (CRF ${pick.crf}).`);
+        const pct = Math.round(pick.saving * 100);
+        if (pct < 20) {
+          /* A small saving is not the app being lazy any more: it means the
+             file is already encoded about as tightly as this resolution is
+             worth, and the encoder has spent its whole quality budget. Saying
+             which CRF it used is what makes that checkable. */
+          notes.push(
+            `Already packed tightly for this length: ${pct}% is what comes off inside the quality rules ` +
+              `(CRF ${pick.crf}${pick.size ? `, ${pick.size.width}×${pick.size.height}` : ''}). ` +
+              'Smaller than that would come out of the picture, not out of waste.',
+          );
+        } else if (pick.crf > preset.crf) {
+          notes.push(
+            `The whole quality budget was spent — CRF ${pick.crf}, still inside what this app allows — which is ` +
+              `${pct}% off.`,
+          );
         }
         if (pickSize && meta.width && pickSize.width < meta.width) {
           notes.push(

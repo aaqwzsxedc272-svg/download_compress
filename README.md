@@ -157,10 +157,21 @@ enforced twice over.
 
 **Before encoding, the app measures.** Two 12-second slices are encoded at candidate settings
 and scaled by duration, so the real encode starts with a CRF and a resolution that are known to
-save at least 12%. The ladder is: preset CRF → CRF ceiling → 720p at preset CRF → 720p at the
-ceiling; the first rung that saves enough wins. If no rung saves at least 5%, the file is not
-encoded at all — it is copied through in seconds and the original is what gets shared, with a
-note saying it was already as small as it can get without losing quality.
+save at least 12%. The ladder is two groups — the preset's own frame size, then 720p — and
+**every rung of a group is measured before the group is judged**: the frame size is chosen first
+(a 1080p film is not downscaled for a few more percent, because frame size is what people see),
+and inside one frame size the *smallest* result wins, because the ceiling already is the quality
+promise. If no rung saves at least 5%, the file is not encoded at all — it is copied through in
+seconds and the original is what gets shared, with a note saying it was already as small as it can
+get without losing quality.
+
+That rule is what a 2.9 GB → 2.5 GB (−12%) job exposed. Its source was 720p, so the 720p group
+had exactly two rungs and the preset CRF (23) cleared the 12% bar on the first probe — the search
+stopped there and the CRF ceiling (26), still inside the rules, was never tried. Spending the rest
+of the budget is worth roughly twice the saving on a file like that; on a test source in the same
+regime the old rule produced −24.9% at CRF 23 and the new one −57.3% at CRF 26, and the real job
+landed within 0.5% of its prediction (18,172,206 bytes against 18,078,310 predicted) with SSIM
+0.978 against the source.
 
 Measured on a 1080p 2 Mbps source that previously came out at CRF 34 looking like 480p: the new
 path produced 1280×720 at CRF 24, 15% smaller, prediction within 0.5% of the real file.
@@ -1177,7 +1188,10 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:estimate` — the quality rules and the size prediction: a dense 1080p file is
   never encoded above CRF 26 and never below 720p, it downscales instead of being crushed, every
   preset stays inside both limits, a hopeless file is recognised instead of being encoded anyway,
-  and the projection lands within 25% of a real encode.
+  and the projection lands within 25% of a real encode. It also pins the *selection rule* with
+  numbers rather than clips — inside one frame size the smallest result wins, a rung that does not
+  clear the bar is never chosen just because it is alone, and frame size outranks bytes — because
+  that rule is what handed a 720p job 12% when 26% was available.
 - `npm run test:encode` — an MKV whose audio the MP4 muxer refuses: the normal plan fails, the
   forgiving retry succeeds, and the error carries the one ffmpeg line a person can act on.
 - `npm run test:ledger` — share links survive a restart, duplicates and mangled names.

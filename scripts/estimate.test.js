@@ -15,7 +15,7 @@ const path = require('node:path');
 const assert = require('node:assert');
 
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-const { chooseCrf, measureAt, MIN_SAVING } = require('../server/estimate');
+const { chooseCrf, chooseFromProbes, measureAt, MIN_SAVING, ceilingFor } = require('../server/estimate');
 const { PRESETS, buildPlan, CRF_CEILING, MIN_SHORT_SIDE } = require('../server/compress');
 
 let passed = 0;
@@ -151,8 +151,52 @@ async function main() {
   check('a bloated file is predicted to shrink by the required margin', () => {
     assert.ok(rescue.saving >= MIN_SAVING, `only ${Math.round(rescue.saving * 100)}% predicted`);
   });
-  check('one probe is enough when the preset CRF already saves', () => {
-    assert.strictEqual(rescue.probes, 1, `it ran ${rescue.probes} probes`);
+  /* The rule that used to cost the user half their saving: with the preset CRF
+     already over the 12% bar, the search stopped there and never asked whether
+     the CRF ceiling — still inside the quality promise — would do better. */
+  check('the whole quality budget is spent inside one frame size', () => {
+    assert.strictEqual(rescue.probes, 2, `it ran ${rescue.probes} probes, not 2`);
+    assert.strictEqual(rescue.crf, ceilingFor(PRESETS.balanced), `it settled for CRF ${rescue.crf}`);
+  });
+  check('and that spends it downward: the ceiling is smaller than the preset', () => {
+    assert.ok(rescue.saving >= MIN_SAVING, `only ${Math.round(rescue.saving * 100)}% predicted`);
+  });
+
+  /* The rule itself, with numbers instead of clips: it is where the regression
+     lived, and it must not live there again. */
+  const rung = (crf, bytes, cap = null) => ({
+    crf,
+    maxShortSide: cap,
+    projectedBytes: bytes,
+    saving: 1 - bytes / 1000,
+    size: { width: 1280, height: 720 },
+  });
+  check('inside one frame size the smallest result wins, not the first that saves', () => {
+    const pick = chooseFromProbes([rung(23, 880), rung(26, 760)]);
+    assert.strictEqual(pick.crf, 26);
+  });
+  check('the first rung is kept when the ceiling does not actually help', () => {
+    const pick = chooseFromProbes([rung(23, 700), rung(26, 705)]);
+    assert.strictEqual(pick.crf, 23, 'it flattened the picture for nothing');
+  });
+  check('a rung that does not clear the bar is not chosen just because it is alone', () => {
+    const pick = chooseFromProbes([rung(23, 950)]);
+    assert.strictEqual(pick.saving < MIN_SAVING, true);
+    assert.strictEqual(pick.crf, 23, 'it should still report the best it found');
+  });
+  check('frame size outranks bytes: a 1080p result beats a smaller 720p one', () => {
+    /* What the caller does with groups — 1080p is judged first, and only if
+       nothing there saves is 720p even measured. */
+    const hd = [rung(24, 860, 1080), rung(26, 800, 1080)];
+    const sd = [rung(24, 600, 720), rung(26, 520, 720)];
+    const pick = chooseFromProbes(hd, { minSaving: MIN_SAVING });
+    assert.strictEqual(pick.crf, 26);
+    assert.strictEqual(pick.maxShortSide, 1080);
+    /* ...and when 1080p cannot save, the 720p group decides. */
+    const hopelessHd = [rung(24, 990, 1080), rung(26, 960, 1080)];
+    assert.strictEqual(chooseFromProbes(hopelessHd).saving < MIN_SAVING, true);
+    assert.strictEqual(chooseFromProbes(sd).crf, 26);
+    assert.strictEqual(chooseFromProbes(sd).maxShortSide, 720);
   });
 
   // 3. The prediction is close to reality (within 25%) at the chosen CRF.

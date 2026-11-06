@@ -21,7 +21,6 @@
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
-const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -106,73 +105,12 @@ const getJob = async (id) => (await (await fetch(`${BASE}/api/jobs/${id}`)).json
 
 /* --------------------------------------------------------------- the fixture */
 
+/* The stand-in for Drive: viewer page, the `uc` form, and a usercontent
+   endpoint that serves bytes only when `confirm=t` comes back. Shared with the
+   preload that lets this same app be driven by a Drive link with no internet. */
+const { startDriveFixture } = require('./fixtures/drive-fixture');
+
 const hits = [];
-
-function driveForm(id) {
-  /* The real page: no file, a form whose hidden inputs are the download. */
-  return `<!doctype html><html><head><title>Google Drive - Virus scan warning</title></head><body>
-    <p>Google Drive can't scan this file for viruses.</p>
-    <p>${id}.mp4 (2.4G) exceeds the maximum size that Google can scan.</p>
-    <form id="download-form" action="http://127.0.0.1:${DRIVE_PORT}/usercontent/download" method="get">
-      <input type="hidden" name="id" value="${id}">
-      <input type="hidden" name="export" value="download">
-      <input type="hidden" name="confirm" value="t">
-      <input type="hidden" name="uuid" value="7d1f0c22-1a44-4f0e-9a51-2c8f1d3b6e90">
-    </form></body></html>`;
-}
-
-function startDrive() {
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://127.0.0.1:${DRIVE_PORT}`);
-    hits.push(`${req.method} ${url.pathname}${url.search}`);
-
-    /* The viewer page: the file's real name lives in its <title>. */
-    if (/^\/file\/d\/[^/]+\/view$/.test(url.pathname)) {
-      const id = url.pathname.split('/')[3];
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      return res.end(
-        `<html><head><title>${id === PRIVATE_ID ? 'Private Film' : 'Holiday Clip'}.mp4 - Google Drive</title></head>` +
-          '<body><div>viewer</div></body></html>',
-      );
-    }
-
-    /* The endpoint a downloader reaches first. For a big file: a page. */
-    if (url.pathname === '/uc') {
-      const id = url.searchParams.get('id') || '';
-      if (id === PRIVATE_ID) {
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        return res.end(
-          '<html><body><p>You need access</p><a href="https://accounts.google.com/ServiceLogin">Sign in</a></body></html>',
-        );
-      }
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      return res.end(driveForm(id));
-    }
-
-    /* What the form submits to: bytes only when `confirm` came back. */
-    if (url.pathname === '/usercontent/download') {
-      if (url.searchParams.get('confirm') !== 't') {
-        res.writeHead(403, { 'content-type': 'text/html' });
-        return res.end('<html><body>confirm required</body></html>');
-      }
-      const file = path.join(MEDIA_DIR, 'clip.mp4');
-      if (!fs.existsSync(file)) return res.writeHead(404).end();
-      const stat = fs.statSync(file);
-      res.writeHead(200, {
-        'content-type': 'video/mp4',
-        'content-length': String(stat.size),
-        'content-disposition': 'attachment; filename="Holiday Clip.mp4"',
-        'accept-ranges': 'bytes',
-      });
-      if (req.method === 'HEAD') return res.end();
-      return fs.createReadStream(file).pipe(res);
-    }
-
-    res.writeHead(404, { 'content-type': 'text/plain' });
-    return res.end('not found');
-  });
-  return new Promise((resolve) => server.listen(DRIVE_PORT, '127.0.0.1', () => resolve(server)));
-}
 
 /* -------------------------------------------------------------------- drive */
 
@@ -191,7 +129,13 @@ function startDrive() {
     path.join(MEDIA_DIR, 'clip.mp4'),
   ]);
 
-  const drive = await startDrive();
+  const drive = await startDriveFixture({
+    port: DRIVE_PORT,
+    mediaPath: path.join(MEDIA_DIR, 'clip.mp4'),
+    name: 'Holiday Clip.mp4',
+    privateIds: [PRIVATE_ID],
+    onHit: (hit) => hits.push(hit),
+  });
   const proc = startServer();
   const link = `https://drive.google.com/file/d/${SHARED_ID}/view?usp=sharing`;
 

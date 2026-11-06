@@ -1,6 +1,6 @@
 'use strict';
 /**
- * A stand-in for Google Drive, for the end-to-end test.
+ * A stand-in for Google Drive, for the end-to-end test and for a live demo.
  *
  *   node --require scripts/fixtures/fake-gdrive.js server/server.js
  *
@@ -10,7 +10,12 @@
  * comes back. Nothing in the app knows this is happening — the resolver builds
  * its own URLs and parses the same HTML it would get from Google.
  *
- *   FAKE_DRIVE_PORT  the local fixture's port (required)
+ *   FAKE_DRIVE_PORT   the local fixture's port (required)
+ *   FAKE_DRIVE_MEDIA  if set, *serve* the fixture from this file too, so a Drive
+ *                     link can be pasted into the app on a machine with no
+ *                     internet (the demo). The test starts its own fixture and
+ *                     leaves this unset.
+ *   FAKE_DRIVE_NAME   the file's name in that demo (default "Drive demo clip.mp4")
  */
 
 const PORT = process.env.FAKE_DRIVE_PORT;
@@ -31,3 +36,22 @@ globalThis.fetch = function fetch(input, init) {
   }
   return realFetch(input, init);
 };
+
+/* The demo: serve the fixture here, so the app's own resolver talks to
+   something that answers like Drive instead of to a network it cannot reach. */
+if (process.env.FAKE_DRIVE_MEDIA) {
+  const { startDriveFixture } = require('./drive-fixture');
+  startDriveFixture({
+    port: Number(PORT),
+    mediaPath: process.env.FAKE_DRIVE_MEDIA,
+    name: process.env.FAKE_DRIVE_NAME || 'Drive demo clip.mp4',
+    onHit: (hit) => console.log(`[fake-gdrive] ${hit}`),
+  })
+    .then(() => {
+      console.log(`[fake-gdrive] drive.google.com is this server — paste any Drive file link`);
+    })
+    .catch((err) => {
+      console.error(`[fake-gdrive] could not start: ${err.message}`);
+      process.exit(1);
+    });
+}

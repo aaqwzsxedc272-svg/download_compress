@@ -416,6 +416,13 @@ What it will not do, and says so instead of failing later:
 | a Google **Doc/Sheet/Slide** | *That is a Google document, not a video file* |
 | Drive's *"too many users have downloaded this file"* page | *The link is fine — try again in a few hours* (that one is Google's rate limit, not a broken link) |
 
+The fixture is also a **demo** for a machine with no internet: point the app's `fetch` at it and
+Drive links work end to end, offline —
+
+```
+FAKE_DRIVE_PORT=3288 FAKE_DRIVE_MEDIA=/tmp/clip.mp4 NODE_OPTIONS="--require ./scripts/fixtures/fake-gdrive.js" npm start
+```
+
 `npm run test:gdrive` runs the whole app against a fixture that answers exactly like Drive — the
 viewer page, the `uc` **form**, and a usercontent endpoint that only serves bytes when `confirm`
 comes back (a preloaded `fetch` points Drive's two hosts at the fixture, so no production code

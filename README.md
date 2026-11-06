@@ -88,6 +88,7 @@ Squeeze detects it at startup and reports it on `/api/health`.
 | **bunkr** | server only | follows the signed-CDN flow; rotates domains, often bot-protected |
 | **filester.me** | server only | public metadata + share-page scrape; behind DDoS-Guard; takes the file's real name from the page, not the CDN's UUID |
 | **fileditch** (`theditch.st`, `fileditch.st`, `fileditchfiles.me`) | server only, needs `npm run browser:install` | three URL shapes for one video: the share page, the signed link it hands out, and the file host. All three sit behind Cloudflare, so the page is opened in a real browser and its clearance cookie is reused for the download. `fileditchfiles.me/…` answers 500 to a plain request, so it is resolved through the player page (`fileditchvids.st`); the signed link lives ~26 minutes, so a fresh one is minted at fetch time |
+| **Google Drive** (`drive.google.com/file/d/…`, `open?id=…`, `uc?id=…`, `docs.google.com/file/d/…`) | yes, if the file is shared with “Anyone with the link” | a Drive link is a viewer page, not a file: the bytes come from `uc?export=download`, and past ~100 MB that answers with a **web page** carrying a `confirm` token. The form is read and submitted, so what downloads is the video rather than a 12 KB HTML “video”. Unshared files, folders and Drive's “too many downloads” page each say what they are, in one sentence |
 | **HLS / DASH streams** (`.m3u8`, `.mpd`) | yes | the best quality on offer is chosen and remuxed into one MP4 by ffmpeg (`-c copy`: no re-encode); a live stream or a DRM-protected one is refused in words, not a stack trace |
 | direct `.mp4` / `.webm` | yes | no resolution needed |
 | any page with a video | yes | `og:video`, `<video>`, `<source>`, JSON-LD, or the playlist in the player's own config |
@@ -109,6 +110,8 @@ real end-to-end encode, then explains what that combination means.
    - `pixeldrain.com/u|l/{id}` → file info / list
    - `bunkr.*` `/f|v|i|d|a/{id}` → signed CDN URL (albums expand to files)
    - `filester.me/d/{slug}` → public metadata, then share-page scrape
+   - `drive.google.com/file/d/{id}/view` → the viewer's title for the name, the
+     `uc` confirm form for a URL that actually serves the bytes
    - `fileditch.st/{id}` / `theditch.st/{id}` / a bare `fileditchfiles.me/...` path → the
      page's `⬇ Download` anchor (a freshly signed link), with the player URL as a fallback
    - a URL that ends in `.m3u8`/`.mpd` → the stream itself (best quality picked)
@@ -384,6 +387,41 @@ refused before a job exists.
 100 MB download, no live site — against a real encrypted HLS stream on a fixture CDN that refuses a
 cookie-and-referer request and serves one that comes from a browser. The second test runs the whole
 app: page in, playable 720p MP4 out, the advert untouched, the pieces gone.
+
+## Google Drive links
+
+A Drive link is not a file, and treating it as one is how a "video" of 12 KB gets saved:
+
+* `drive.google.com/file/d/{id}/view` is a **viewer page**. Its `Share` settings decide everything
+  else, and its `<title>` is the file's real name — that is where `Holiday Clip.mp4` comes from,
+  not from a UUID in a URL.
+* The bytes are behind `drive.google.com/uc?export=download&id={id}`.
+* Past roughly 100 MB that endpoint does **not** return the file. It returns Google's
+  *"Drive can't scan this file for viruses"* page, carrying a `confirm` token and a `uuid` in a
+  form. A downloader that saves the response saves that page. So the form is read, its own values
+  are turned into `drive.usercontent.google.com/download?id=…&confirm=…`, and *that* is fetched —
+  the name in the page is not trusted over the one in the form.
+* The confirm URL is minted at **download time**, not at resolve time: those tokens are per
+  session, and a queued job may start ten minutes later. A one-minute memo means the picker and
+  the job do not pay for it twice.
+* The size on the card is a real `Content-Length` from the confirmed URL, not a guess — the same
+  probe every other host gets.
+
+What it will not do, and says so instead of failing later:
+
+| Link | What you get |
+| --- | --- |
+| a file not shared publicly | *That Drive file is not shared publicly. In Drive open Share and set "Anyone with the link"* — before a job exists |
+| a **folder** | *That is a Drive folder, not a video. Open it and paste each video's own link — or download the folder yourself and drop the file here* |
+| a Google **Doc/Sheet/Slide** | *That is a Google document, not a video file* |
+| Drive's *"too many users have downloaded this file"* page | *The link is fine — try again in a few hours* (that one is Google's rate limit, not a broken link) |
+
+`npm run test:gdrive` runs the whole app against a fixture that answers exactly like Drive — the
+viewer page, the `uc` **form**, and a usercontent endpoint that only serves bytes when `confirm`
+comes back (a preloaded `fetch` points Drive's two hosts at the fixture, so no production code
+knows the test exists). It checks the name, the real size, a finished job whose source is the
+video rather than the HTML page, the `confirm=t` request that proves the form was submitted, and
+the three refusals above.
 
 ## A failure is not a dead end
 
@@ -1109,7 +1147,10 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
 - `npm run test:crash` — 10 checks against a real server process: an uncaught exception and an
   unhandled rejection are survived, the API keeps answering afterwards, both are written to
   `data/crash.log` with the build, and SIGTERM still stops it.
-- `npm run test:resolve` — 75 resolver tests against stubbed APIs (real response shapes),
+- `npm run test:resolve` — 85 resolver tests against stubbed APIs (real response shapes),
+  including Google Drive: a form page read into a real download URL, an unshared file, a folder,
+  a document, Drive's "too many downloads" page, and the one-minute memo that keeps the picker and
+  the job from asking Google twice.
   including the three URL shapes a fileditch page hands out, the Cloudflare path, a page that only
   reveals its download button to a browser, and the rule that a player page is never offered before
   a minted link, plus the page-title naming rule and fileditch's minted-link/player routes. It also
@@ -1184,6 +1225,11 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   really were refused and the segments really did arrive through the browser, the advert is fetched
   zero times, only the 720p rendition is used, the assembled source is a video rather than a
   playlist, the encoder makes a smaller 720p file out of it, and the pieces are gone afterwards.
+- `npm run test:gdrive` — 14 checks running the whole app against a fixture that behaves like
+  Drive (viewer page, `uc` form, a usercontent endpoint that only answers `confirm=t`): the file's
+  real name and size, a finished job whose source is the video and not the HTML page, a smaller
+  output of the same length, the `confirm=t` request itself, and the unshared file / folder
+  refusals.
 - `npm run test:slowlink` — 30 checks against a real server and a fixture page that takes longer
   to read than a request may live: the fast path is untouched, a slow page answers `202` inside the
   deadline, asking again answers in 3 ms with no extra read, the job endpoint answers in 400 ms

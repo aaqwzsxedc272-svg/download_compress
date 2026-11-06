@@ -1452,6 +1452,12 @@ async function fetchThenCompress(job, ref) {
         /* keep referer only */
       }
     }
+    /* A Drive viewer page is not a referer Drive wants, and a "shared with
+       anyone" file needs none: the confirmed URL is complete on its own. */
+    if (ref && ref.resolver === 'gdrive') {
+      delete refHeaders.referer;
+      delete refHeaders.origin;
+    }
     /* A Cloudflare clearance earned while reading the page is what the CDN
        checks again on the file itself — together with the user agent that
        earned it, because cf_clearance is bound to that string. */
@@ -1523,7 +1529,10 @@ async function fetchThenCompress(job, ref) {
       /* refHeaders is what the resolver learned (referer, cookie, UA); the
          resolver also returns the exact header set its playlist request was
          accepted with, and the segments are guarded the same way. */
-      extraHeaders: { ...refHeaders, ...(ref.streamHeaders || {}) },
+      /* `ref.headers` is what a resolver says its own URL needs — a Drive
+         session cookie, for instance. `streamHeaders` is the same idea for a
+         playlist, kept separate because ffmpeg gets those. */
+      extraHeaders: { ...refHeaders, ...(ref.headers || {}), ...(ref.streamHeaders || {}) },
       duration: Number(ref.duration) || 0,
       onProgress: ({ seconds, bytes }) => {
         const total = Number(ref.duration) || 0;
@@ -2255,6 +2264,7 @@ const ALLOWED_REF_RESOLVERS = new Set([
   'filester',
   'fileditch',
   'stream',
+  'gdrive',
   'direct',
 ]);
 

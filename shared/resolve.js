@@ -753,6 +753,279 @@
     },
   };
 
+  /* --------------------------------------------------------- Google Drive
+   *
+   * A Drive link is not a file: it is a viewer page, and the bytes live behind
+   * `uc?export=download&id=…`. Two things make it awkward, and both are the
+   * reason "it does not work with Drive" would otherwise be true:
+   *
+   *   1. **A big file answers with a web page.** Past ~100 MB Google refuses to
+   *      serve the file directly and sends a "Google Drive can't scan this file
+   *      for viruses" form instead, carrying a `confirm` token and a `uuid`.
+   *      Save that page as a video and you get a 12 KB HTML file; a downloader
+   *      that does not read the form gets exactly that. So the form is read,
+   *      and the URL it submits is what gets downloaded.
+   *   2. **Not every link is public.** A file that was never shared answers with
+   *      a sign-in page. That is a fact about the link, and it is said in one
+   *      sentence instead of failing as "a web page, not a video".
+   *
+   * Folders are refused on purpose: a folder is a list, and the picker already
+   * knows how to show a list of files — but not by guessing which of Drive's
+   * thirty files were meant.
+   */
+
+  const DRIVE_HOST = /(^|\.)(drive|docs)\.google\.com$/i;
+  const DRIVE_CONTENT_HOST = /(^|\.)drive\.usercontent\.google\.com$/i;
+
+  /** The file id in any of Drive's link shapes, or null. */
+  function driveFileId(input) {
+    const parsed = safeUrl(input);
+    if (!parsed) return null;
+    if (!DRIVE_HOST.test(parsed.hostname) && !DRIVE_CONTENT_HOST.test(parsed.hostname)) return null;
+    const fromPath = /\/d\/([A-Za-z0-9_-]{10,})/.exec(parsed.pathname);
+    if (fromPath && /\/file\/d\/|\/document\/d\/|\/spreadsheets\/d\/|\/presentation\/d\//.test(parsed.pathname)) {
+      return fromPath[1];
+    }
+    const fromQuery = parsed.searchParams.get('id');
+    if (fromQuery && /^[A-Za-z0-9_-]{10,}$/.test(fromQuery)) return fromQuery;
+    return fromPath ? fromPath[1] : null;
+  }
+
+  /** A Drive folder (or a Docs editor page): a link this app will not guess at. */
+  function driveKind(input) {
+    const parsed = safeUrl(input);
+    if (!parsed || !DRIVE_HOST.test(parsed.hostname)) return null;
+    if (/\/drive\/(u\/\d+\/)?folders?\//.test(parsed.pathname)) return 'folder';
+    if (/\/document\/d\/|\/spreadsheets\/d\/|\/presentation\/d\//.test(parsed.pathname)) return 'document';
+    return null;
+  }
+
+  const DRIVE_UA = UA;
+
+  /** Cookies a Drive response hands out, as a Cookie header, or null. */
+  function driveCookies(res) {
+    const jar = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    const pairs = jar.map((line) => String(line).split(';')[0].trim()).filter(Boolean);
+    return pairs.length ? pairs.join('; ') : null;
+  }
+
+  /** The name Drive puts on a file: its own header, or the viewer's <title>. */
+  function driveNameFromHeader(header) {
+    if (!header) return null;
+    const star = /filename\*\s*=\s*([^']*)''([^;]+)/i.exec(header);
+    if (star) {
+      try {
+        return decodeURIComponent(star[2].trim().replace(/^"|"$/g, ''));
+      } catch {
+        /* fall through */
+      }
+    }
+    const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(header);
+    return plain ? plain[1].trim() : null;
+  }
+
+  /**
+   * Read Drive's "can't scan this file" page and find the download it offers.
+   *
+   * Two shapes exist: a form whose hidden inputs carry `confirm` and `uuid`, and
+   * a plain link to `drive.usercontent.google.com/download`. Whichever is there
+   * is used; the form's own values are turned into the same kind of URL, so the
+   * rest of the app only ever sees one thing.
+   */
+  function driveConfirmTarget(id, html) {
+    if (
+      /too many users have (?:viewed|downloaded)(?: or (?:viewed|downloaded))? this file/i.test(html) ||
+      /you (?:can't|cannot) (?:view|download) this file at this time/i.test(html)
+    ) {
+      throw new ResolveError(
+        'Google Drive is refusing this file for now: too many people have downloaded it in the last day. ' +
+          'The link is fine — try again in a few hours, or download it yourself and drop the file here.',
+        'DRIVE_QUOTA',
+      );
+    }
+    if (
+      /accounts\.google\.com\/(ServiceLogin|AccountChooser|signin)/i.test(html) ||
+      /You need (access|permission)/i.test(html) ||
+      /request access/i.test(html)
+    ) {
+      throw new ResolveError(
+        'That Drive file is not shared publicly. In Drive open Share and set “Anyone with the link”, then ' +
+          'paste the link again.',
+        'DRIVE_PRIVATE',
+      );
+    }
+
+    /* 1. A link straight to the confirmed download. */
+    const linked = /https:\/\/drive\.usercontent\.google\.com\/download\?[^"'<>\\\s]+/i.exec(html);
+    if (linked) return linked[0].replace(/&amp;/g, '&');
+
+    /* 2. The form: read its inputs rather than guess the parameters. Google
+       has used `confirm`+`uuid` for years and occasionally adds another token
+       (`at`), so every hidden field is carried over rather than a whitelist —
+       a dropped token is a download that answers "forbidden". */
+    const action = /<form[^>]+action="([^"]+)"/i.exec(html)?.[1] || 'https://drive.usercontent.google.com/download';
+    const inputs = {};
+    for (const tag of html.match(/<input\b[^>]*>/gi) || []) {
+      const name = /name="([^"]*)"/i.exec(tag)?.[1];
+      const value = /value="([^"]*)"/i.exec(tag)?.[1] ?? '';
+      if (name) inputs[name] = value.replace(/&amp;/g, '&');
+    }
+    if (!inputs.confirm) return null;
+    if (!inputs.id) inputs.id = id;
+    if (!inputs.export) inputs.export = 'download';
+    const where = /^https?:/i.test(action) ? action.split('?')[0] : 'https://drive.usercontent.google.com/download';
+    return `${where}?${new URLSearchParams(inputs).toString()}`;
+  }
+
+  /**
+   * Turn a file id into a URL that really serves the bytes.
+   *
+   * Called again at download time on purpose: `confirm` values are minted per
+   * session and a job can start ten minutes after the link was read.
+   */
+  async function driveDownload(id) {
+    const view = `https://drive.google.com/uc?export=download&id=${encodeURIComponent(id)}`;
+    const res = await fetchWithTimeout(
+      view,
+      {
+        headers: {
+          'user-agent': DRIVE_UA,
+          accept: 'text/html,application/xhtml+xml,application/octet-stream,*/*',
+          'accept-language': 'en-US,en;q=0.9',
+        },
+        redirect: 'follow',
+      },
+      20000,
+    ).catch((err) => {
+      throw new ResolveError(
+        `Google Drive did not answer (${err.name === 'AbortError' ? 'timeout' : err.message}).`,
+        'DRIVE_UNREACHABLE',
+      );
+    });
+    const cookie = driveCookies(res);
+    const type = String(res.headers.get('content-type') || '').toLowerCase();
+
+    /* A file that needs no confirmation comes back as the file itself. */
+    if (res.ok && !type.includes('text/html')) {
+      res.body?.cancel?.().catch(() => {});
+      return {
+        url: `https://drive.usercontent.google.com/download?id=${encodeURIComponent(id)}&export=download&confirm=t`,
+        cookie,
+        name: driveNameFromHeader(res.headers.get('content-disposition')),
+        size: Number(res.headers.get('content-length') || 0) || 0,
+      };
+    }
+
+    const html = await res.text().catch(() => '');
+    const target = driveConfirmTarget(id, html);
+    if (!target) {
+      if (/not found|no longer exists|404/i.test(html)) {
+        throw new ResolveError('That Google Drive file does not exist any more.', 'NOT_FOUND');
+      }
+      throw new ResolveError(
+        'Google Drive answered with a page this app cannot read. Make sure the file is still there and shared ' +
+          'with “Anyone with the link”.',
+        'DRIVE_UNREADABLE',
+      );
+    }
+    return { url: target, cookie, name: null, size: 0 };
+  }
+
+  /* Reading the same Drive link twice (the picker, then the job) must not cost
+     two round trips to Google. A minute is short enough that a token minted
+     here is still good when the download starts. */
+  const driveCache = new Map();
+  const DRIVE_TTL = 60 * 1000;
+
+  async function driveLookup(id, { fresh = false } = {}) {
+    const hit = driveCache.get(id);
+    if (!fresh && hit && Date.now() - hit.at < DRIVE_TTL) return hit.value;
+    const info = await driveDownload(id);
+    /* A long-running server sees many links; the cache is a courtesy, not a
+       ledger, so old entries go rather than grow. */
+    if (driveCache.size >= 200) driveCache.clear();
+    driveCache.set(id, { at: Date.now(), value: info });
+    return info;
+  }
+
+  const gdrive = {
+    id: 'gdrive',
+    match: (url) => {
+      if (driveKind(url)) return driveKind(url);
+      return driveFileId(url) ? 'file' : null;
+    },
+    async list(url) {
+      const kind = driveKind(url);
+      if (kind === 'folder') {
+        throw new ResolveError(
+          'That is a Drive folder, not a video. Open it and paste each video’s own link — or download the ' +
+            'folder yourself and drop the file here.',
+          'DRIVE_FOLDER',
+        );
+      }
+      if (kind === 'document') {
+        throw new ResolveError(
+          'That is a Google document, not a video file. Open it and paste the link of a video inside Drive.',
+          'DRIVE_DOCUMENT',
+        );
+      }
+      const id = driveFileId(url);
+      if (!id) throw new ResolveError('That is not a Google Drive file link.', 'BAD_URL');
+
+      /* The confirmed download is what makes the link downloadable; the viewer
+         page is what has the file's real name. Both are cheap and both are
+         needed before the card can say anything true. */
+      const [download, pageName] = await Promise.all([
+        driveLookup(id),
+        (async () => {
+          const html = await fetchWithTimeout(
+            `https://drive.google.com/file/d/${encodeURIComponent(id)}/view`,
+            { headers: { 'user-agent': DRIVE_UA, accept: 'text/html' }, redirect: 'follow' },
+            15000,
+          )
+            .then((res) => (res.ok ? res.text() : ''))
+            .catch(() => '');
+          const title = /<title[^>]*>([^<]+)<\/title>/i.exec(html)?.[1] || '';
+          const cleaned = title.replace(/\s*-\s*Google Drive\s*$/i, '').trim();
+          if (cleaned && !/^Google Drive$/i.test(cleaned)) return cleaned;
+          const og = /<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i.exec(html)?.[1];
+          return og ? og.trim() : null;
+        })(),
+      ]);
+
+      const name = download.name || pageName || `${id}.mp4`;
+      return {
+        resolver: 'gdrive',
+        title: pageName || null,
+        files: [
+          {
+            id,
+            name,
+            size: download.size || 0,
+            mime: '',
+            kind: isVideo(name, '') ? 'video' : 'other',
+            ref: {
+              resolver: 'gdrive',
+              id,
+              name,
+              /* Deliberately no `ref.url`: that field means "a URL that can be
+                 fetched as it stands", and the viewer page is not one — a size
+                 probe aimed at it would measure an HTML page. The confirmed
+                 download comes from `direct()`, which mints it fresh. */
+              ...(download.cookie ? { headers: { cookie: download.cookie } } : {}),
+            },
+          },
+        ],
+      };
+    },
+    async direct(ref) {
+      if (!ref || !ref.id) throw new ResolveError('Missing Drive file reference.', 'BAD_REF');
+      const info = await driveLookup(ref.id, { fresh: true });
+      if (ref && info.cookie) ref.headers = { ...(ref.headers || {}), cookie: info.cookie };
+      return info.url;
+    },
+  };
+
   /* ------------------------------------------------------------ streams (HLS)
    * A stream is a text file that lists the parts of a video. As a *master* it
    * names several qualities; as a *media playlist* it names the segments. There
@@ -2589,7 +2862,7 @@ function preferPageName(urlName, pageName) {
 
   /* ----------------------------------------------------------------- registry */
 
-  const RESOLVERS = [gofile, turbo, pixeldrain, bunkr, filester, fileditch, stream, direct, page];
+  const RESOLVERS = [gofile, turbo, pixeldrain, bunkr, filester, fileditch, gdrive, stream, direct, page];
 
   /** Videos first, biggest first — the file people usually want. */
   function orderFiles(files) {

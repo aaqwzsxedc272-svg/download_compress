@@ -1341,6 +1341,169 @@ seg0.ts
     await assert.rejects(resolve('not a url'), (err) => err.code === 'BAD_URL');
   });
 
+  console.log('google drive');
+
+  /* The shapes Google really answers with. A big file does not come back as a
+     file — it comes back as this form, and a downloader that saves the response
+     gets a 12 KB HTML "video". */
+  const DRIVE_ID = '1AbCdEfGhIjKlMnOpQrStUvWxYz012345';
+  const DRIVE_FORM = `<!doctype html><html><head><title>Google Drive - Virus scan warning</title></head><body>
+    <p>Google Drive can't scan this file for viruses.</p>
+    <form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
+      <input type="hidden" name="id" value="${DRIVE_ID}">
+      <input type="hidden" name="export" value="download">
+      <input type="hidden" name="confirm" value="t">
+      <input type="hidden" name="uuid" value="5f1c2f0a-9b2e-4f77-8a11-2f6d0c4e9b31">
+    </form></body></html>`;
+
+  const DRIVE_DIRECT_ID = '1DirectFileAbCdEfGhIjKl';
+  const DRIVE_PRIVATE_ID = '1PrivateFileAbCdEfGhIjK';
+  const DRIVE_QUOTA_ID = '1QuotaFileAbCdEfGhIjKlM';
+
+  const driveHandler = ({ form = DRIVE_FORM, viewTitle = 'Holiday in Rome.mp4 - Google Drive' } = {}) =>
+    (url) => {
+      if (/drive\.google\.com\/file\/d\/[^/]+\/view/.test(url)) {
+        return {
+          raw: `<html><head><title>${viewTitle}</title></head><body>viewer</body></html>`,
+          type: 'text/html',
+        };
+      }
+      if (/drive\.google\.com\/uc\?export=download/.test(url)) {
+        return { raw: form, type: 'text/html' };
+      }
+      return { raw: '', type: 'text/plain', status: 404 };
+    };
+
+  await test('a Drive link is read as a file, with its real name', async () => {
+    const calls = stubFetch(driveHandler());
+    const result = await resolve(`https://drive.google.com/file/d/${DRIVE_ID}/view?usp=sharing`);
+    assert.equal(result.resolver, 'gdrive');
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].name, 'Holiday in Rome.mp4');
+    assert.equal(result.files[0].kind, 'video');
+    assert.ok(calls.some((call) => call.url.includes('drive.google.com/uc?export=download')));
+  });
+
+  await test('the download URL is the one its "can\'t scan this file" form submits', async () => {
+    stubFetch(driveHandler());
+    const url = await directUrl({
+      resolver: 'gdrive',
+      id: DRIVE_ID,
+      name: 'Holiday in Rome.mp4',
+      url: `https://drive.google.com/file/d/${DRIVE_ID}/view`,
+    });
+    assert.match(url, /^https:\/\/drive\.usercontent\.google\.com\/download\?/);
+    assert.match(url, /[?&]id=1AbCdEfGhIjKlMnOpQrStUvWxYz012345/);
+    assert.match(url, /[?&]confirm=t/);
+    assert.match(url, /uuid=5f1c2f0a-9b2e-4f77-8a11-2f6d0c4e9b31/);
+  });
+
+  await test('every hidden token in the form is carried over, not just confirm', async () => {
+    const AT_ID = '1AtTokenFileAbCdEfGhIjK';
+    stubFetch(
+      driveHandler({
+        form: `<html><body><form action="https://drive.usercontent.google.com/download" method="get">
+          <input type="hidden" name="id" value="${AT_ID}">
+          <input type="hidden" name="export" value="download">
+          <input type="hidden" name="confirm" value="t">
+          <input type="hidden" name="at" value="AK7h2Xq9">
+          <input type="hidden" name="uuid" value="0e5c1c9a-77aa-4a11-9f0e-5b8e2f6c1d44">
+        </form></body></html>`,
+      }),
+    );
+    const url = await directUrl({ resolver: 'gdrive', id: AT_ID });
+    assert.match(url, /[?&]at=AK7h2Xq9/, 'the extra token Google added is kept');
+    assert.match(url, /[?&]uuid=0e5c1c9a-77aa-4a11-9f0e-5b8e2f6c1d44/);
+    assert.match(url, /[?&]confirm=t/);
+  });
+
+  await test('a file offered as a direct link needs no form', async () => {
+    stubFetch((url) => {
+      if (/drive\.google\.com\/uc\?export=download/.test(url)) {
+        return {
+          raw: '',
+          type: 'video/mp4',
+          headers: {
+            'content-disposition': 'attachment; filename="Beach Day.mp4"',
+            'content-length': '734003200',
+          },
+        };
+      }
+      return { raw: '<html><head><title>Beach Day.mp4 - Google Drive</title></head></html>', type: 'text/html' };
+    });
+    const result = await resolve(`https://drive.google.com/uc?id=${DRIVE_DIRECT_ID}&export=download`);
+    assert.equal(result.files[0].name, 'Beach Day.mp4');
+    assert.equal(result.files[0].size, 734003200);
+  });
+
+  await test('every Drive link shape resolves to the same file', async () => {
+    stubFetch(driveHandler());
+    for (const shape of [
+      `https://drive.google.com/file/d/${DRIVE_ID}/view`,
+      `https://drive.google.com/open?id=${DRIVE_ID}`,
+      `https://drive.google.com/uc?id=${DRIVE_ID}&export=download`,
+      `https://docs.google.com/file/d/${DRIVE_ID}/edit`,
+    ]) {
+      const result = await resolve(shape);
+      assert.equal(result.files[0].ref.id, DRIVE_ID, shape);
+    }
+  });
+
+  await test('a file that is not shared publicly says so, in one sentence', async () => {
+    stubFetch((url) => {
+      if (/\/view/.test(url)) return { raw: '<html><title>Google Drive</title></html>', type: 'text/html' };
+      return {
+        raw: '<html><body>You need access<a href="https://accounts.google.com/ServiceLogin">Sign in</a></body></html>',
+        type: 'text/html',
+      };
+    });
+    await assert.rejects(
+      resolve(`https://drive.google.com/file/d/${DRIVE_PRIVATE_ID}/view`),
+      (err) => err.code === 'DRIVE_PRIVATE' && /Anyone with the link/.test(err.message),
+    );
+  });
+
+  await test('a folder is refused with what to do instead, not with a guess', async () => {
+    stubFetch(() => ({ raw: '<html></html>', type: 'text/html' }));
+    await assert.rejects(
+      resolve('https://drive.google.com/drive/folders/1FolderIdAbCdEfGhIjKlMn'),
+      (err) => err.code === 'DRIVE_FOLDER' && /paste each video’s own link/.test(err.message),
+    );
+  });
+
+  await test('Drive\'s "too many downloads" page is its own answer', async () => {
+    stubFetch((url) =>
+      /\/view/.test(url)
+        ? { raw: '<html><title>Google Drive</title></html>', type: 'text/html' }
+        : {
+            raw: '<html><body>Sorry, you can\'t view or download this file at this time. Too many users have viewed or downloaded this file recently.</body></html>',
+            type: 'text/html',
+          },
+    );
+    await assert.rejects(
+      resolve(`https://drive.google.com/file/d/${DRIVE_QUOTA_ID}/view`),
+      (err) => err.code === 'DRIVE_QUOTA' && /try again in a few hours/i.test(err.message),
+    );
+  });
+
+  await test('a document link is not a video, and says which it is', async () => {
+    stubFetch(() => ({ raw: '<html></html>', type: 'text/html' }));
+    await assert.rejects(
+      resolve('https://docs.google.com/document/d/1DocIdAbCdEfGhIjKlMn/view'),
+      (err) => err.code === 'DRIVE_DOCUMENT',
+    );
+  });
+
+  await test('a Drive link pasted twice does not ask Google twice', async () => {
+    const calls = stubFetch(driveHandler());
+    const ref = { resolver: 'gdrive', id: '1SecondLookupAbCdEfGhIjKl', url: 'https://drive.google.com/x' };
+    await directCandidates(ref);
+    const after = calls.filter((call) => /uc\?export=download/.test(call.url)).length;
+    await directCandidates(ref);
+    const extra = calls.filter((call) => /uc\?export=download/.test(call.url)).length - after;
+    assert.equal(extra, 1, 'the confirmed URL should be re-minted once, not twice');
+  });
+
   console.log('network failures');
 
   await test('a blocked fetch surfaces as BLOCKED, not a crash', async () => {

@@ -441,6 +441,51 @@ knows the test exists). It checks the name, the real size, a finished job whose 
 video rather than the HTML page, the `confirm=t` request that proves the form was submitted, and
 the three refusals above.
 
+## A file that will not read
+
+Three failures in a row, all of them *"That file is not a video this server can read."* on a 1.88 GB
+Drive download, is what started this. The sentence was true and useless: a RAR with `.mp4` glued on
+the end, a share page saved as a video, a dropped `.ts` recording and an MP4 that stopped downloading
+halfway all produce it, and they want four different things from the person holding the link.
+
+So a file that will not probe is now **identified from its bytes** before anything is said about it:
+
+| The bytes | What the app says |
+| --- | --- |
+| `Rar!`, `PK`, `7z` | *It is a RAR archive with a video's name on it — a scene release is often split into parts. Extract it on your own machine and drop the video here* |
+| `<!doctype html`, `<html` | *The link handed back a web page instead of the file…* — plus what to do about it |
+| `%PDF`, JPEG, PNG, GIF | *It is a PDF, not a video* |
+| ISO (``CD001`` at 0x8001) | *It is a disc image, not a video file* |
+| MP3, FLAC, Ogg | *sound only, so there is no picture to compress* |
+| all zeroes, 0 bytes | *The file is empty — the download produced nothing* |
+| an MP4 / Matroska / AVI / MPEG-TS that will not parse | *…but this build's ffprobe cannot parse it — the download may be damaged (1.8 GB). Paste the link again*, or, when the host promised more than arrived, *it is short: 1.8 GB arrived of 2.4 GB* |
+
+**Two of those are worth trying harder on, and the app does.** A container can be broken in ways a
+stream copy fixes and a decode cannot: an index that never arrived, a `.ts` with the wrong extension,
+a recording whose first packet was lost. `repair()` re-writes the container with `-c copy` — not one
+frame is re-encoded — and only replaces the original when the copy probes cleanly, saying so on the
+card: *"The file arrived in a broken container (an MPEG-TS stream) — it was remuxed without
+re-encoding, so the picture is untouched, and the job carries on."*
+
+That path also survives a crash that used to look like a verdict on the file: the bundled ffprobe is
+a **2018 build** and segfaults on some damaged MPEG-TS streams, which arrives as *exit null* with no
+stderr at all. A crash is not evidence of anything, so it goes to the repair path instead of into a
+sentence.
+
+**And "Try again" stopped looping.** A retry after a failure is only a retry when the bytes could be
+different: after a web page or a short download, the file is fetched again; after a RAR or a PDF, the
+button answers *"Trying again would read the same bytes, so the file has to come from somewhere
+else."* instead of starting a third identical job.
+
+Any file can be interrogated on its own:
+
+```
+npm run whatis -- data/jobs/nGJLqPTq/source.mp4
+```
+
+which prints the size, the real container, the first twelve bytes, what ffprobe makes of it, what a
+stream copy manages, and the sentence the app would show.
+
 ## A failure is not a dead end
 
 A 4K file on a small machine is hours of work, and the reported failure — `ENOENT … stat
@@ -1185,6 +1230,10 @@ Cloud hosts stop an idle machine, which can cut a two-hour encode in half. Three
   browser that is simply absent a bug.
 - `npm run test:hosters` — 9 uploader tests: streamed multipart/raw bodies match their
   declared Content-Length, refusal handling, size-limit skipping and the fallback chain.
+- `npm run test:whatis` — 14 checks: a RAR, a ZIP, a web page, an empty file, a truncated MP4 and
+  an MPEG-TS whose first packet was lost are each named from their bytes; the TS is **repaired** and
+  encodes afterwards; and, driven through the real endpoints, a RAR fails with the reason and
+  refuses a pointless retry while a web page's retry really does fetch it again.
 - `npm run test:estimate` — the quality rules and the size prediction: a dense 1080p file is
   never encoded above CRF 26 and never below 720p, it downscales instead of being crushed, every
   preset stays inside both limits, a hopeless file is recognised instead of being encoded anyway,

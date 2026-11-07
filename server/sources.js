@@ -239,6 +239,9 @@ function filenameFromUrl(raw) {
   }
 }
 
+/** "512 MB" — for a sentence about a short download. */
+const formatMb = (bytes) => (bytes >= 1048576 ? `${Math.round(bytes / 1048576)} MB` : `${Math.round(bytes / 1024)} KB`);
+
 async function downloadHttp(
   url,
   destPath,
@@ -420,7 +423,20 @@ async function downloadHttp(
     if (outerSignal) outerSignal.removeEventListener('abort', forwardAbort);
   }
 
+  /* A body that ended early without an error is still a short file, and a
+     short MP4 is a file with no index — which surfaces later as "not a video",
+     three states away from the cause. Say it here, where the fix lives (the
+     fragment is on disk, and the next attempt carries on from it). */
   const expected = expectTotal > 0 ? expectTotal : total;
+  if (expected > 0 && offset + received < expected) {
+    throw Object.assign(
+      new Error(
+        `The download stopped ${formatMb(expected - (offset + received))} short of ${formatMb(expected)} — ` +
+          'the part that arrived is kept, and it carries on from there.',
+      ),
+      { code: 'DOWNLOAD_FAILED', keptBytes: offset + received, expectedBytes: expected },
+    );
+  }
   return {
     bytes: offset + received,
     contentType: type,

@@ -10,7 +10,7 @@
     "smoke": "node scripts/smoke.js",
     "test:resolve": "node scripts/resolve.test.js",
     "test:hosters": "node scripts/hosters.test.js",
-    "test": "node scripts/resolve.test.js && node scripts/browser-capture.test.js && node scripts/crash.test.js && node scripts/hooks.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js && node scripts/notify.test.js && node scripts/mailsetup.test.js && node scripts/publish.test.js && node scripts/sweep.test.js && node scripts/progress.test.js && node scripts/stream.test.js && node scripts/ui.test.js && node scripts/storage.test.js && npm run test:browser:stream && npm run test:browser:job && npm run test:update && npm run test:slowlink && npm run test:gdrive",
+    "test": "node scripts/resolve.test.js && node scripts/browser-capture.test.js && node scripts/crash.test.js && node scripts/hooks.test.js && node scripts/hosters.test.js && node scripts/fallback.test.js && node scripts/refs.test.js && node scripts/estimate.test.js && node scripts/ledger.test.js && node scripts/encode.test.js && node scripts/notify.test.js && node scripts/mailsetup.test.js && node scripts/publish.test.js && node scripts/sweep.test.js && node scripts/progress.test.js && node scripts/stream.test.js && node scripts/ui.test.js && node scripts/storage.test.js && npm run test:browser:stream && npm run test:browser:job && npm run test:update && npm run test:slowlink && npm run test:gdrive && npm run test:whatis",
     "deploy:hf": "scripts/deploy-space.sh",
     "package:hf": "node scripts/package-space.js",
     "verify": "node scripts/verify-deploy.js",
@@ -44,7 +44,9 @@
     "test:browser:job": "node scripts/browser-job.test.js",
     "test:update": "node scripts/update.test.js",
     "test:slowlink": "node scripts/slowlink.test.js",
-    "test:gdrive": "node scripts/gdrive.test.js"
+    "test:gdrive": "node scripts/gdrive.test.js",
+    "whatis": "node scripts/whatis.js",
+    "test:whatis": "node scripts/whatis.test.js"
   },
   "engines": {
     "node": ">=18"

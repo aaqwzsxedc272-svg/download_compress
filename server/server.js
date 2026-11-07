@@ -12,7 +12,7 @@ const { pipeline } = require('node:stream/promises');
 const express = require('express');
 
 const jobsStore = require('./jobs');
-const { probe, thumbnail, transcode } = require('./ffmpeg');
+const { probe, probeOrExplain, thumbnail, transcode } = require('./ffmpeg');
 const { downloadWithFallback, RECOVERABLE } = require('./fallback');
 const autoStop = require('./autostop');
 const ledger = require('./ledger');
@@ -454,7 +454,17 @@ async function compressJob(job) {
 
   jobsStore.updateJob(job, { status: 'compressing', stage: 'Reading video info', progress: 0 });
 
-  const meta = await probe(paths.source);
+  /* A file that will not probe is not necessarily a bad file: a broken
+     container (index at the end and missing, a .ts with the wrong name, an MKV
+     with jumping timestamps) is repaired by a stream copy, which changes no
+     pixels. Only when even that fails does the app say what the file is —
+     "not a video this server can read" fitted a RAR, a web page and a truncated
+     MP4 equally well, and those want three different answers. */
+  const read = await probeOrExplain(paths.source, {
+    workDir: job.dir,
+    expected: Number(job.downloadTotal) || 0,
+  });
+  const meta = read.info;
   const stat = await fsp.stat(paths.source);
   job.sourceBytes = stat.size;
 
@@ -478,6 +488,9 @@ async function compressJob(job) {
   thumbnail(paths.source, paths.thumb, meta.duration).catch(() => {});
 
   const notes = [];
+  /* A repaired source is worth saying out loud: the encode is of the file that
+     was downloaded, after a container rewrite that touched no frame. */
+  if (read.note) notes.push(read.note);
   let usedOriginal = false;
   const note = (pick) => {
     console.log(
@@ -1128,6 +1141,8 @@ function reportJobError(job, err) {
               ? 'That CDN wants a cookie earned on your own connection: open the page in your browser, copy the ' +
                 '.m3u8 address the player requests, and paste that link instead.'
               : 'That link is served only to the page it belongs to. Paste the page the video plays on instead.')
+      : err.code === 'INVALID_MEDIA' && err.advice
+        ? `That file is not a video this server can read. ${err.advice}`
       : err.code === 'FFMPEG_FAILED'
       ? `ffmpeg could not process this file${err.codecNote ? ` (${err.codecNote})` : ''}.` +
         `${ffmpegDetail ? ` It said: ${ffmpegDetail}` : ''} Try another preset, or a different source file.`
@@ -1136,6 +1151,9 @@ function reportJobError(job, err) {
     status: 'error',
     stage: outOfSpace ? 'Out of disk space' : 'Failed',
     error: message,
+    /* Kept so "Try again" can tell a failure worth repeating from one that will
+       fail at the same byte: a file that is not a video is not a bad download. */
+    errorCode: outOfSpace ? 'NO_DISK' : err.code || 'ERR',
     speed: null,
   });
   console.error(`[job ${job.id}] ${outOfSpace ? 'NO_DISK' : err.code || 'ERR'}:`, err.message?.slice(0, 600));
@@ -1903,8 +1921,13 @@ async function adoptUpload(tmpPath, fields) {
   });
   const paths = jobsStore.jobPaths(job);
 
+  /* Reading (and, if needed, repairing) the file happens here, before it
+     becomes the job's source — so the note it produces has to be carried onto
+     the job, or the card would show an encode of a file it never mentions
+     fixing. */
+  let read;
   try {
-    await probe(tmpPath);
+    read = await probeOrExplain(tmpPath, { workDir: path.dirname(paths.source) });
   } catch (err) {
     await jobsStore.removeJob(job.id);
     await fsp.rm(tmpPath, { force: true }).catch(() => {});
@@ -1913,7 +1936,12 @@ async function adoptUpload(tmpPath, fields) {
 
   await fsp.rename(tmpPath, paths.source);
   const size = (await fsp.stat(paths.source)).size;
-  jobsStore.updateJob(job, { status: 'queued', sourceBytes: size, stage: 'Queued' });
+  jobsStore.updateJob(job, {
+    status: 'queued',
+    sourceBytes: size,
+    stage: 'Queued',
+    ...(read && read.note ? { fetchedNote: read.note } : {}),
+  });
   startCompression(job);
   return job;
 }
@@ -2366,6 +2394,7 @@ async function adoptJob(job, ref) {
       : `Picking up the earlier run — ${keptParts} part(s) already encoded`,
     progress: 0,
     error: null,
+    errorCode: null,
     interrupted: false,
     resumed: true,
   });
@@ -2913,7 +2942,12 @@ app.post('/api/upload/finish/:id', async (req, res) => {
     await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
     uploads.delete(entry.meta.id);
     if (err.code === 'NO_VIDEO' || err.code === 'INVALID_MEDIA') {
-      return fail(res, 415, 'NO_VIDEO', 'That file is not a video this server can read.');
+      return fail(
+        res,
+        415,
+        'NO_VIDEO',
+        `That file is not a video this server can read.${err.advice ? ` ${err.advice}` : ''}`,
+      );
     }
     if (err.code === 'TOO_BIG') return fail(res, 413, 'TOO_BIG', err.message);
     return fail(res, 400, 'UPLOAD_FAILED', err.message);
@@ -2939,7 +2973,12 @@ app.post('/api/upload', async (req, res) => {
     if (err.code === 'TOO_BIG') return fail(res, 413, 'TOO_BIG', err.message);
     if (err.code === 'NO_VIDEO') return fail(res, 415, 'NO_VIDEO', 'That file does not contain a video track.');
     if (err.code === 'INVALID_MEDIA') {
-      return fail(res, 415, 'INVALID_MEDIA', 'That file is not a video this server can read.');
+      return fail(
+        res,
+        415,
+        'INVALID_MEDIA',
+        `That file is not a video this server can read.${err.advice ? ` ${err.advice}` : ''}`,
+      );
     }
     return fail(res, 400, 'UPLOAD_FAILED', err.message);
   }
@@ -3507,6 +3546,31 @@ app.post('/api/jobs/:id/retry', async (req, res) => {
   const paths = jobsStore.jobPaths(job);
   const sourceBytes = await fsp.stat(paths.source).then((stat) => stat.size).catch(() => 0);
   const parts = await segments.finishedParts(job.dir, await segments.read(job.dir));
+
+  /* "Try again" on a file that is not a video is not a retry: the source is on
+     disk, unchanged, and the next attempt will fail at the same byte. Three
+     identical failures in a row is what that looks like from the outside, and
+     it teaches the person nothing. Say what the file is instead — unless the
+     download itself was the problem (a web page, a short file), where fetching
+     it again really is the fix. */
+  if (sourceBytes && job.errorCode === 'INVALID_MEDIA') {
+    const whatis = require('./whatis');
+    const found = await whatis.explainFile(paths.source, { expected: Number(job.downloadTotal) || 0 });
+    const redo = whatis.shouldRedownload(found.shape);
+    if (!redo) {
+      return fail(
+        res,
+        409,
+        'NOT_RETRYABLE',
+        `${job.error || 'That file is not a video this server can read.'} ` +
+          'Trying again would read the same bytes, so the file has to come from somewhere else.',
+      );
+    }
+    /* The bytes on disk are the wrong bytes: start the download over. */
+    await fsp.rm(paths.source, { force: true }).catch(() => {});
+    console.log(`[job ${job.id}] retry: the download was ${found.shape.kind}, fetching it again`);
+  }
+
   if (!sourceBytes && !parts.size && !job.ref) {
     return fail(
       res,

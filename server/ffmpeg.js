@@ -1,6 +1,8 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const ffprobePath = require('@ffprobe-installer/ffprobe').path;
 
@@ -16,12 +18,29 @@ function execFile(bin, args, { maxBuffer = 8 * 1024 * 1024 } = {}) {
     });
     child.stderr.on('data', (c) => {
       stderr += c;
-      if (stderr.length > maxBuffer) child.kill('SIGKILL');
+      /* A damaged file makes ffprobe repeat one complaint for every packet in
+         it — megabytes of the same line. Keeping the tail is what matters
+         ("the last thing it said"), and killing the process for talking too
+         much turned a clear error into "exit null". */
+      if (stderr.length > maxBuffer) stderr = stderr.slice(-maxBuffer / 2);
     });
     child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (code === 0) resolve(stdout);
-      else reject(Object.assign(new Error(stderr.trim() || `exit ${code}`), { code, stderr }));
+      else {
+        reject(
+          Object.assign(new Error(stderr.trim() || `exit ${code}`), {
+            code,
+            signal: signal || null,
+            /* A crash is not a verdict on the file. The bundled ffprobe is a
+               2018 build and segfaults on some damaged MPEG-TS streams; a
+               stream copy of the same file often works, so this must be tried
+               before telling anyone the file is not a video. */
+            crashed: code === null || signal === 'SIGSEGV',
+            stderr,
+          }),
+        );
+      }
     });
   });
 }
@@ -37,9 +56,17 @@ async function probe(file) {
       '-show_streams',
       '-i', file,
     ]);
-  } catch {
+  } catch (err) {
+    /* Carry ffprobe's own complaint: "not a video this server can read" is
+       true of a RAR with .mp4 on the end, a web page, and a truncated MP4
+       alike, and those want three different replies. */
     throw Object.assign(new Error('That file is not a video this server can read.'), {
       code: 'INVALID_MEDIA',
+      detail: err.crashed
+        ? 'ffprobe crashed on it — the bundled build is old, and a stream copy may still read it'
+        : usefulLine(err.stderr) || String(err.message || '').slice(-200) || null,
+      ffprobe: true,
+      crashed: Boolean(err.crashed),
     });
   }
   const info = JSON.parse(raw);
@@ -226,4 +253,125 @@ function transcode(input, output, args, { onProgress, duration = 0, signal } = {
   });
 }
 
-module.exports = { ffmpegPath, ffprobePath, probe, thumbnail, transcode, execFile, usefulLine, makeProgressReader, parseTimecode };
+/**
+ * Give a file ffprobe refused one more chance — by *remuxing* it.
+ *
+ * A container can be broken in ways that a copy fixes and a decode cannot:
+ * an MP4 whose index is at the end and never arrived, a `.ts` recording with
+ * the wrong extension, an MKV with timestamps that jump backwards, a stream
+ * whose first packets are junk. `-c copy` re-writes the container without
+ * touching a single frame, so nothing is lost if it works and nothing is lost
+ * if it does not.
+ *
+ * The repaired file replaces the original only when it probes cleanly, and the
+ * caller is told that it happened: an encode of a repaired file must not look
+ * like an encode of the file that was downloaded.
+ *
+ * @returns {{info: object|null, repaired: boolean, note: string|null, detail: string|null}}
+ */
+async function repair(file, { workDir = path.dirname(file) } = {}) {
+  const whatis = require('./whatis');
+  const shape = await whatis.identify(file);
+  /* Only a video container is worth remuxing. HTML, a RAR, an ISO: the bytes
+     are not a video and no flag changes that. */
+  if (shape.family !== 'video') {
+    return {
+      info: null,
+      repaired: false,
+      note: null,
+      shape,
+      advice: whatis.adviceFor(shape, { bytes: shape.bytes }),
+      detail: shape.label,
+    };
+  }
+
+  const out = path.join(workDir, `repaired-${Date.now()}.mkv`);
+  const attempts = [
+    ['-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'],
+    [],
+  ];
+  for (const flags of attempts) {
+    try {
+      await execFile(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+        ...flags,
+        '-i', file,
+        '-map', '0:v:0',
+        '-map', '0:a:0?',
+        '-c', 'copy',
+        '-f', 'matroska',
+        out,
+      ]);
+      const info = await probe(out);
+      if (info && info.width && info.height) {
+        await fsp.rename(out, file).catch(async () => {
+          await fsp.copyFile(out, file);
+          await fsp.rm(out, { force: true }).catch(() => {});
+        });
+        return {
+          info,
+          repaired: true,
+          shape,
+          note:
+            `The file arrived in a broken container (${shape.label}) — it was remuxed without re-encoding, ` +
+            'so the picture is untouched, and the job carries on.',
+          detail: null,
+        };
+      }
+    } catch (err) {
+      /* Try the forgiving flags, then give up with ffmpeg's own line. */
+      const detail = usefulLine(err.stderr) || err.message;
+      await fsp.rm(out, { force: true }).catch(() => {});
+      shape.ffmpegSaid = detail;
+    }
+  }
+  await fsp.rm(out, { force: true }).catch(() => {});
+  return {
+    info: null,
+    repaired: false,
+    shape,
+    note: null,
+    detail: shape.ffmpegSaid || null,
+    advice: whatis.adviceFor(shape, { bytes: shape.bytes }),
+  };
+}
+
+/**
+ * Probe, and if that fails, say what the file actually is.
+ *
+ * Used everywhere a file enters the pipeline (a download, an upload, a drop),
+ * so a refusal is never just "not a video": it names the container, the size,
+ * and the one thing to do about it.
+ */
+async function probeOrExplain(file, { workDir, expected = 0 } = {}) {
+  try {
+    return { info: await probe(file), shape: null, note: null };
+  } catch (err) {
+    if (err.code !== 'INVALID_MEDIA') throw err;
+    const repaired = await repair(file, { workDir });
+    if (repaired.info) return repaired;
+    const whatis = require('./whatis');
+    const advice =
+      repaired.advice || whatis.adviceFor(repaired.shape || { kind: 'unknown' }, { bytes: 0, expected });
+    throw Object.assign(err, {
+      code: 'INVALID_MEDIA',
+      detail: repaired.detail || err.detail || null,
+      shape: repaired.shape || null,
+      advice,
+    });
+  }
+}
+
+module.exports = {
+  ffmpegPath,
+  ffprobePath,
+  probe,
+  probeOrExplain,
+  repair,
+  thumbnail,
+  transcode,
+  execFile,
+  usefulLine,
+  makeProgressReader,
+  parseTimecode,
+};

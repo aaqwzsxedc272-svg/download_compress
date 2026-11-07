@@ -201,14 +201,20 @@ async function explainFile(file, { expected = 0 } = {}) {
 /**
  * Is fetching the file again the fix?
  *
- * When the bytes on disk are a web page, an empty file or nothing at all, the
- * *download* went wrong and a second attempt can succeed. When they are a RAR,
- * a PDF or a broken container, the host will hand back the same bytes and the
- * retry is a loop — which is what three identical failures in a row looked
- * like from the outside.
+ * When the bytes on disk are a web page, an empty file, nothing at all, or
+ * fewer bytes than the host promised, the *download* went wrong and a second
+ * attempt can succeed. When they are a RAR, a PDF or a complete container that
+ * no copy can fix, the host will hand back the same bytes and the retry is a
+ * loop — which is what three identical failures in a row looked like from the
+ * outside.
  */
-function shouldRedownload(shape) {
-  return Boolean(shape) && ['html', 'empty', 'zeroes', 'missing'].includes(shape.kind);
+function shouldRedownload(shape, { bytes = 0, expected = 0 } = {}) {
+  if (!shape) return false;
+  if (['html', 'empty', 'zeroes', 'missing'].includes(shape.kind)) return true;
+  /* A file that is short of what the host promised is a download that stopped,
+     not a file that is wrong: fetching it again is exactly the fix. */
+  if (expected > 0 && bytes > 0 && bytes < expected * 0.995) return true;
+  return false;
 }
 
 module.exports = { identify, shapeOf, adviceFor, explainFile, shouldRedownload, hexPreview, readHead };

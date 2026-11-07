@@ -3556,7 +3556,10 @@ app.post('/api/jobs/:id/retry', async (req, res) => {
   if (sourceBytes && job.errorCode === 'INVALID_MEDIA') {
     const whatis = require('./whatis');
     const found = await whatis.explainFile(paths.source, { expected: Number(job.downloadTotal) || 0 });
-    const redo = whatis.shouldRedownload(found.shape);
+    const redo = whatis.shouldRedownload(found.shape, {
+      bytes: found.shape.bytes,
+      expected: Number(job.downloadTotal) || 0,
+    });
     if (!redo) {
       return fail(
         res,

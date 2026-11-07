@@ -172,6 +172,13 @@ const html = () => Buffer.from('<!doctype html><html><body>You need access</body
     assert.strictEqual(shouldRedownload(shapeOf(rar())), false);
     assert.strictEqual(shouldRedownload(shapeOf(Buffer.alloc(0))), true);
     assert.strictEqual(shouldRedownload(shapeOf(Buffer.from('7853429abcdef', 'utf8'))), false);
+    /* A file that stopped downloading short of what the host promised: that is
+       the download's fault, and it is the one broken-container case that a
+       retry fixes. */
+    const mp4Shape = shapeOf(Buffer.concat([Buffer.from('\x00\x00\x00\x20ftypisom', 'latin1'), Buffer.alloc(64)]));
+    assert.strictEqual(mp4Shape.kind, 'mp4');
+    assert.strictEqual(shouldRedownload(mp4Shape, { bytes: 900, expected: 1800 }), true);
+    assert.strictEqual(shouldRedownload(mp4Shape, { bytes: 1800, expected: 1800 }), false);
   });
 
   /* ------------------------------------------- the loop, through the real app */

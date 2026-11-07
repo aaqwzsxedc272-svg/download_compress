@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Squeeze — your video</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c8f560'/%3E%3Cpath d='M9 12h14M11 16h10M13 20h6' stroke='%230b0d0e' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="bg-glow" aria-hidden="true"></div>
+
+<header class="site-header">
+  <a class="brand" href="/">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M5 8h14M7 12h10M9 16h6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    </span>
+    <span class="brand-name">Squeeze</span>
+  </a>
+  <div class="header-meta">
+    <a class="pill" href="/">← New video</a>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="detail-grid">
+    <section class="card player-card" id="playerCard">
+      <div id="playerSlot" style="aspect-ratio:16/9;display:grid;place-items:center;border-radius:12px;background:#0b1011;overflow:hidden">
+        <div style="text-align:center;padding:24px">
+          <div class="spinner" style="margin:0 auto 14px"></div>
+          <div id="playerStatus" style="color:var(--muted);font-size:14px">Working on it…</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" style="padding:18px">
+      <div class="detail-head">
+        <div>
+          <div class="detail-title" id="jobName">Video</div>
+          <div id="jobSub" style="color:var(--dim);font-size:13px;margin-top:4px"></div>
+        </div>
+        <div class="job-badge" id="jobBadge"></div>
+      </div>
+
+      <div class="progress" id="jobProgress" style="margin:8px 0 4px;display:none"><div class="progress-bar" id="jobProgressBar"></div></div>
+
+      <div class="stat-row" id="statRow"></div>
+
+      <div class="detail-actions" id="detailActions"></div>
+      <p id="jobNote" style="display:none;margin:14px 0 0;color:var(--muted);font-size:13px"></p>
+    </section>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <span>Squeeze</span><span class="sep">·</span><span>ffmpeg + libx264</span>
+</footer>
+
+<script src="/job.js" defer></script>
+</body>
+</html>

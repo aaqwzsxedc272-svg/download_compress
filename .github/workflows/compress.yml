@@ -1,0 +1,109 @@
+# Compress a video from a link, on GitHub's own machines.
+#
+# No server, no card, no host that can shut down: the runner has full internet and
+# two cores, downloads the video, encodes it with ffmpeg and uploads the result to a
+# free file host.
+#
+# Two ways to start it:
+#   * Issues -> New issue -> "Compress a video"  (the normal way)
+#   * Actions -> compress-video -> Run workflow  (manual, any URL)
+#
+# Free on public repositories (unlimited minutes); private repos draw from the
+# 2,000 free minutes a month.
+name: compress-video
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Video link
+        required: true
+        type: string
+      preset:
+        description: Quality
+        required: false
+        type: choice
+        default: high
+        options: [high, balanced, small, tiny, max]
+      target_mb:
+        description: Fit in N MB (optional)
+        required: false
+        type: string
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  compress:
+    # Only the repo owner can spend the runner minutes, and only issues that carry
+    # the "compress" label are picked up.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+       contains(github.event.issue.labels.*.name, 'compress') &&
+       github.event.issue.user.login == github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      - name: Install yt-dlp (YouTube, TikTok, Instagram, X)
+        run: |
+          python3 -m pip install --user --quiet -U yt-dlp
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Compress
+        id: squeeze
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          INPUT_URL: ${{ inputs.url }}
+          INPUT_PRESET: ${{ inputs.preset }}
+          INPUT_TARGET: ${{ inputs.target_mb }}
+          MAX_CONCURRENT: "1"
+          MAX_UPLOAD_MB: "6000"
+        run: |
+          node scripts/action-compress.js \
+            --url "${INPUT_URL}" \
+            --issue-body "${ISSUE_BODY}" \
+            --preset "${INPUT_PRESET}" \
+            --target-mb "${INPUT_TARGET}" \
+            --out out
+
+      - name: Keep the file for a week
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: squeeze-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Reply on the issue
+        if: always() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -s "$GITHUB_STEP_SUMMARY" ]; then
+            gh issue comment "${{ github.event.issue.number }}" --body-file "$GITHUB_STEP_SUMMARY"
+          else
+            gh issue comment "${{ github.event.issue.number }}" \
+              --body "The job stopped before producing a result. Open the **Actions** tab for the log."
+          fi
+
+      - name: Close the issue
+        if: success() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" --reason completed

@@ -1,0 +1,3887 @@
+'use strict';
+
+/* Before anything reads process.env: a .env file makes the SMTP password a
+   one-time setup instead of something to retype on every run. */
+const envFile = require('./env').load();
+
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { pipeline } = require('node:stream/promises');
+const express = require('express');
+
+const jobsStore = require('./jobs');
+const { probe, probeOrExplain, thumbnail, transcode } = require('./ffmpeg');
+const { downloadWithFallback, RECOVERABLE } = require('./fallback');
+const autoStop = require('./autostop');
+const ledger = require('./ledger');
+const notify = require('./notify');
+const mailsettings = require('./mailsettings');
+const publish = require('./publish');
+const version = require('./version');
+const { chooseCrf } = require('./estimate');
+const {
+  PRESET_LIST,
+  DEFAULT_PRESET,
+  getPreset,
+  buildPlan,
+  segmentArgs,
+  muxArgs,
+  targetTooSmall,
+} = require('./compress');
+const segments = require('./segments');
+const hosters = require('./hosters');
+const sources = require('./sources');
+const { resolve, directUrl, directCandidates, isPlaylistUrl, inspectPlaylist } = require('../shared/resolve');
+const browserhooks = require('./browserhooks');
+const storage = require('./storage');
+const usageFactory = require('./usage');
+
+/* gofile mints its API token in an obfuscated browser script, and Cloudflare
+   pages build their download button in JavaScript, so a headless browser is the
+   only way through either. Optional dependency: without it this is a no-op.
+   Shared with `npm run doctor` so a diagnostic sees the same machine the app
+   does. */
+browserhooks.install();
+
+/**
+ * The capture function used by the download fallback, or null when Chromium is
+ * not installed here.
+ *
+ * It used to return only the media URLs the page played. For a fileditch-style
+ * player that is the player page itself — which serves HTML — so the fallback
+ * now also gets the anchors the rendered page offers, which is where the real
+ * download link lives.
+ */
+function browserCapture() {
+  try {
+    const browser = require('./browser');
+    if (!browser.available()) return null;
+    return (url) => browser.captureMedia(url, { includeAnchors: true });
+  } catch {
+    return null;
+  }
+}
+const { ensureSample } = require('./sample');
+
+const PORT = Number(process.env.PORT) || 3000;
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 6144;
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', true);
+app.use(express.json({ limit: '256kb' }));
+
+/* ------------------------------------------------------------------ helpers */
+
+const relayTokens = new Map(); // token -> expiry
+
+function newRelayToken() {
+  const token = crypto.randomBytes(18).toString('base64url');
+  relayTokens.set(token, Date.now() + 3 * 60 * 60 * 1000);
+  return token;
+}
+
+function validRelayToken(token) {
+  const expiry = relayTokens.get(token);
+  if (!expiry) return false;
+  if (expiry < Date.now()) {
+    relayTokens.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function fail(res, status, code, message) {
+  return res.status(status).json({ error: message, code });
+}
+
+/**
+ * What a browser tab will say for this job's file.
+ *
+ * The download and preview routes carry the file name in the URL, so the tab
+ * title is the last path segment — which is exactly the name shown in the app.
+ * Hosted pages (pixeldrain, bunkr, …) take their title from the same name.
+ */
+function tabTitleFor(job) {
+  if (job.outputName) return job.outputName;
+  try {
+    return outputNameFor(job);
+  } catch {
+    return job.name || 'video.mp4';
+  }
+}
+
+/* Every job view the API and the event stream hand out gets the two things the
+   page shows under a file: the name a browser tab will carry, and the link it
+   can be opened from. */
+jobsStore.setViewHook((job) => ({
+  tabTitle: tabTitleFor(job),
+  downloadPath: `/api/jobs/${job.id}/download/${encodeURIComponent(tabTitleFor(job))}`,
+  previewPath: `/api/jobs/${job.id}/preview/${encodeURIComponent(tabTitleFor(job))}`,
+}));
+
+function outputNameFor(job) {
+  const preset = getPreset(job.presetId);
+  if (job.noCompress) {
+    /* A copy is not re-encoded, so it keeps the source's own name — and its own
+       extension when it could not be repackaged as MP4. */
+    const source = job.name || (job.url ? safeNameFromUrl(job.url) : 'video');
+    const base = source.replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\w\-. ]+/g, '').trim().slice(0, 80) || 'video';
+    return `${base}${job.outputExt || '.mp4'}`;
+  }
+  let base = job.name || (job.url ? safeNameFromUrl(job.url) : 'video');
+  base = base.replace(/\.[a-z0-9]{2,5}$/i, '');
+  base = base
+    .replace(/[^\w\-. ]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[-_. ]+$/, '')
+    .slice(0, 80)
+    .replace(/[-_. ]+$/, '') || 'video';
+  const tag = job.targetMb ? `${Math.round(job.targetMb)}mb` : preset.id;
+  return `${base}-squeeze-${tag}.mp4`;
+}
+
+/** A file name from the host beats a slug from the link, which beats a token. */
+function bestName(current, candidate) {
+  const looksReal = (name) => Boolean(name) && /\.[a-z0-9]{2,5}$/i.test(name) && !/^[a-f0-9]{16,}\b/i.test(name);
+  if (looksReal(candidate) && !looksReal(current)) return candidate;
+  if (!current) return candidate || current;
+  return current;
+}
+
+/** "48 s" rather than "0 min" for a short stream. */
+function durationText(seconds) {
+  const value = Number(seconds) || 0;
+  if (value <= 0) return null;
+  if (value < 60) return `${Math.round(value)} s`;
+  const minutes = Math.round(value / 60);
+  return minutes < 90 ? `${minutes} min` : `${Math.round(minutes / 6) / 10} h`;
+}
+
+function safeNameFromUrl(raw) {
+  try {
+    const u = new URL(raw);
+    const last = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
+    return last || u.hostname;
+  } catch {
+    return 'video';
+  }
+}
+
+function makeController(job) {
+  const controller = new AbortController();
+  job.abort = () => controller.abort();
+  job.abortSignal = controller.signal;
+  return controller;
+}
+
+
+/** Run every pass of a plan, keeping progress/ETA on the job. */
+async function runPasses(job, plan, paths, meta, controller) {
+  const passCount = plan.passes.length;
+  let lastEmit = 0;
+  for (let index = 0; index < passCount; index += 1) {
+    const pass = plan.passes[index];
+    const slice = 1 / passCount;
+    await transcode(paths.source, paths.output, pass.args, {
+      signal: controller.signal,
+      duration: meta.duration,
+      onProgress: ({ seconds, speed }) => {
+        const now = Date.now();
+        if (seconds != null && meta.duration > 0) {
+          const within = Math.min(1, seconds / meta.duration);
+          job.progress = Math.min(1, index * slice + within * slice);
+        }
+        if (speed != null && speed > 0) {
+          job.speed = speed;
+          const remaining = Math.max(0, meta.duration - (seconds || 0));
+          job.etaSeconds = Math.round(remaining / speed);
+        }
+        if (now - lastEmit > 400) {
+          lastEmit = now;
+          jobsStore.updateJob(job, {
+            stage: passCount > 1 ? `${pass.label} (${index + 1}/${passCount})` : 'Compressing',
+          });
+        }
+      },
+    });
+  }
+}
+
+/**
+ * Hand the downloaded bytes back untouched.
+ *
+ * A copy keeps every bit of quality. If the source is an MKV (or anything else
+ * MP4-shaped) it is remuxed instead — a stream copy is seconds of work, loses
+ * nothing, and plays everywhere. The bytes stay identical; only the container
+ * changes. Used by "just download" jobs and by a job that is told to stop
+ * encoding while it runs.
+ */
+async function copyOriginal(job, paths, meta, notes, signal) {
+  const sourceExt = (path.extname(job.name || '') || '.mp4').toLowerCase();
+  if (job.noCompress && sourceExt !== '.mp4') {
+    try {
+      await transcode(paths.source, paths.output, [
+        '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+        '-i', paths.source,
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        paths.output,
+      ], { signal, duration: meta.duration });
+      job.outputExt = '.mp4';
+      notes.push('Repackaged into MP4 without re-encoding — not a single pixel was touched.');
+      return;
+    } catch {
+      /* fall through to a byte-for-byte copy */
+    }
+  }
+  await fsp.copyFile(paths.source, paths.output);
+  job.outputExt = job.noCompress ? sourceExt : '.mp4';
+  if (job.noCompress && sourceExt !== '.mp4') {
+    notes.push(`Kept in its original format (${sourceExt.slice(1)}) because it could not be repackaged losslessly.`);
+  }
+}
+
+/**
+ * Encode a long video in pieces, so a machine that stops only costs the piece
+ * it was in the middle of.
+ *
+ * Everything the pieces need to fit together is pinned in `segments.json` the
+ * first time: the CRF, the output size, the chunk length, the preset. A restart
+ * reads that file back and encodes only what is missing — which is why a resumed
+ * job must not re-decide its own quality settings: a different CRF halfway
+ * through a file is visible.
+ */
+async function runSegmented(job, plan, paths, meta, controller, { robust = false, maxShortSide = null } = {}) {
+  const duration = Number(meta.duration) || 0;
+  const existing = await segments.read(job.dir);
+  const sameSettings =
+    existing &&
+    existing.crf === plan.crf &&
+    existing.chunkSeconds > 0 &&
+    existing.width === plan.size.width &&
+    existing.height === plan.size.height &&
+    existing.robust === Boolean(robust);
+
+  let state;
+  if (sameSettings) {
+    state = existing;
+  } else {
+    /* Different settings (or the first run): old pieces cannot be joined with
+       new ones, so they go. */
+    await segments.clear(job.dir);
+    state = {
+      version: 1,
+      chunkSeconds: segments.chunkSecondsFor(duration),
+      total: 0,
+      done: [],
+      crf: plan.crf,
+      maxShortSide: Number.isFinite(maxShortSide) ? maxShortSide : null,
+      width: plan.size.width,
+      height: plan.size.height,
+      presetId: job.presetId,
+      robust: Boolean(robust),
+      startedAt: Date.now(),
+    };
+  }
+
+  const pieces = segments.plan({ duration, chunkSeconds: state.chunkSeconds });
+  state.total = pieces.length;
+  /* A partial file is never a part, whatever state says: the encoder was killed
+     while writing it. */
+  await segments.clearPartials(job.dir).catch(() => {});
+  const done = await segments.finishedParts(job.dir, state);
+  state.done = [...done].sort((a, b) => a - b);
+  await segments.write(job.dir, state);
+
+  const already = state.done.length;
+  if (already) {
+    job.resumeFrom = Math.round((already / pieces.length) * 100) / 100;
+    console.log(`[job ${job.id}] resuming: ${already}/${pieces.length} parts were already encoded`);
+    jobsStore.updateJob(job, {
+      stage: `Picking up where it stopped — ${already} of ${pieces.length} parts done`,
+    });
+  }
+  await fsp.mkdir(segments.dirFor(job.dir), { recursive: true });
+  jobsStore.updateJob(job, { segmentsDone: already, segmentsTotal: pieces.length });
+
+  for (const piece of pieces) {
+    if (done.has(piece.index)) continue;
+    if (controller.signal.aborted) {
+      throw Object.assign(new Error('Cancelled.'), { code: 'CANCELLED' });
+    }
+    const out = segments.fileFor(job.dir, piece.index);
+    const partial = segments.partialFor(job.dir, piece.index);
+    await fsp.rm(partial, { force: true }).catch(() => {});
+    const args = segmentArgs({
+      input: paths.source,
+      output: partial,
+      meta,
+      size: plan.size,
+      preset: getPreset(job.presetId),
+      crf: plan.crf,
+      robust,
+      start: piece.start,
+      length: piece.length,
+    });
+    /* Where this part has got to. Kept here rather than read from the last
+       progress callback: a callback is allowed to carry only a speed, and
+       treating that as "still at 0:00" is what pinned the bar at 0% for
+       twenty minutes at a time. */
+    let partSeconds = 0;
+    const runPart = () =>
+      transcode(paths.source, partial, args, {
+        signal: controller.signal,
+        duration: piece.length,
+        onProgress: ({ seconds, speed }) => {
+          if (Number.isFinite(seconds)) partSeconds = seconds;
+          const within = Math.min(1, Math.max(0, partSeconds) / piece.length);
+          const position = piece.start + within * piece.length;
+          job.progress = Math.min(0.999, position / duration);
+          if (speed > 0) {
+            job.speed = speed;
+            job.etaSeconds = Math.round((duration - position) / speed);
+          }
+          jobsStore.updateJob(job, {
+            stage: `Encoding part ${piece.index + 1} of ${pieces.length} — resumable`,
+            segmentsDone: piece.index,
+            segmentsTotal: pieces.length,
+          });
+        },
+      });
+
+    /* One bad part should not cost the hours spent on the other twelve. A part
+       is minutes of work; the whole file is hours. This covers both a part that
+       ffmpeg refuses and a part whose file is not there afterwards — the second
+       is what a directory deleted under a running encoder looks like, and
+       encoding it again is cheaper than throwing the job away. */
+    let attempt = 0;
+    for (;;) {
+      partSeconds = 0;
+      try {
+        await runPart();
+        const stat = await fsp.stat(partial).catch((err) => {
+          if (err.code === 'ENOENT') {
+            throw Object.assign(
+              new Error('The encoder reported this part as finished, but its file is not on the disk.'),
+              { code: 'PART_MISSING' },
+            );
+          }
+          throw err;
+        });
+        if (!stat.size) {
+          await fsp.rm(partial, { force: true }).catch(() => {});
+          throw Object.assign(new Error('A part of the encode came out empty.'), { code: 'EMPTY_OUTPUT' });
+        }
+        /* It is a part only now that it is whole. */
+        await fsp.rename(partial, out);
+        break;
+      } catch (err) {
+        if (err.code === 'CANCELLED' || controller.signal.aborted) throw err;
+        if (attempt >= 1) throw err;
+        attempt += 1;
+        await fsp.rm(partial, { force: true }).catch(() => {});
+        console.log(
+          `[job ${job.id}] part ${piece.index + 1} failed once (${err.code || 'ERR'}), retrying it: ` +
+            `${(err.detail || err.message || '').slice(0, 200)}`,
+        );
+        jobsStore.updateJob(job, { stage: `Retrying part ${piece.index + 1} of ${pieces.length}` });
+      }
+    }
+
+    done.add(piece.index);
+    state.done = [...done].sort((a, b) => a - b);
+    await segments.write(job.dir, state);
+    jobsStore.updateJob(job, { segmentsDone: done.size, segmentsTotal: pieces.length });
+  }
+
+  /* All the pieces are on disk: join them and add the audio in one pass. */
+  jobsStore.updateJob(job, { stage: 'Joining the parts', progress: 0.999 });
+  const listPath = await segments.writeConcatFile(job.dir, pieces);
+  const audio = plan.audio || { mode: 'aac', kbps: getPreset(job.presetId).audioKbps };
+  await transcode(paths.source, paths.output, muxArgs({
+    listPath,
+    source: paths.source,
+    output: paths.output,
+    audio,
+    preset: getPreset(job.presetId),
+    robust,
+  }), { signal: controller.signal, duration });
+
+  /* The joined file is checked before the pieces are thrown away: a join that
+     silently lost a part would be worse than no resume at all. */
+  const joined = await probe(paths.output).catch(() => null);
+  if (!joined || !joined.duration || joined.duration < duration * 0.9) {
+    throw Object.assign(
+      new Error(
+        `The joined file is ${joined && joined.duration ? `${Math.round(joined.duration)}s` : 'unreadable'} ` +
+          `instead of ${Math.round(duration)}s.`,
+      ),
+      { code: 'JOIN_FAILED' },
+    );
+  }
+  await segments.cleanup(job.dir);
+}
+
+/** "video: hevc · audio: truehd", for when the encoder refuses a file. */
+function codecSummary(meta) {
+  const parts = [];
+  if (meta.videoCodec) parts.push(`video ${meta.videoCodec}`);
+  if (meta.audioCodec) parts.push(`audio ${meta.audioCodec}`);
+  return parts.join(' · ');
+}
+
+/* ------------------------------------------------------- the actual work */
+
+/** Auto-host finished files when a hoster is configured. */
+const AUTO_HOST = process.env.AUTO_HOST !== '0';
+
+/* Below this predicted saving the encode is skipped and the original is shared:
+   spending half an hour to hand back the same bytes is worse than saying so. */
+const SKIP_ENCODE_BELOW = Number(process.env.SQUEEZE_SKIP_BELOW) || 0.05;
+
+async function compressJob(job) {
+  const paths = jobsStore.jobPaths(job);
+  const preset = getPreset(job.presetId);
+  /* Mutable: "just download it" pressed mid-encode aborts this signal, and the
+     copy that follows needs a clean one. */
+  let controller = makeController(job);
+
+  jobsStore.updateJob(job, { status: 'compressing', stage: 'Reading video info', progress: 0 });
+
+  /* A file that will not probe is not necessarily a bad file: a broken
+     container (index at the end and missing, a .ts with the wrong name, an MKV
+     with jumping timestamps) is repaired by a stream copy, which changes no
+     pixels. Only when even that fails does the app say what the file is —
+     "not a video this server can read" fitted a RAR, a web page and a truncated
+     MP4 equally well, and those want three different answers. */
+  const read = await probeOrExplain(paths.source, {
+    workDir: job.dir,
+    expected: Number(job.downloadTotal) || 0,
+  });
+  const meta = read.info;
+  const stat = await fsp.stat(paths.source);
+  job.sourceBytes = stat.size;
+
+  if (!meta.duration && !meta.bitrate) {
+    throw Object.assign(new Error('Could not read this video — it may be corrupted.'), { code: 'BAD_MEDIA' });
+  }
+
+  jobsStore.updateJob(job, {
+    meta: {
+      duration: Math.round(meta.duration * 10) / 10,
+      width: meta.width,
+      height: meta.height,
+      fps: meta.fps,
+      videoCodec: meta.videoCodec,
+      audioCodec: meta.audioCodec,
+      hasAudio: meta.hasAudio,
+    },
+    stage: 'Compressing',
+  });
+
+  thumbnail(paths.source, paths.thumb, meta.duration).catch(() => {});
+
+  const notes = [];
+  /* A repaired source is worth saying out loud: the encode is of the file that
+     was downloaded, after a container rewrite that touched no frame. */
+  if (read.note) notes.push(read.note);
+  let usedOriginal = false;
+  const note = (pick) => {
+    console.log(
+      `[job ${job.id}] predicted ${formatSize(pick.projectedBytes)} at CRF ${pick.crf}` +
+        `${pick.size ? ` ${pick.size.width}x${pick.size.height}` : ''} ` +
+        `(${pick.saving >= 0 ? '−' : '+'}${Math.abs(Math.round(pick.saving * 100))}% vs the original)`,
+    );
+  };
+  if (job.browserFetched) notes.push('Fetched through a headless browser — the host refuses plain requests.');
+  if (job.fetchedNote) notes.push(job.fetchedNote);
+  if (job.targetMb && targetTooSmall(meta, preset, job.targetMb)) {
+    notes.push(`A ${job.targetMb} MB target is very tight for a clip this long — quality may suffer.`);
+  }
+
+  /* Decide the settings before spending an hour encoding: what CRF, at what
+     resolution, is predicted to be smaller *without looking worse*. */
+  let crfOverride = null;
+  let scaleOverride = null;
+  let skipEncode = false;
+  /* "Just download": some sources are slow to pull from, and the point is a
+     fast copy served from this machine (or a host), not a smaller file. */
+  /* A job that was already encoding has its quality settings pinned on disk.
+     Re-deciding them now would stitch two different encodes together. */
+  const resumeState = job.noCompress || job.targetMb ? null : await segments.read(job.dir);
+
+  if (job.noCompress) {
+    skipEncode = true;
+    notes.push('Saved without re-encoding, exactly as downloaded — this was a “just download” job.');
+  } else if (resumeState && resumeState.crf) {
+    crfOverride = resumeState.crf;
+    /* The scale cap the first run used, not its result: buildPlan() has to
+       arrive at exactly the same frame size to keep the pieces joinable. */
+    scaleOverride = 'maxShortSide' in resumeState ? resumeState.maxShortSide : null;
+    const doneParts = Array.isArray(resumeState.done) ? resumeState.done.length : 0;
+    notes.push(
+      doneParts
+        ? `Picked up after a restart: ${doneParts} of ${resumeState.total} parts were already encoded and are kept.`
+        : 'Picked up after a restart — but the stop came before the first part finished, so this file is encoded again (the download itself is kept).',
+    );
+  } else if (!job.targetMb) {
+    jobsStore.updateJob(job, { stage: 'Checking what is worth encoding' });
+    const pick = await chooseCrf({
+      input: paths.source,
+      meta,
+      preset,
+      sourceBytes: job.sourceBytes,
+      workDir: job.dir,
+    });
+    if (pick.probes) {
+      note(pick);
+      const pickSize = pick.size || null;
+      jobsStore.updateJob(job, {
+        projection: {
+          crf: pick.crf,
+          projectedBytes: pick.projectedBytes,
+          saving: Math.round(pick.saving * 1000) / 1000,
+          width: pickSize ? pickSize.width : null,
+          height: pickSize ? pickSize.height : null,
+        },
+      });
+      if (pick.saving < SKIP_ENCODE_BELOW) {
+        skipEncode = true;
+        notes.push(
+          'This file is already about as small as it can be without losing quality, so the original is what gets shared.',
+        );
+      } else {
+        const pct = Math.round(pick.saving * 100);
+        if (pct < 20) {
+          /* A small saving is not the app being lazy any more: it means the
+             file is already encoded about as tightly as this resolution is
+             worth, and the encoder has spent its whole quality budget. Saying
+             which CRF it used is what makes that checkable. */
+          notes.push(
+            `Already packed tightly for this length: ${pct}% is what comes off inside the quality rules ` +
+              `(CRF ${pick.crf}${pick.size ? `, ${pick.size.width}×${pick.size.height}` : ''}). ` +
+              'Smaller than that would come out of the picture, not out of waste.',
+          );
+        } else if (pick.crf > preset.crf) {
+          notes.push(
+            `The whole quality budget was spent — CRF ${pick.crf}, still inside what this app allows — which is ` +
+              `${pct}% off.`,
+          );
+        }
+        if (pickSize && meta.width && pickSize.width < meta.width) {
+          notes.push(
+            `${meta.width}×${meta.height} → ${pickSize.width}×${pickSize.height}: shrinking the frame keeps the picture sharp where a flatter 1080p encode would have looked soft.`,
+          );
+        }
+      }
+      if (pick.crf !== preset.crf) crfOverride = pick.crf;
+      if (pick.maxShortSide && pick.maxShortSide !== preset.maxShortSide) {
+        scaleOverride = pick.maxShortSide;
+      }
+    }
+  }
+
+  if (controller.signal.aborted) {
+    /* Aborted between the probe and the encode is not a cancellation: it is the
+       user asking for the original. The copy takes seconds. */
+    if (!job.skipRequested) throw Object.assign(new Error('Cancelled.'), { code: 'CANCELLED' });
+    skipEncode = true;
+    job.noCompress = true;
+    notes.push('The encode was stopped on request, so the file is handed back exactly as downloaded.');
+    controller = makeController(job);
+  }
+
+  let outStat = null;
+  let videoKbps = null;
+  let audioMode = null;
+  let twoPass = false;
+  let scaleNote = null;
+  let outSize = { width: meta.width, height: meta.height };
+
+  if (skipEncode) {
+    jobsStore.updateJob(job, { stage: job.noCompress ? 'Saving the original' : 'Keeping the original', progress: 1 });
+    await copyOriginal(job, paths, meta, notes, controller.signal);
+    outStat = await fsp.stat(paths.output);
+    usedOriginal = true;
+  } else {
+    /* First attempt uses the normal plan. If ffmpeg trips over the container
+       (an MKV with broken timestamps, a 10-bit or 4:2:2 stream, more packets
+       buffered than the muxer will take) it is retried once with the forgiving
+       flags before the job is allowed to fail — that is the difference between
+       "ffmpeg could not process this file" and a working video. */
+    let attempt = 0;
+    let plan = null;
+    for (;;) {
+      plan = buildPlan({
+        input: paths.source,
+        output: paths.output,
+        meta,
+        preset,
+        targetMb: job.targetMb,
+        passlogBase: path.join(job.dir, 'x264pass'),
+        crfOverride,
+        maxShortSide: scaleOverride,
+        robust: attempt > 0,
+      });
+
+      videoKbps = plan.videoKbps;
+      audioMode = plan.audio.mode;
+      twoPass = plan.twoPass;
+      scaleNote = plan.scaleNote;
+      outSize = { width: plan.size.width, height: plan.size.height };
+
+      /* Long single-pass encodes are cut into parts so a stopped machine can
+         carry on from the last finished part instead of from zero. Two-pass
+         (a size target) and short clips stay in one piece. */
+      const resumable =
+        !plan.twoPass &&
+        meta.duration >= segments.MIN_DURATION_SECONDS &&
+        process.env.SEGMENTED !== '0';
+
+      try {
+        if (resumable) {
+          await runSegmented(job, plan, paths, meta, controller, {
+            robust: attempt > 0,
+            maxShortSide: scaleOverride,
+          });
+        } else {
+          await runPasses(job, plan, paths, meta, controller);
+        }
+        break;
+      } catch (err) {
+        /* Stopped on purpose, from the job card: what the user wants is the
+           file that was already downloaded, not a failed encode. */
+        if (job.skipRequested && controller.signal.aborted) {
+          jobsStore.updateJob(job, { stage: 'Keeping the original', progress: 1 });
+          await fsp.rm(paths.output, { force: true }).catch(() => {});
+          await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+          await segments.clear(job.dir).catch(() => {});
+          job.noCompress = true;
+          usedOriginal = true;
+          notes.push('The encode was stopped on request, so the file is handed back exactly as downloaded.');
+          await copyOriginal(job, paths, meta, notes, makeController(job).signal);
+          outStat = await fsp.stat(paths.output);
+          break;
+        }
+        const recoverable = err.code === 'FFMPEG_FAILED' && attempt === 0 && !controller.signal.aborted;
+        if (!recoverable) {
+          if (err.code === 'FFMPEG_FAILED') err.codecNote = codecSummary(meta);
+          throw err;
+        }
+        attempt += 1;
+        await fsp.rm(paths.output, { force: true }).catch(() => {});
+        await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+        /* Different encoder settings: the parts on disk no longer fit. */
+        await segments.clear(job.dir).catch(() => {});
+        notes.push('The first try tripped over something in this file (its container or bit depth), so it was retried in a more forgiving mode.');
+        console.log(`[job ${job.id}] ffmpeg retry: ${err.detail || err.message?.slice(0, 200)}`);
+        jobsStore.updateJob(job, { stage: 'Retrying with more forgiving encoder settings' });
+      }
+    }
+
+    await fsp.rm(`${path.join(job.dir, 'x264pass')}.log`, { force: true }).catch(() => {});
+    await fsp.rm(`${path.join(job.dir, 'x264pass')}.log.mbtree`, { force: true }).catch(() => {});
+
+    if (!outStat) {
+      outStat = await fsp.stat(paths.output);
+      if (!outStat.size) throw Object.assign(new Error('Compression produced an empty file.'), { code: 'EMPTY_OUTPUT' });
+
+      // Never hand back a file that is bigger AND no better: if the re-encode
+      // did not pay off, deliver the original bytes instead.
+      if (!job.targetMb && outStat.size >= job.sourceBytes) {
+        await fsp.copyFile(paths.source, paths.output);
+        outStat = await fsp.stat(paths.output);
+        usedOriginal = true;
+        notes.push('Re-encoding would have made this bigger, so the original file is what gets shared.');
+      }
+    }
+  }
+
+  /* The source is only needed while encoding. Deleting it now roughly halves
+     what a job occupies on disk, which matters on a 32 GB machine handling
+     multi-gigabyte 4K files. The exception is a job whose original was asked
+     for: it stays until the normal deadline, because "download the original"
+     and "keep the original" are the same promise. */
+  if (!job.wantOriginal) await fsp.rm(paths.source, { force: true }).catch(() => {});
+
+  const saved = job.sourceBytes ? Math.max(0, 1 - outStat.size / job.sourceBytes) : 0;
+  if (job.noCompress) usedOriginal = false;
+  if (!job.noCompress && !usedOriginal && saved < 0.05 && !job.targetMb) {
+    notes.push('This one was already small — the compressed copy is about the same size.');
+  }
+
+  jobsStore.updateJob(job, {
+    status: 'done',
+    stage: 'Ready',
+    progress: 1,
+    speed: null,
+    etaSeconds: 0,
+    outputBytes: outStat.size,
+    outputName: outputNameFor(job),
+    note: notes.join(' ') || null,
+    videoKbps,
+    usedOriginal,
+    audioMode,
+    twoPass,
+    scaledTo: scaleNote,
+    outputSize: outSize,
+    projection: job.projection || null,
+    saved,
+  });
+  writeResultsFile();
+
+  // The point of the app is the link, not the local file: hand it to a host now.
+  if (AUTO_HOST) {
+    const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+    if (free > outStat.size * 3) trackHosting(hostJob(job, { order: job.hostOrder }));
+  }
+}
+
+/** Upload a finished job's file to a free host and record the share link. */
+async function hostJob(job, { order } = {}) {
+  if (job.status !== 'done') {
+    throw Object.assign(new Error('That file is not ready yet.'), { code: 'NOT_READY' });
+  }
+  if (job.hosting) return job;
+
+  const paths = jobsStore.jobPaths(job);
+  if (!fs.existsSync(paths.output)) {
+    throw Object.assign(new Error('The local copy of this file is gone, so it cannot be re-hosted.'), {
+      code: 'NO_FILE',
+    });
+  }
+
+  job.hosting = true;
+  jobsStore.updateJob(job, { status: 'hosting', stage: 'Uploading to a file host', hostError: null, progress: 0 });
+
+  try {
+    const result = await hosters.uploadToHoster(
+      paths.output,
+      { name: job.outputName || 'video.mp4' },
+      {
+        order,
+        signal: job.abortSignal,
+        onProgress: ({ sent, total, provider }) => {
+          job.progress = total ? sent / total : 0;
+          job.stage = `Uploading to ${hosters.PROVIDERS[provider]?.label || provider} · ${Math.round(job.progress * 100)}%`;
+          jobsStore.updateJob(job, {});
+        },
+      },
+    );
+
+    jobsStore.updateJob(job, {
+      status: 'hosted',
+      stage: 'Link ready',
+      progress: 1,
+      hostedUrl: result.url,
+      hostProvider: result.provider,
+      hostedBy: 'server',
+      hostError: null,
+      hostedAt: Date.now(),
+    });
+    writeResultsFile();
+    queueEarlyPost(job);
+    persistHostedLink(job, result.url, result.provider);
+
+    /* Space is the scarcest thing on these machines. Once the file is on a host
+       and the link is in the ledger, the local copy has done its job. */
+    if (DELETE_AFTER_UPLOAD) {
+      /* A user who asked for the original keeps it for the usual two hours. */
+      const freed = await dropLocalCopy(job, { keepSource: Boolean(job.wantOriginal) });
+      if (freed) {
+        jobsStore.updateJob(job, {
+          localDeleted: true,
+          note: [job.note, `The local copy was deleted after upload to keep ${formatSize(freed)} free.`]
+            .filter(Boolean)
+            .join(' '),
+        });
+        console.log(`[job ${job.id}] uploaded, freed ${formatSize(freed)} locally`);
+      }
+    }
+    return job;
+  } catch (err) {
+    jobsStore.updateJob(job, {
+      status: 'done',
+      progress: 1,
+      stage: 'Ready (no share link yet)',
+      hostError: err.message,
+    });
+    throw err;
+  } finally {
+    job.hosting = false;
+  }
+}
+
+/**
+ * Delete a finished job's files from disk (its share link stays in the ledger).
+ * Returns the bytes freed.
+ */
+async function dropLocalCopy(job, { keepSource = false } = {}) {
+  const paths = jobsStore.jobPaths(job);
+  let freed = 0;
+  for (const file of [paths.output, paths.thumb, ...(keepSource ? [] : [paths.source])]) {
+    const size = await fsp.stat(file).then((stat) => stat.size).catch(() => 0);
+    if (!size) continue;
+    const removed = await fsp.rm(file, { force: true }).then(() => size).catch(() => 0);
+    freed += removed;
+  }
+  return freed;
+}
+
+/**
+ * Make room by deleting files that are already on a host, oldest first.
+ * Called before a job starts, so a full disk costs a re-download at worst —
+ * never the share links, which are already recorded.
+ */
+async function reclaimSpace(neededBytes) {
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  if (!neededBytes || free >= neededBytes) return { free, reclaimed: 0, jobs: 0 };
+
+  let reclaimed = 0;
+  let count = 0;
+  const candidates = jobsStore
+    .listJobs()
+    /* Pinned files are not the sweeper's to delete, even under pressure: the
+       job fails with NO_DISK and says what to remove, which is a choice only
+       the person who pinned it can make. */
+    .filter((job) => job.hostedUrl && !job.hosting && !job.pinLocal)
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+
+  for (const job of candidates) {
+    if (free + reclaimed >= neededBytes) break;
+    const freed = await dropLocalCopy(job);
+    if (!freed) continue;
+    reclaimed += freed;
+    count += 1;
+    jobsStore.updateJob(job, { localDeleted: true });
+    console.log(`[space] freed ${formatSize(freed)} from ${job.id} (already hosted)`);
+  }
+  const after = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  return { free: after, reclaimed, jobs: count };
+}
+
+/** Keep an append-only ledger of share links, independent of job cleanup. */
+async function persistHostedLink(job, url, provider) {
+  await ledger.record({
+    jobId: job.id,
+    url,
+    provider,
+    name: job.outputName,
+    sourceBytes: job.sourceBytes,
+    outputBytes: job.outputBytes,
+    at: Date.now(),
+  });
+  // Older releases wrote links.json; keep writing it so no history is lost.
+  const file = path.join(jobsStore.DATA_DIR, 'links.json');
+  const line = JSON.stringify({
+    jobId: job.id,
+    url,
+    provider,
+    name: job.outputName,
+    sourceBytes: job.sourceBytes,
+    outputBytes: job.outputBytes,
+    createdAt: job.createdAt,
+    at: Date.now(),
+  });
+  await fsp.appendFile(file, `${line}\n`).catch(() => {});
+}
+
+/* --------------------------------------------------------------- emailing */
+
+/** Links newer than this have not been mailed yet. Boot time, so a restart does
+    not re-send yesterday's links. */
+let lastEmailedAt = Date.now();
+let emailInFlight = null;
+
+/**
+ * Mail every share link that appeared since the last mail.
+ * `force` sends the whole ledger (the "Email me the links" button).
+ */
+async function emailLinks({ to, force = false, reason } = {}) {
+  if (!notify.configured()) {
+    return {
+      sent: false,
+      needsConfig: true,
+      to: to || notify.defaultTo(),
+      mailto: notify.mailtoUrl(await allLinks(), { to: to || notify.defaultTo() }),
+      reason: 'Email is not set up on this machine.',
+    };
+  }
+  if (emailInFlight) return emailInFlight;
+
+  emailInFlight = (async () => {
+    const links = await allLinks();
+    const fresh = force ? links : links.filter((link) => Date.parse(link.at || 0) >= lastEmailedAt);
+    if (!fresh.length) return { sent: false, skipped: true, count: 0, to: to || notify.defaultTo() };
+    try {
+      await notify.sendLinks(fresh, { to: to || notify.defaultTo(), reason });
+      lastEmailedAt = Date.now();
+      console.log(`[email] ${fresh.length} link(s) sent to ${to || notify.defaultTo()}`);
+      return { sent: true, count: fresh.length, to: to || notify.defaultTo() };
+    } catch (err) {
+      console.error(`[email] failed: ${err.message}`);
+      return { sent: false, error: err.message, to: to || notify.defaultTo() };
+    }
+  })().finally(() => {
+    emailInFlight = null;
+  });
+  return emailInFlight;
+}
+
+/**
+ * Get the links somewhere they can be read later, with whatever this machine
+ * already has: a gist, a webhook, a phone notification, or just the console.
+ * Always prints the banner first — that costs nothing and works everywhere.
+ */
+async function publishLinks({ reason, quiet = false } = {}) {
+  const links = await allLinks();
+  if (!links.length) return { ok: false, reason: 'nothing-to-publish' };
+  publish.banner(links, { reason });
+  return publish.publish(links, { reason, quiet });
+}
+
+/* A share link that exists is worth reporting before the queue is finished: if
+   the machine runs out of minutes and never drains, the links for the files it
+   already treated must not go down with it. Batched, so a seven-file queue does
+   not become seven Discord messages — and PUBLISH_EVERY_SECONDS=0 turns it off
+   (the drain post still sends everything). */
+const EARLY_PUBLISH_MS = Math.max(0, Number(process.env.PUBLISH_EVERY_SECONDS ?? 60)) * 1000;
+const earlyPosts = new Map();
+let earlyTimer = null;
+
+function linkEntryFor(job) {
+  return {
+    url: job.hostedUrl,
+    name: job.outputName || job.name || null,
+    provider: job.hostProvider || null,
+    sourceBytes: job.sourceBytes || 0,
+    outputBytes: job.outputBytes || 0,
+    usedOriginal: Boolean(job.usedOriginal),
+  };
+}
+
+function queueEarlyPost(job) {
+  if (!AUTO_PUBLISH || !EARLY_PUBLISH_MS || !job || !job.hostedUrl) return;
+  earlyPosts.set(job.hostedUrl, linkEntryFor(job));
+  if (earlyTimer) return;
+  earlyTimer = setTimeout(() => {
+    earlyTimer = null;
+    const batch = [...earlyPosts.values()];
+    earlyPosts.clear();
+    if (!batch.length) return;
+    publish
+      .publish(batch, { reason: 'A file finished — here is its link. The rest follow as they finish.' })
+      .then((result) => {
+        if (result && result.ok) console.log(`[publish] ${batch.length} finished link(s) posted early`);
+        else if (result && result.reason !== 'nothing-to-publish') {
+          console.warn(`[publish] early post failed: ${result.reason || 'no sink'}`);
+        }
+      })
+      .catch(() => {});
+  }, EARLY_PUBLISH_MS);
+  if (earlyTimer.unref) earlyTimer.unref();
+}
+
+/**
+ * Uploads are started, not awaited, by the encoder: the job is "done" the
+ * moment the file is compressed, and the upload runs behind it. The queue is
+ * therefore not really finished until those uploads are — otherwise the links
+ * would be mailed and posted before they exist, and the one run where nobody is
+ * watching would be the run that loses them.
+ */
+const hostingInFlight = new Set();
+function trackHosting(promise) {
+  const tracked = Promise.resolve(promise).catch(() => {});
+  hostingInFlight.add(tracked);
+  tracked.finally(() => hostingInFlight.delete(tracked));
+  return tracked;
+}
+async function waitForHosting() {
+  if (!hostingInFlight.size) return;
+  const cap = (Number(process.env.HOSTING_WAIT_SECONDS) || 900) * 1000;
+  const all = Promise.all([...hostingInFlight].map((promise) => promise.catch(() => {})));
+  await Promise.race([all, new Promise((resolve) => setTimeout(resolve, cap))]);
+}
+
+/* The queue draining is the moment the links are all final — and the moment
+   auto-stop would take the page away — so that is when they leave the machine. */
+const AUTO_EMAIL = process.env.AUTO_EMAIL !== '0';
+/* AUTO_PUBLISH=0 turns the gist/webhook/ntfy/paste step off; the console banner
+   and data/links.tsv are not affected. */
+const AUTO_PUBLISH = process.env.AUTO_PUBLISH !== '0';
+/* Delete the encoded file once the host has it. The link is what was asked for;
+   the bytes are still on the host. KEEP_LOCAL_AFTER_UPLOAD=1 to keep them. */
+const DELETE_AFTER_UPLOAD = process.env.KEEP_LOCAL_AFTER_UPLOAD !== '1';
+autoStop.setBeforeStop(async () => {
+  const reason = 'This machine has finished and is about to switch itself off.';
+  /* A upload may still be running; a link that has not been minted cannot be
+     mailed, so give it its time (the stop has its own timeout). */
+  await waitForHosting();
+  if (AUTO_PUBLISH) await publishLinks({ reason }).catch(() => {});
+  if (AUTO_EMAIL) await emailLinks({ reason });
+});
+
+const FRIENDLY = {
+  CANCELLED: 'Cancelled.',
+  /* Streams (.m3u8 / .mpd). Each of these is a different thing to do next, so
+     each gets its own sentence rather than "something went wrong". */
+  STREAM_LIVE:
+    'That link is a live stream with no end, so there is no finished video to save. A recording of the same page downloads normally.',
+  STREAM_DRM: 'That stream is DRM-protected, so its video cannot be saved as a file.',
+  STREAM_FORBIDDEN:
+    'The video server refused the request. It wants the page the video is on as its referer — open that page and paste its link instead of the stream link.',
+  STREAM_NOT_A_PLAYLIST:
+    'That link answered with a web page instead of a playlist: the real stream link is generated by the page, so paste the page itself.',
+  STREAM_EMPTY: 'The stream produced no video — the host may require the page as referer, or the link may have expired.',
+  STREAM_NO_VARIANTS: 'That playlist lists no qualities, so there is nothing in it to download.',
+  STREAM_TIMEOUT:
+    'The stream was still running after the time limit and was stopped. A live stream never ends; a very long one needs STREAM_TIMEOUT_MINUTES raised.',
+  PART_MISSING:
+    'The encoder finished a part of this file but the file was gone — something else cleared the disk while it ran. ' +
+    'The parts that survived are kept, so “Try again” carries on from there.',
+  JOIN_FAILED: 'The parts of this file could not be joined into one video. The parts are kept, so “Try again” re-joins them.',
+  NO_VIDEO: 'That file has no video track.',
+  INVALID_MEDIA: 'That file is not a video this server can read.',
+  BAD_MEDIA: 'That video looks corrupted or uses a format that cannot be read.',
+  FFMPEG_FAILED: 'ffmpeg could not process this file. It may be corrupted or use an unusual codec.',
+  TOO_BIG: 'That file is larger than this server accepts.',
+  UNREACHABLE: 'This server could not reach that link.',
+  BAD_STATUS: 'The link did not return a video.',
+  CLOUDFLARE:
+    'That host answers with a Cloudflare browser check, which a plain request cannot pass. ' +
+    'Install the browser helper once in this project — `npm run browser:install` — and the page is opened ' +
+    'like a visitor would open it. Meanwhile “Save file” downloads it in your own browser and the drop zone takes it.',
+  FILEDITCH_FAILED: 'That fileditch link has expired or the page is gone. Paste the page itself (theditch.st/… or fileditchfiles.me/…) and a fresh link is minted for you.',
+  FILEDITCH_NO_LINK: 'fileditch did not offer a download for that page — it may have been removed.',
+  FILESTER_BLOCKED: 'filester refused the request (its bot protection). Paste the share page again, or pick another host.',
+  HTML_PAGE: 'That link is a web page, not a video file.',
+  PLAYLIST: 'That is a streaming playlist (.m3u8 / .mpd), not a video file. Paste a direct MP4 or WebM link instead.',
+  DOWNLOAD_FAILED: 'The download stopped before it finished.',
+  TIMEOUT: 'The download timed out.',
+  NO_YTDLP: 'Platform downloads are not enabled on this server.',
+  BLOCKED_HOST: 'That address is not allowed.',
+  NO_VIDEO_FOUND: 'No video was found behind that link.',
+  GOFILE_PREMIUM: 'gofile only releases that folder to a premium account.',
+  PASSWORD: 'That link is password protected.',
+  NOT_FOUND: 'That link no longer exists.',
+  NO_VIDEO_ON_PAGE: 'That page streams its video, so there is no single file to download.',
+  YTDLP_FAILED: 'The platform refused the download. It may need a login, or the link is unsupported.',
+};
+
+const OUT_OF_SPACE = /ENOSPC|No space left on device/i;
+
+const formatGb = (bytes) => `${(bytes / 1073741824).toFixed(1)} GB`;
+const formatSize = (bytes) =>
+  bytes >= 1073741824 ? `${(bytes / 1073741824).toFixed(2)} GB` : `${(bytes / 1048576).toFixed(1)} MB`;
+
+/** Total/used/free for the volume that holds the working files. */
+async function diskUsage(dir) {
+  try {
+    const stats = await fsp.statfs(dir);
+    const totalBytes = stats.blocks * stats.bsize;
+    const freeBytes = stats.bavail * stats.bsize;
+    return {
+      totalBytes,
+      freeBytes,
+      usedBytes: totalBytes - freeBytes,
+      percentFree: totalBytes ? Math.round((freeBytes / totalBytes) * 100) : null,
+    };
+  } catch {
+    return { totalBytes: null, freeBytes: null, usedBytes: null, percentFree: null };
+  }
+}
+
+/* A filesystem error is a bug report, not a sentence: "ENOENT: no such file or
+   directory, stat '/home/…/part-0011.mp4'" tells the person nothing they can
+   act on. These are the ones a job can actually hit. */
+function describeSystemError(err) {
+  const message = String((err && err.message) || '');
+  if (err.code === 'ENOENT' || /^ENOENT/.test(message)) {
+    return 'A file this job needed disappeared from the disk while it was being worked on. The parts that are left are kept — “Try again” carries on from there.';
+  }
+  if (err.code === 'EACCES' || /^EACCES/.test(message)) {
+    return 'This server could not write to its own data directory (permissions). Fix the permissions on data/ and try again.';
+  }
+  if (err.code === 'ENOSPC' || /no space left on device/i.test(message)) return null; // handled as NO_DISK
+  return null;
+}
+
+function reportJobError(job, err) {
+  const outOfSpace = err.code === 'NO_DISK' || OUT_OF_SPACE.test(String(err.message || ''));
+  /* When the encoder refuses a file, the reason matters more than the apology:
+     "ffmpeg could not process this file" hides whether it was the container, the
+     bit depth or a codec this build cannot decode. */
+  const ffmpegDetail = err.code === 'FFMPEG_FAILED' ? (err.detail || '').trim() : '';
+  const systemNote = describeSystemError(err);
+  const message = outOfSpace
+    ? 'This machine ran out of disk space. Delete finished videos (the Remove button) and try again — a long 4K file needs about three times its own size free.'
+    : systemNote
+      ? systemNote
+      : job.isStream && err.code === 'FFMPEG_FAILED'
+        ? `The stream stopped partway through (${err.detail || 'ffmpeg could not read it to the end'}). ` +
+          'Nothing was saved, so the link starts again from the beginning.'
+      : job.isStream && /^STREAM_/.test(String(err.code || ''))
+        ? err.browserNote
+          ? /* The browser tried too, and was refused: this is no longer a
+               headers problem, and no longer advice this app can follow. */
+            'The video server refused the stream, and refused a real browser making the request too ' +
+            `(${String(err.browserNote).replace(/\.$/, '')}). ` +
+            'That gate is tied to your own connection — the page plays there, and nothing on this machine can ' +
+            'pretend to be you.'
+          : `The video server refused the stream${
+              job.ref && job.ref.accessRefreshedAt ? ', even after the page was opened in a browser' : ''
+            }. ` +
+            (job.ref && job.ref.accessRefreshedAt
+              ? 'That CDN wants a cookie earned on your own connection: open the page in your browser, copy the ' +
+                '.m3u8 address the player requests, and paste that link instead.'
+              : 'That link is served only to the page it belongs to. Paste the page the video plays on instead.')
+      : err.code === 'INVALID_MEDIA' && err.advice
+        ? `That file is not a video this server can read. ${err.advice}`
+      : err.code === 'FFMPEG_FAILED'
+      ? `ffmpeg could not process this file${err.codecNote ? ` (${err.codecNote})` : ''}.` +
+        `${ffmpegDetail ? ` It said: ${ffmpegDetail}` : ''} Try another preset, or a different source file.`
+      : err.playerNote || FRIENDLY[err.code] || err.message || 'Something went wrong while compressing.';
+  jobsStore.updateJob(job, {
+    status: 'error',
+    stage: outOfSpace ? 'Out of disk space' : 'Failed',
+    error: message,
+    /* Kept so "Try again" can tell a failure worth repeating from one that will
+       fail at the same byte: a file that is not a video is not a bad download. */
+    errorCode: outOfSpace ? 'NO_DISK' : err.code || 'ERR',
+    speed: null,
+  });
+  console.error(`[job ${job.id}] ${outOfSpace ? 'NO_DISK' : err.code || 'ERR'}:`, err.message?.slice(0, 600));
+
+  /* A failure near the end of a long encode is the worst time to throw the
+     work away, and that is exactly what this used to do: the source, the output
+     and every finished part were deleted, so "try again" started from zero.
+     What is kept now: the source (whole or partial — it resumes), and the
+     encoded parts (a retry re-encodes only what is missing). What goes: a
+     half-written output, which is not a video. The storage panel and the
+     sweeper own the disk from here, and a failed job is kept for
+     KEEP_UNFINISHED_HOURS rather than thrown away on the spot. */
+  const paths = jobsStore.jobPaths(job);
+  fsp.rm(paths.output, { force: true }).catch(() => {});
+  const keptSource = fs.existsSync(paths.source);
+  const keptPartials = fs.existsSync(path.join(job.dir, 'segments'));
+  if (keptSource || keptPartials) {
+    jobsStore.updateJob(job, { retained: true });
+  }
+}
+
+/**
+ * Ask a real browser to earn a host's clearance cookie.
+ *
+ * A CDN behind the same bot check as its page refuses ffmpeg exactly the way it
+ * refuses `fetch` — with a 403 that no header guessing fixes. The browser solves
+ * the challenge once, and the cookie it earns (plus the user agent it earned it
+ * with, and the referer the page itself used for the playlist) is enough for
+ * ffmpeg to read the stream.
+ */
+async function browserClearance(pageUrl) {
+  try {
+    const browser = require('./browser');
+    if (!browser.available()) return null;
+    const captured = await browser.captureMedia(pageUrl, { timeoutMs: 45000 });
+    if (!captured) return null;
+
+    /* What the page's own player asked for, in the order that decides which one
+       is the film: the same ranking the resolver uses, so an advert or a
+       preview beside it cannot win here either. */
+    const urls = [
+      ...new Set((captured.media || []).map((item) => item && item.url).filter((u) => u && isPlaylistUrl(u))),
+    ];
+    let playlist = urls[0] || null;
+    if (urls.length > 1) {
+      const { rankStreams } = require('../shared/resolve');
+      const ranked = await rankStreams(urls, pageUrl).catch(() => []);
+      if (ranked.length) playlist = ranked[0].url;
+    }
+
+    const entry = (captured.media || []).find((item) => item && item.url === playlist) || null;
+    if (!captured.cookie && !playlist) return null;
+    return {
+      cookie: captured.cookie || null,
+      userAgent: captured.userAgent || null,
+      /* A browser sends the page's origin for a cross-site subresource; the
+         capture recorded whatever this CDN actually accepted. */
+      referer: (entry && entry.referer) || pageUrl,
+      playlist,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** The page this stream belongs to, as far as the job knows. */
+function streamPageUrl(job, ref) {
+  const known = (job && job.url) || (ref && (ref.page || ref.referer)) || null;
+  if (known) return known;
+  /* A stream pasted on its own has no page — but some CDNs are known to belong
+     to one, and opening that page is what earns the session they want. */
+  try {
+    return require('../shared/resolve').knownParentReferer(ref && ref.url) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The last resort, and the one that works when a CDN will only talk to a real
+ * browser: fetch the pieces *inside* Chromium, remux them locally.
+ *
+ * See `browser.streamDownload` for why headers cannot fix this. Returns null
+ * when there is no browser to try, so the caller can keep its own error.
+ */
+async function downloadStreamThroughBrowser(job, ref, candidate, paths, { signal } = {}) {
+  let browser = null;
+  try {
+    browser = require('./browser');
+  } catch {
+    return null;
+  }
+  if (!browser.available()) return null;
+
+  const pageUrl = streamPageUrl(job, ref) || null;
+  const dir = path.join(path.dirname(paths.source), 'stream-parts');
+
+  /* The pieces and the remuxed file exist at the same time, so this needs about
+     twice the film while it runs. A film that cannot fit must say so in two
+     seconds, not forty minutes. */
+  const estimate = Number((ref && (ref.estimatedBytes || ref.size)) || 0);
+  if (estimate > 0) {
+    const free = await sources.freeDiskBytes(jobsStore.DATA_DIR).catch(() => 0);
+    if (free > 0 && free < estimate * 2.05) {
+      throw Object.assign(
+        new Error(
+          `Not enough disk space for this stream: about ${formatGb(estimate)} to fetch and the same again to ` +
+            `assemble, but ${formatGb(free)} is free. Finished videos whose link is ready can be removed.`,
+        ),
+        { code: 'NO_DISK' },
+      );
+    }
+  }
+
+  jobsStore.updateJob(job, {
+    streamViaBrowser: true,
+    stage: 'Fetching the stream through a real browser — this CDN refuses anything else',
+    progress: 0,
+  });
+  await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+
+  try {
+    const fetched = await browser.streamDownload(pageUrl, (ref && ref.url) || candidate, {
+      destDir: dir,
+      duration: Number(ref && ref.duration) || 0,
+      signal,
+      onProgress: ({ seconds, bytes }) => {
+        const total = Number(ref && ref.duration) || 0;
+        job.progress = total > 0 ? Math.min(0.95, (Number(seconds) || 0) / total) : 0;
+        job.sourceBytes = bytes || job.sourceBytes;
+        const mb = Math.round((bytes || 0) / 1048576);
+        job.stage = total > 0
+          ? `Fetching the stream through a browser · ${Math.min(99, Math.round((seconds / total) * 100))}%`
+          : `Fetching the stream through a browser (${mb} MB)`;
+        if (Date.now() - (job._lastEmit || 0) > 600) {
+          job._lastEmit = Date.now();
+          jobsStore.updateJob(job, {});
+        }
+      },
+    });
+
+    jobsStore.updateJob(job, { stage: 'Assembling the video', progress: 0.96 });
+    const out = await sources.remuxLocalPlaylist(fetched.playlistPath, paths.source, {
+      signal,
+      duration: fetched.duration || Number(ref && ref.duration) || 0,
+      onProgress: (value) => {
+        job.progress = 0.96 + Math.min(0.03, value * 0.03);
+        jobsStore.updateJob(job, {});
+      },
+    });
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    return { total: out.bytes, bytes: out.bytes, seconds: out.seconds, viaBrowser: true, segments: fetched.segments };
+  } catch (err) {
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    console.error(`[job ${job.id}] browser stream failed: ${err.code || 'ERR'} ${err.message}`);
+    /* Stopping the job is not a failure to explain: it was asked for. */
+    if (err.code === 'CANCELLED' || (signal && signal.aborted)) throw err;
+    /* A full disk is a fact about this machine, not a verdict on the link. */
+    if (err.code === 'ENOSPC' || /no space left on device/i.test(String(err.message || ''))) {
+      throw Object.assign(
+        new Error(`The disk filled up while fetching the stream. ${err.message}`),
+        { code: 'NO_DISK' },
+      );
+    }
+    return { failed: true, error: err };
+  }
+}
+
+/**
+ * The stream refused a request that the resolver had already succeeded at.
+ *
+ * That happens for one of two reasons, and both are cured the same way: the
+ * session cookie the CDN issued during resolution was not carried into the job,
+ * or the link is only served to a browser that played the page itself. One
+ * browser launch answers both — it plays the page, keeps the cookies, and
+ * reports the playlist URL the player actually requested, which may not even be
+ * the URL we stored.
+ *
+ * Returns true when `ref` now carries something new worth retrying.
+ */
+async function recoverStreamAccess(job, ref, { stage } = {}) {
+  const pageUrl = streamPageUrl(job, ref);
+  if (!pageUrl) return false;
+  const clearance = await browserClearance(pageUrl);
+  if (!clearance) return false;
+
+  const changed =
+    Boolean(clearance.playlist && clearance.playlist !== ref.url) ||
+    Boolean(clearance.cookie && clearance.cookie !== ref.cookie);
+
+  if (clearance.playlist) ref.url = clearance.playlist;
+  if (clearance.cookie) ref.cookie = clearance.cookie;
+  if (clearance.userAgent) ref.userAgent = clearance.userAgent;
+  if (clearance.referer) ref.referer = clearance.referer;
+  /* Learned afresh, so the stale set must not outrank it. */
+  ref.streamHeaders = null;
+  /* Only when there is something to retry with: this flag is what the error
+     message reads to decide whether a browser was really tried, and what stops
+     the recovery from being attempted twice. */
+  if (changed) ref.accessRefreshedAt = Date.now();
+  jobsStore.updateJob(job, { ref });
+  if (stage) jobsStore.updateJob(job, { stage });
+  return changed;
+}
+
+/**
+ * Job whose source still has to be fetched: resolve the file reference to a
+ * fresh signed URL, download it, then hand it to the encoder.
+ */
+async function fetchThenCompress(job, ref) {
+  const paths = jobsStore.jobPaths(job);
+  const controller = makeController(job);
+
+  try {
+    jobsStore.updateJob(job, { status: 'fetching', stage: 'Finding the video file' });
+
+    /* Every URL that might serve this file, best first. Most hosts have one;
+       fileditch has a handful because its signed links rot in half an hour. */
+    const streamRef = Boolean(ref && String(ref.resolver) === 'stream');
+    /* Marked before anything can fail: a stream job that dies while *resolving*
+       is still a stream job, and its error has to be the sentence about the
+       page it belongs to, not a generic one. */
+    if (streamRef && !job.isStream) jobsStore.updateJob(job, { isStream: true });
+    let candidates;
+    try {
+      candidates = await directCandidates(ref);
+    } catch (resolveErr) {
+      if (!streamRef) throw resolveErr;
+      /* The playlist answered when the link was pasted and refuses now. Before
+         failing the job, play the page once in a real browser and use what its
+         player actually loaded — that is the one thing that cures a missing
+         session cookie and a link that is only served to a browser. */
+      const recovered = await recoverStreamAccess(job, ref, {
+        stage: 'The stream refused the request — opening the page once to earn its clearance',
+      });
+      if (!recovered) throw resolveErr;
+      candidates = await directCandidates(ref).catch(async () => [await directUrl(ref)]);
+    }
+    let url = candidates[0];
+    /* A stream has no Content-Length: its size is the length of the video times
+       the bitrate of the variant that was chosen. Resolving the variant here
+       (rather than at download time) is also what puts the resolution on the
+       card, so the person can see which quality was picked and why. */
+    const streaming = candidates.length > 0 && candidates.every((candidate) => isPlaylistUrl(candidate));
+    if (streaming) {
+      const bits = [];
+      if (ref.quality) bits.push(`${ref.quality}p`);
+      if (ref.duration) bits.push(durationText(ref.duration));
+      if (bits.length) {
+        jobsStore.updateJob(job, {
+          resolvedNote: `Reading the stream at its best quality${bits.length ? ` — ${bits.join(', ')}` : ''}.`,
+        });
+      }
+    }
+    const expected = Number(ref.size) || Number(ref.estimatedBytes) || 0;
+    /* Encoding needs the source plus the output plus room for the encoder's
+       own scratch files, so require ~2.2x the file and never drop below 1 GB.
+       A copy job only needs the file once. */
+    const needed = job.noCompress
+      ? Math.max(expected * 1.2, 512 * 1024 ** 2)
+      : Math.max(expected * 2.2, 1024 ** 3);
+
+    /* What a previous run already downloaded. A crash must not mean paying for
+       the same gigabytes twice. Only the *same URL* is resumed: the bytes on
+       disk belong to whatever that URL served, and a different route may be a
+       different file. */
+    let partialBytes = 0;
+    try {
+      const stat = await fsp.stat(paths.source);
+      partialBytes = stat.size || 0;
+    } catch {
+      partialBytes = 0;
+    }
+    const partialTotal = Number(job.downloadTotal) || 0;
+    /* Signed links rotate but point at the same bytes, so the URL is not the
+       identity — the size the host reports is (checked again on the response's
+       Content-Range, which must start exactly where the fragment ends). */
+    const resumable = partialBytes > 0 && partialTotal > 0;
+
+    /* The whole file is already here (the crash came after the download): there
+       is nothing to fetch at all. */
+    if (resumable && partialTotal && partialBytes >= partialTotal) {
+      console.log(`[job ${job.id}] the download was already complete (${Math.round(partialBytes / 1048576)} MB)`);
+      startCompression(job);
+      return;
+    }
+    if (partialBytes > 0 && !resumable) {
+      /* A fragment with no known size cannot be validated, so it is not worth
+         trusting: start clean rather than risk a corrupt file. */
+      await fsp.rm(paths.source, { force: true }).catch(() => {});
+      partialBytes = 0;
+    }
+
+    let free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+    if (free < needed) {
+      // Finished files that are already on a host are expendable: their links
+      // are safe in the ledger, and their bytes are not needed here any more.
+      const made = await reclaimSpace(needed);
+      free = made.free;
+      if (made.reclaimed) {
+        console.log(`[space] reclaimed ${formatSize(made.reclaimed)} to make room`);
+      }
+    }
+    if (free < needed) {
+      throw Object.assign(
+        new Error(
+          `Not enough disk space: ${formatGb(free)} free, about ${formatGb(needed)} needed for this file. ` +
+            'Finished videos whose share link is ready can be removed (they are already on the host).',
+        ),
+        { code: 'NO_DISK' },
+      );
+    }
+
+    jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading video', progress: 0 });
+
+    const capture = browserCapture();
+    /* Signed links from fileditch and friends expect the page that issued them
+       as the referer; resolvers put it on the ref. */
+    const refHeaders = {};
+    if (ref && ref.referer) {
+      refHeaders.referer = ref.referer;
+      try {
+        refHeaders.origin = new URL(ref.referer).origin;
+      } catch {
+        /* keep referer only */
+      }
+    }
+    /* A Drive viewer page is not a referer Drive wants, and a "shared with
+       anyone" file needs none: the confirmed URL is complete on its own. */
+    if (ref && ref.resolver === 'gdrive') {
+      delete refHeaders.referer;
+      delete refHeaders.origin;
+    }
+    /* A Cloudflare clearance earned while reading the page is what the CDN
+       checks again on the file itself — together with the user agent that
+       earned it, because cf_clearance is bound to that string. */
+    if (ref && ref.cookie) {
+      refHeaders.cookie = ref.cookie;
+      if (ref.userAgent) refHeaders['user-agent'] = ref.userAgent;
+    }
+    if (resumable && partialBytes > 0) {
+      console.log(`[job ${job.id}] resuming the download at ${Math.round(partialBytes / 1048576)} MB`);
+      jobsStore.updateJob(job, {
+        stage: `Continuing the download from ${Math.round(partialBytes / 1048576)} MB`,
+        resolvedNote:
+          'Its earlier run was cut off, so it carries on from where it stopped instead of starting again.',
+      });
+    }
+    let resumeFrom = resumable ? partialBytes : 0;
+    const downloadOptions = {
+      maxBytes: MAX_UPLOAD_BYTES,
+      extraHeaders: refHeaders,
+      signal: controller.signal,
+      get resumeFrom() {
+        return resumeFrom;
+      },
+      expectTotal: partialTotal,
+      /* Record what this transfer is (URL + full size) the moment the host
+         answers, so a crash at 90% is resumable rather than restartable. */
+      onStart: ({ total, url: from }) => {
+        if (total) job.downloadTotal = total;
+        if (from) job.downloadUrl = from;
+        jobsStore.updateJob(job, {});
+      },
+      onProgress: (received, total) => {
+        const p = total ? received / total : 0;
+        /* A host that trickles (bunkr can) is easier to wait for when the speed
+           and the remaining time are on screen. */
+        const now = Date.now();
+        if (job._dlAt) {
+          const seconds = (now - job._dlAt) / 1000;
+          if (seconds >= 0.9) {
+            const rate = (received - (job._dlBytes || 0)) / seconds;
+            if (rate > 0) {
+              job.downloadSpeed = rate;
+              job.downloadEta = total ? Math.round((total - received) / rate) : null;
+            }
+            job._dlAt = now;
+            job._dlBytes = received;
+          }
+        } else {
+          job._dlAt = now;
+          job._dlBytes = received;
+        }
+        job.sourceBytes = received;
+        job.progress = p;
+        job.stage = total
+          ? `Downloading video · ${Math.round(p * 100)}%`
+          : `Downloading video (${Math.round(received / 1048576)} MB)`;
+        if (Date.now() - (job._lastEmit || 0) > 500) {
+          job._lastEmit = Date.now();
+          jobsStore.updateJob(job, {});
+        }
+      },
+    };
+
+    /* A stream reports its progress in *video seconds*, not bytes: ffmpeg is
+       pulling segments and remuxing them, and the length of the video is the
+       only stable measure of how far along it is. */
+    const streamOptions = {
+      signal: controller.signal,
+      /* refHeaders is what the resolver learned (referer, cookie, UA); the
+         resolver also returns the exact header set its playlist request was
+         accepted with, and the segments are guarded the same way. */
+      /* `ref.headers` is what a resolver says its own URL needs — a Drive
+         session cookie, for instance. `streamHeaders` is the same idea for a
+         playlist, kept separate because ffmpeg gets those. */
+      extraHeaders: { ...refHeaders, ...(ref.headers || {}), ...(ref.streamHeaders || {}) },
+      duration: Number(ref.duration) || 0,
+      onProgress: ({ seconds, bytes }) => {
+        const total = Number(ref.duration) || 0;
+        const p = total > 0 ? Math.min(0.999, (Number(seconds) || 0) / total) : 0;
+        job.progress = p;
+        job.sourceBytes = bytes || job.sourceBytes;
+        job.stage = total
+          ? `Downloading the stream · ${Math.round(p * 100)}%`
+          : `Downloading the stream (${Math.round((bytes || 0) / 1048576)} MB)`;
+        if (Date.now() - (job._lastEmit || 0) > 500) {
+          job._lastEmit = Date.now();
+          jobsStore.updateJob(job, {});
+        }
+      },
+    };
+
+    /* Try each candidate in turn: a stale signed link costs a request, not a
+       job. Only the failures that another URL could fix are retried. */
+    let attempt = null;
+    let htmlRoutes = 0;
+    const tried = [];
+    while (!attempt && candidates.length) {
+      const candidate = candidates.shift();
+      tried.push(candidate);
+      try {
+        if (!job.downloadUrl) job.downloadUrl = candidate;
+        if (isPlaylistUrl(candidate) || sources.looksLikePlaylist(candidate)) {
+          jobsStore.updateJob(job, { isStream: true });
+          let info;
+          try {
+            info = await sources.downloadStream(candidate, paths.source, streamOptions);
+          } catch (streamErr) {
+            /* The stream's CDN may be behind the same bot check as its page, or
+               may have refused the segments after answering the playlist. One
+               browser launch is worth it: it is the difference between a 403 and
+               the video. Retried once, at most — the browser is not free. */
+            if (!ref.accessRefreshedAt) {
+              const recovered = await recoverStreamAccess(job, ref, {
+                stage: 'The video CDN wanted a browser — trying with its clearance',
+              });
+              if (recovered) {
+                Object.assign(streamOptions.extraHeaders, {
+                  referer: ref.referer,
+                  ...(ref.cookie ? { cookie: ref.cookie } : {}),
+                  ...(ref.userAgent ? { 'user-agent': ref.userAgent } : {}),
+                  ...(ref.streamHeaders || {}),
+                });
+                /* The playlist may have moved: the player asked for a different
+                   URL than the one the page's HTML named. */
+                const retryUrl = ref.url || candidate;
+                info = await sources.downloadStream(retryUrl, paths.source, streamOptions);
+                if (retryUrl !== candidate) job.downloadUrl = retryUrl;
+              }
+            }
+            if (!info) {
+              /* Everything a request can change has been tried: the page's
+                 cookies, the clearance a browser earned, this CDN's own
+                 referer. What is left is the client itself — so fetch the
+                 pieces inside Chromium and remux them here. */
+              /* Some refusals are not about the client and a browser cannot fix
+                 them: DRM stays DRM, a live stream has no end, and a job the
+                 user stopped should stop. */
+              const pointless = [
+                'STREAM_DRM',
+                'STREAM_LIVE',
+                'STREAM_EMPTY',
+                'STREAM_NO_VARIANTS',
+                'NO_DISK',
+                'CANCELLED',
+              ];
+              const viaBrowser = pointless.includes(streamErr.code)
+                ? null
+                : await downloadStreamThroughBrowser(job, ref, candidate, paths, {
+                    signal: controller.signal,
+                  });
+              if (viaBrowser && !viaBrowser.failed) {
+                info = { total: viaBrowser.total };
+                job.streamViaBrowser = true;
+                if (viaBrowser.seconds) job.streamDuration = viaBrowser.seconds;
+              } else if (viaBrowser && viaBrowser.failed) {
+                /* Say what the browser said: it is a better sentence than
+                   "forbidden", and it is true. */
+                streamErr.browserNote = viaBrowser.error.message;
+                streamErr.message = `${streamErr.message} (a real browser was tried too: ${viaBrowser.error.message})`;
+              }
+            }
+            if (!info) throw streamErr;
+          }
+          attempt = { usedBrowser: false, url: candidate, filename: null, stream: true };
+          if (info && info.total) job.sourceBytes = info.total;
+          job.downloadUrl = candidate;
+          break;
+        }
+        const info = await sources.downloadHttp(candidate, paths.source, downloadOptions);
+        attempt = { usedBrowser: false, url: (info && info.url) || candidate, filename: (info && info.filename) || null };
+        if (info && info.total) job.downloadTotal = info.total;
+        if (info && info.resumed) job.downloadResumed = true;
+        job.downloadUrl = candidate;
+      } catch (err) {
+        /* A resume that the host mangles (wrong bytes, expired signed link, a
+           different file behind the same URL) must not poison the download:
+           the partial is dropped and the next route starts from zero. */
+        if (resumeFrom > 0) {
+          resumeFrom = 0;
+          await fsp.rm(paths.source, { force: true }).catch(() => {});
+          jobsStore.updateJob(job, { stage: 'Starting the download again from the beginning' });
+        }
+        if (err.code === 'HTML_PAGE') htmlRoutes += 1;
+        if (!RECOVERABLE.has(err.code)) throw err;
+        let host = 'that host';
+        try {
+          host = new URL(candidate).host;
+        } catch {
+          /* keep the generic wording */
+        }
+        console.log(`[job ${job.id}] ${err.code} from ${host} — trying the next route`);
+        jobsStore.updateJob(job, { stage: 'The usual link failed — trying another route' });
+      }
+    }
+
+    /* Still nothing? A host that refuses plain requests (hotlink protection, a
+       bot challenge, a player-only signed URL) is retried through a real
+       browser before the job is allowed to fail. */
+    if (!attempt) {
+      try {
+        attempt = await downloadWithFallback({
+          url: tried[tried.length - 1] || url,
+          pageUrl: job.url || url,
+          destPath: paths.source,
+          download: (target, dest, options) => sources.downloadHttp(target, dest, options),
+          capture,
+          options: downloadOptions,
+          /* fileditch's signed links expire in about half an hour — shorter
+             than a queue wait — so fetch a fresh one before giving up. */
+          refresh: async () => {
+            const fresh = await directCandidates(ref).catch(() => []);
+            return fresh.find((candidate) => !tried.includes(candidate)) || null;
+          },
+        });
+      } catch (err) {
+        /* Every route answered with a web page, which is what a player page
+           looks like from here — and the reason a plain download cannot work is
+           the JavaScript download button, not a missing file. Say the thing that
+           actually fixes it. */
+        if (err.code === 'HTML_PAGE' && htmlRoutes > 0 && !browserhooks.install().available) {
+          err.playerNote =
+            'That page only plays the video; its download button is built by JavaScript, and this server has no ' +
+            'browser to press it. Run `npm run browser:install` once in the project, then try the link again.';
+        }
+        throw err;
+      }
+    }
+    if (attempt.usedBrowser) {
+      job.browserFetched = true;
+    }
+    if (attempt.refreshed) job.fetchedNote = 'The host had rotated its download link, so a fresh one was minted.';
+
+
+    /* Trust the host's own file name over anything guessed from a URL: a signed
+       CDN link says "abc123", the Content-Disposition says "Holiday.mp4".
+       A stream has no name of its own — the playlist is called playlist.m3u8,
+       which would be a lie on a finished MP4, so the resolver's name stands. */
+    const hostName = attempt.stream
+      ? null
+      : attempt.filename || (await sources.filenameFromUrl(attempt.url || url));
+    const named = bestName(job.name, hostName);
+    if (named && named !== job.name) {
+      jobsStore.updateJob(job, { name: named });
+    }
+
+    jobsStore.updateJob(job, {
+      progress: 0,
+      sourceBytes: (await fsp.stat(paths.source)).size,
+      downloadSpeed: null,
+      downloadEta: null,
+    });
+    startCompression(job);
+  } catch (err) {
+    reportJobError(job, err);
+  }
+}
+
+/* Encode jobs one at a time per CPU slot: two 1080p encodes fighting over the
+   same cores finish slower than they would run back to back. */
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 1;
+const queue = [];
+let activeCount = 0;
+let finishedThisSession = 0;
+
+function updateQueuePositions() {
+  queue.forEach((job, index) => {
+    jobsStore.updateJob(job, {
+      status: 'queued',
+      stage: index === 0 ? 'Next in line' : `${index + 1} in line`,
+    });
+  });
+}
+
+/* GitHub Codespaces (and similar hosts) stop an idle machine, but "terminal
+   output is counted as activity". So while any job is running, print a line
+   every 45 seconds: the machine stays awake through a multi-hour encode even if
+   nobody is looking at the tab. */
+let heartbeatTimer = null;
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_SECONDS || 45) * 1000;
+
+/* Job ids that an encoder is working on right now. Not a status field: status
+   can be 'error' while a retry is starting, and the point is to never run two
+   encoders over one directory. */
+const runningJobs = new Set();
+
+/* The sweeper asks this before deleting anything: a job with an encoder on it
+   is never removed, whatever its status field says at that instant. */
+jobsStore.setBusyHook((id) => runningJobs.has(id));
+
+/* How much of GitHub's free allowance this machine has used. It counts only
+   while this process is alive, so it understates rather than overstates — see
+   server/usage.js for why it cannot be a reading from GitHub. */
+const usage = usageFactory.createMeter({
+  dataDir: jobsStore.DATA_DIR,
+  cores: Number(process.env.CODESPACE_CORES) || undefined,
+});
+/* Anything a job does is activity: the meter's idle countdown restarts, and the
+   time is credited without waiting for the next minute. */
+jobsStore.bus.on('update', () => usage.touch());
+
+function startHeartbeat() {
+  if (heartbeatTimer || !HEARTBEAT_MS) return;
+  heartbeatTimer = setInterval(() => {
+    const busy = jobsStore.listJobs ? jobsStore.listJobs() : [];
+    const running = (busy || []).filter((job) =>
+      ['fetching', 'queued', 'compressing', 'hosting'].includes(job.status),
+    );
+    if (!running.length) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+      return;
+    }
+    const parts = running.map((job) => {
+      const pct = Math.round((Number(job.progress) || 0) * 100);
+      const eta = job.etaSeconds ? ` · ${Math.max(1, Math.round(job.etaSeconds / 60))}m left` : '';
+      /* Which part of how many: a line that just says 8% cannot tell you
+         whether the encode has moved at all since the last line. */
+      const part =
+        Number(job.segmentsTotal) > 1
+          ? ` (part ${Math.min(job.segmentsTotal, (Number(job.segmentsDone) || 0) + 1)}/${job.segmentsTotal})`
+          : '';
+      return `${job.id} ${pct}%${part}${eta}`;
+    });
+    console.log(`[keep-alive] ${new Date().toISOString()} · ${parts.join(' · ')}`);
+  }, HEARTBEAT_MS);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
+}
+
+function pumpQueue() {
+  while (activeCount < MAX_CONCURRENT && queue.length) {
+    const job = queue.shift();
+    if (!jobsStore.getJob(job.id)) continue; // removed while waiting
+    if (runningJobs.has(job.id)) continue;
+    runningJobs.add(job.id);
+    activeCount += 1;
+    startHeartbeat();
+    autoStop.cancel('a job started');
+    compressJob(job)
+      .catch((err) => reportJobError(job, err))
+      .finally(() => {
+        runningJobs.delete(job.id);
+        activeCount -= 1;
+        finishedThisSession += 1;
+        updateQueuePositions();
+        pumpQueue();
+        // Nothing left to do: let the uploads finish, then post and mail the
+        // links, then let the machine go if the user asked for that.
+        if (!queue.length && activeCount === 0) {
+          (async () => {
+            await waitForHosting();
+            /* Something may have been queued while the upload ran. */
+            if (queue.length || activeCount) return;
+            const reason = 'The queue is finished.';
+            if (AUTO_PUBLISH) await publishLinks({ reason }).catch(() => {});
+            if (AUTO_EMAIL) await emailLinks({ reason }).catch(() => {});
+            autoStop.schedule('queue finished');
+          })().catch(() => {});
+        }
+      });
+  }
+  updateQueuePositions();
+}
+
+function startCompression(job) {
+  /* One job, one encoder. Two passes over the same directory delete each
+     other's part files, and the loser reports "ENOENT … part-0011.mp4". */
+  if (job._running || runningJobs.has(job.id)) {
+    console.log(`[job ${job.id}] already running — not starting it twice`);
+    return;
+  }
+  if (queue.some((queued) => queued.id === job.id)) return;
+  jobsStore.updateJob(job, { status: 'queued', stage: 'Queued', progress: 0, error: null, interrupted: false });
+  queue.push(job);
+  pumpQueue();
+}
+
+/* --------------------------------------------------------------- raw uploads */
+
+async function saveRequestToFile(req, destPath, { maxBytes = MAX_UPLOAD_BYTES } = {}) {
+  // Leave room for the encoded output next to the source.
+  const declared = Number(req.headers['content-length'] || 0);
+  let free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  if (declared && declared * 1.5 > free) {
+    free = (await reclaimSpace(declared * 1.5)).free;
+  }
+  if (declared && declared * 1.5 > free) {
+    throw Object.assign(new Error('This server does not have enough free disk space for that file.'), {
+      code: 'NO_DISK',
+    });
+  }
+
+  const out = fs.createWriteStream(destPath);
+  let received = 0;
+  let tooBig = false;
+
+  req.on('data', (chunk) => {
+    received += chunk.length;
+    if (received > maxBytes && !tooBig) {
+      tooBig = true;
+      req.destroy();
+      out.destroy();
+    }
+  });
+
+  try {
+    await pipeline(req, out);
+  } catch {
+    await fsp.rm(destPath, { force: true }).catch(() => {});
+    if (tooBig) {
+      throw Object.assign(new Error(`Files up to ${MAX_UPLOAD_MB} MB are supported.`), { code: 'TOO_BIG' });
+    }
+    throw Object.assign(new Error('The upload stopped before it finished.'), { code: 'UPLOAD_FAILED' });
+  }
+
+  if (tooBig) {
+    await fsp.rm(destPath, { force: true }).catch(() => {});
+    throw Object.assign(new Error(`Files up to ${MAX_UPLOAD_MB} MB are supported.`), { code: 'TOO_BIG' });
+  }
+
+  return received;
+}
+
+/** Move a freshly received file into the job folder and kick off compression. */
+async function adoptUpload(tmpPath, fields) {
+  const job = jobsStore.createJob({
+    source: fields.source || 'upload',
+    url: fields.url,
+    name: fields.name,
+    presetId: fields.presetId,
+    targetMb: fields.targetMb,
+    noCompress: fields.noCompress,
+  });
+  const paths = jobsStore.jobPaths(job);
+
+  /* Reading (and, if needed, repairing) the file happens here, before it
+     becomes the job's source — so the note it produces has to be carried onto
+     the job, or the card would show an encode of a file it never mentions
+     fixing. */
+  let read;
+  try {
+    read = await probeOrExplain(tmpPath, { workDir: path.dirname(paths.source) });
+  } catch (err) {
+    await jobsStore.removeJob(job.id);
+    await fsp.rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
+
+  await fsp.rename(tmpPath, paths.source);
+  const size = (await fsp.stat(paths.source)).size;
+  jobsStore.updateJob(job, {
+    status: 'queued',
+    sourceBytes: size,
+    stage: 'Queued',
+    ...(read && read.note ? { fetchedNote: read.note } : {}),
+  });
+  startCompression(job);
+  return job;
+}
+
+/* -------------------------------------------------------------------- routes */
+
+app.get('/api/health', async (req, res) => {
+  const ytdlp = await sources.hasYtdlp();
+  const disk = await diskUsage(jobsStore.DATA_DIR);
+  res.json({
+    ok: true,
+    freeBytes: disk.freeBytes,
+    freeGb: Math.round((disk.freeBytes / 1073741824) * 10) / 10,
+    disk,
+    autoStop: autoStop.status(),
+    maxUploadMb: MAX_UPLOAD_MB,
+    presets: PRESET_LIST,
+    defaultPreset: DEFAULT_PRESET,
+    platformDownloads: Boolean(ytdlp),
+    ytdlpVersion: ytdlp?.version || null,
+    hosters: hosters.describeProviders(),
+    autoHost: AUTO_HOST,
+    email: notify.describe(),
+    publish: await publish.describe(),
+    version: { ...version.describe(), update: version.knownRemote() },
+    browserHosters: ['gofile', 'pixeldrain'],
+    /* Cloudflare-protected hosts need this one to be true. */
+    browserAvailable: (() => {
+      try {
+        return require('./browser').available();
+      } catch {
+        return false;
+      }
+    })(),
+    /* What the last start picked up off the disk. */
+    recovery: {
+      resumedSinceStart: jobsStore.listJobs().filter((job) => job.resumed).length,
+      interruptedNow: jobsStore
+        .listJobs()
+        .filter((job) => job.interrupted && !job.hostedUrl).length,
+    },
+  });
+});
+
+/* ------------------------------------------------------- storage and limits */
+
+/**
+ * Everything on the disk, who it belongs to, and what it is worth deleting.
+ *
+ * The page opens this behind the header's storage button; `npm run disk` prints
+ * the same facts in a terminal.
+ */
+app.get('/api/storage', async (req, res) => {
+  const report = await storage.describe({
+    dataDir: jobsStore.DATA_DIR,
+    jobsStore,
+    projectRoot: path.join(__dirname, '..'),
+  });
+  res.json({ ...report, usage: usage.describe() });
+});
+
+/** Delete one file of one job. The guard rails live in server/storage.js. */
+app.delete('/api/storage/jobs/:id/:part', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  const result = await storage.deletePart({ jobsStore, job, part: req.params.part });
+  if (!result.ok) return fail(res, result.code === 'NOT_FOUND' ? 404 : 409, result.code, result.message);
+  console.log(`[space] deleted ${req.params.part} of ${job.id} — freed ${formatSize(result.freed)}`);
+  jobsStore.updateJob(job, {});
+  return res.json({ ok: true, freedBytes: result.freed, job: jobsStore.publicView(job) });
+});
+
+/** Bulk housekeeping: temp uploads, finished jobs, or everything. */
+app.post('/api/storage/clean', async (req, res) => {
+  const what = String((req.body || {}).what || 'finished');
+  if (!['tmp', 'finished', 'all'].includes(what)) return fail(res, 400, 'BAD_WHAT', 'Choose tmp, finished or all.');
+  if (what === 'all' && !(req.body || {}).force) {
+    return fail(res, 400, 'NEED_FORCE', 'Deleting everything removes files that have no share link. Send force: true.');
+  }
+  const result = await storage.clean({
+    dataDir: jobsStore.DATA_DIR,
+    jobsStore,
+    what,
+    force: Boolean((req.body || {}).force),
+  });
+  console.log(`[space] clean ${what}: freed ${formatSize(result.freedBytes)}, ${result.removedJobs} job(s) removed`);
+  return res.json(result);
+});
+
+/**
+ * Pin a job's local files so the sweeper leaves them alone.
+ *
+ * The sweeper exists because a Codespace has 32 GB; the pin exists because a
+ * file someone is still using is not the sweeper's to delete.
+ */
+app.post('/api/jobs/:id/pin', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  const pinned = Boolean((req.body || {}).pinned);
+  jobsStore.updateJob(job, { pinLocal: pinned });
+  res.json({ ok: true, job: jobsStore.publicView(job) });
+});
+
+/**
+ * The monthly allowance, as far as this machine can measure it.
+ *
+ * GitHub does not hand a Codespace its remaining hours, so this is a meter and
+ * says so; the real figure is on the billing page, which is linked.
+ */
+app.get('/api/usage', (req, res) => res.json({ usage: usage.describe() }));
+
+app.post('/api/usage/settings', async (req, res) => {
+  await usage.setSettings(req.body || {});
+  res.json({ ok: true, settings: usage.describe().settings, usage: usage.describe() });
+});
+
+app.get('/api/presets', (req, res) => res.json({ presets: PRESET_LIST }));
+
+/** Which build is this? Asked after every crash, and answered in one call. */
+app.get('/api/version', (req, res) => res.json({ version: version.describe() }));
+
+/**
+ * Walk a link through every stage and report what each one said.
+ *
+ * The app can only show one line of an error, and "it did not work" is not
+ * enough to fix a host that hides behind a bot check. `npm run doctor -- <url>`
+ * prints the same report from a terminal.
+ */
+app.get('/api/diagnose-link', async (req, res) => {
+  const url = sources.normalizeUrl(req.query.url);
+  if (!url) return fail(res, 400, 'BAD_URL', 'Pass ?url= with the link to test.');
+  const result = await require('./diagnose').diagnose(url, {
+    browser: req.query.browser === '0' ? 'skip' : undefined,
+  });
+  if (String(req.query.format || '') === 'text') {
+    return res.type('text/plain').send(`${result.text}\n`);
+  }
+  const { text, ...json } = result;
+  return res.json(json);
+});
+
+/* Stop the machine when the queue drains — for metered hosts. */
+app.get('/api/auto-stop', (req, res) => res.json({ autoStop: autoStop.status() }));
+
+app.post('/api/auto-stop', (req, res) => {
+  const wants = Boolean(req.body && req.body.enabled);
+  if (wants && !autoStop.configured()) {
+    return fail(
+      res,
+      400,
+      'AUTOSTOP_UNAVAILABLE',
+      'This machine has no stop command configured (set AUTO_STOP_COMMAND, or run inside Codespaces).',
+    );
+  }
+  const enabled = autoStop.enable(wants);
+  if (!enabled) autoStop.cancel('switched off');
+  else if (!queue.length && activeCount === 0 && finishedThisSession) autoStop.schedule('already idle');
+  return res.json({ autoStop: autoStop.status() });
+});
+
+app.post('/api/auto-stop/cancel', (req, res) => {
+  autoStop.cancel('cancelled by the user');
+  return res.json({ autoStop: autoStop.status() });
+});
+
+app.post('/api/relay-token', (req, res) => {
+  res.json({ token: newRelayToken(), maxUploadMb: MAX_UPLOAD_MB });
+});
+
+/** Does the server itself have a route to this URL? Drives the UI's strategy. */
+app.post('/api/probe', async (req, res) => {
+  const url = sources.normalizeUrl(req.body?.url);
+  if (!url) return fail(res, 400, 'BAD_URL', 'That does not look like a valid link.');
+  const platform = sources.platformFor(url);
+  if (platform) {
+    const ytdlp = await sources.hasYtdlp();
+    return res.json({
+      url,
+      platform,
+      serverCanFetch: Boolean(ytdlp),
+      reason: ytdlp ? null : 'platform-needs-ytdlp',
+    });
+  }
+  const remote = await sources.probeRemote(url);
+  res.json({
+    url,
+    platform: null,
+    serverCanFetch: remote.reachable && !remote.isHtml,
+    contentLength: remote.contentLength || 0,
+    contentType: remote.contentType || null,
+    reason: remote.reachable ? (remote.isHtml ? 'html-page' : null) : 'unreachable',
+  });
+});
+
+/** List the actual files behind a share link (gofile folder, turbo.cr page, …). */
+/**
+ * Fill in the size of files a share page lists but does not measure.
+ *
+ * "3 files found" is not enough to choose from when one is 200 MB and another
+ * is 4 GB. A HEAD request (or a one-byte range GET) is enough, and a host that
+ * refuses it simply leaves the size unknown — the answer is never delayed by
+ * more than the deadline below.
+ */
+async function withSizes(result, { timeoutMs = 7000, limit = 12 } = {}) {
+  if (!result || !result.files || !result.files.length) return result;
+  const targets = result.files.filter((file) => !file.size).slice(0, limit);
+  if (!targets.length) return result;
+
+  const work = Promise.all(
+    targets.map(async (file) => {
+      const ref = file.ref || {};
+
+      /* A stream has no byte size to probe: the playlist is a few hundred bytes
+         and the video is whatever its segments add up to. Length × bitrate of
+         the chosen quality is a good enough number to choose a file by, and it
+         is labelled as an estimate wherever it is shown. */
+      if (ref.resolver === 'stream' || isPlaylistUrl(ref.url)) {
+        const info = await inspectPlaylist(ref.url, {
+          headers: ref.referer ? { referer: ref.referer } : {},
+        }).catch((err) => {
+          file.error = err.message;
+          return null;
+        });
+        if (!info) return;
+        file.size = info.estimatedBytes || 0;
+        file.sizeIsEstimate = Boolean(info.estimatedBytes);
+        file.quality = info.height ? `${info.height}p` : file.quality || null;
+        file.duration = info.duration || 0;
+        file.note = [
+          info.variants && info.variants.length > 1 ? `${info.variants.length} qualities` : 'stream',
+          durationText(info.duration),
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        Object.assign(ref, {
+          duration: info.duration || 0,
+          quality: info.height || null,
+          estimatedBytes: info.estimatedBytes || 0,
+        });
+        return;
+      }
+
+      // Use the URL already in hand: minting a fresh signed link just to weigh
+      // the file would make the picker slow and burn a token.
+      const direct = /^https?:/i.test(ref.url || '') && !signedish(ref.url) ? ref.url : null;
+      const url = direct || (await directUrl(ref).catch(() => null));
+      if (!url) return;
+      const probe = await sources
+        .probeRemote(url, { timeoutMs: 4000, headers: ref.referer ? { referer: ref.referer } : {} })
+        .catch(() => null);
+      if (probe && probe.reachable && probe.contentLength) file.size = probe.contentLength;
+    }),
+  );
+
+  await Promise.race([work, new Promise((resolve) => setTimeout(resolve, timeoutMs))]);
+  return result;
+}
+
+/** Resolve after `ms`, never reject: a race partner, not a timer to clean up. */
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+/**
+ * Reading one page is expensive — a browser launch, a challenge, a player that
+ * has to be allowed to run — and it was being done twice for one link: once when
+ * the picker asked, once when the job started. Two minutes of memo, so pressing
+ * "start it anyway" does not pay for the browser a second time.
+ */
+const linkReads = new Map();
+const LINK_READ_TTL = 2 * 60 * 1000;
+function resolveLinkOnce(url) {
+  const hit = linkReads.get(url);
+  if (hit && Date.now() - hit.at < LINK_READ_TTL) return hit.promise;
+  const promise = resolve(url);
+  linkReads.set(url, { at: Date.now(), promise });
+  /* A refusal is worth remembering no more than a minute either; a link that
+     failed at 10:01 may work at 10:05 with a fresh session. */
+  promise.catch(() => linkReads.delete(url));
+  return promise;
+}
+
+/** A fileditch signed path or any opaque token: not worth a HEAD on its own. */
+function signedish(url) {
+  try {
+    const last = new URL(url).pathname.split('/').filter(Boolean).pop() || '';
+    return last.length > 24 && /^[A-Za-z0-9_-]+$/.test(last);
+  } catch {
+    return false;
+  }
+}
+
+app.post('/api/resolve', async (req, res) => {
+  const url = sources.normalizeUrl(req.body?.url);
+  if (!url) return fail(res, 400, 'BAD_URL', 'That does not look like a valid link.');
+  if (sources.isBlockedHost(url)) return fail(res, 400, 'BLOCKED_HOST', 'That address is not allowed.');
+  /* The same deadline the job endpoint honours. A page that needs a browser
+     takes a minute and a half to read; a request that waits for it is answered
+     by the host's proxy with a 504, which is what "Request failed (504)" was.
+     Saying "still reading, start the job and watch it there" is true and
+     useful; a gateway timeout is neither. */
+  const reading = (async () =>
+    withSizes(await fileBehindUrl(url, await resolveLinkOnce(url)), {
+      timeoutMs: Number(process.env.SIZE_PROBE_MS) || 7000,
+    }))().then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  const first = await Promise.race([reading, wait(Number(process.env.RESOLVE_WAIT_MS) || 7000).then(() => null)]);
+
+  if (!first) {
+    return res.status(202).json({
+      pending: true,
+      url,
+      resolver: null,
+      files: [],
+      message:
+        'This link is still being read — the page needs a browser, and that takes a minute. ' +
+        'Start it anyway: the job reads the link itself and shows its progress.',
+    });
+  }
+
+  const result = first.value;
+  if (first.error) {
+    const err = first.error;
+    const status = err.code === 'BAD_URL' ? 400 : 422;
+    return fail(res, status, err.code || 'RESOLVE_FAILED', err.message || 'Could not read that link.');
+  }
+  try {
+    return res.json({
+      resolver: result.resolver,
+      title: result.title || null,
+      /* The linked page's own <title>: what its browser tab says. */
+      pageTitle: result.pageTitle || null,
+      files: result.files.map((file) => ({
+        name: file.name,
+        size: file.size || 0,
+        /* A stream's size is length × bitrate, so the picker says "about". */
+        sizeIsEstimate: Boolean(file.sizeIsEstimate),
+        mime: file.mime || '',
+        kind: file.kind,
+        /* "1080p · 4 qualities · 24 min" for a stream, nothing for a file. */
+        quality: file.quality || null,
+        note: file.note || null,
+        ref: file.ref,
+      })),
+    });
+  } catch (err) {
+    const status = err.code === 'BAD_URL' ? 400 : 422;
+    return fail(res, status, err.code || 'RESOLVE_FAILED', err.message || 'Could not read that link.');
+  }
+});
+
+/* Every resolver that can turn a reference back into a URL. bunkr and filester
+   were missing here, so picking a file from either sent a valid ref and got
+   "That file reference is not valid." */
+const ALLOWED_REF_RESOLVERS = new Set([
+  'gofile',
+  'turbo',
+  'pixeldrain',
+  'bunkr',
+  'filester',
+  'fileditch',
+  'stream',
+  'gdrive',
+  'direct',
+]);
+
+/**
+ * Create a job.
+ * body: { source: 'url'|'ref'|'upload'|'sample', url?, ref?, name?, presetId?, targetMb? }
+ */
+/* ------------------------------------------------------- one job per video */
+
+/* A job this server is actively working on: pasting the same link again must
+   attach to it, not start a second copy of the same download. */
+const ACTIVE_STATUSES = new Set(['queued', 'fetching', 'uploading', 'awaiting-upload', 'compressing', 'hosting']);
+
+/**
+ * A stable identity for "the same video".
+ *
+ * A signed fileditch link is a new URL every half hour, so the URL cannot be
+ * the identity — the path behind it can. Everything else falls back to the
+ * normalised link (a direct file, or the page the file was picked from).
+ */
+function reuseKey({ url, ref, name }) {
+  const filePath = ref && typeof ref.path === 'string' ? ref.path.trim().replace(/^\/+/, '') : '';
+  if (filePath) return `path:${filePath}`;
+  /* A folder page can hold several videos, so the page alone is not the file:
+     the name the picker offered is. Two files from one gofile folder must not
+     be mistaken for each other. */
+  const page = jobUrl(url);
+  if (page) return `page:${page}|${String(name || '').toLowerCase()}`;
+  if (ref && ref.url) return `file:${ref.url}`;
+  return null;
+}
+
+function jobUrl(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(String(value));
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * The unfinished job for this video, if there is one.
+ *
+ * The two failures this prevents are the ones a crash actually causes: the same
+ * link pasted twice runs two encoders over one file, and the same link pasted
+ * after a restart throws away gigabytes that were already on disk.
+ */
+function findReusable({ url, ref, name, presetId, targetMb, noCompress }) {
+  const key = reuseKey({ url, ref, name });
+  if (!key) return null;
+  for (const job of jobsStore.listJobs()) {
+    if (!job || !job.dir) continue;
+    /* A finished job is a result, not work: asking for the same video again
+       with the same settings is a legitimate new request. */
+    if (['done', 'hosted'].includes(job.status)) continue;
+    if (String(job.presetId || 'balanced') !== presetId) continue;
+    if ((Number(job.targetMb) || null) !== (targetMb || null)) continue;
+    if (Boolean(job.noCompress) !== Boolean(noCompress)) continue;
+    if (reuseKey({ url: job.url, ref: job.ref, name: job.name }) !== key) continue;
+    return job;
+  }
+  return null;
+}
+
+/**
+ * Take an old job over rather than starting from zero.
+ *
+ * Returns 'running' when the job never stopped, 'resumed' when it was picked up
+ * again, and null when there is nothing worth keeping on disk (a link that
+ * failed before a single byte arrived).
+ */
+async function adoptJob(job, ref) {
+  if (ACTIVE_STATUSES.has(job.status)) return 'running';
+
+  const paths = jobsStore.jobPaths(job);
+  const bytes = fs.existsSync(paths.source) ? fs.statSync(paths.source).size : 0;
+  const parts = await segments.read(job.dir).catch(() => null);
+  const keptParts = parts && Array.isArray(parts.done) ? parts.done.length : 0;
+  if (!bytes && !keptParts) return null;
+
+  jobsStore.updateJob(job, {
+    status: 'queued',
+    stage: bytes
+      ? 'Picking up the earlier run — the download is still on disk'
+      : `Picking up the earlier run — ${keptParts} part(s) already encoded`,
+    progress: 0,
+    error: null,
+    errorCode: null,
+    interrupted: false,
+    resumed: true,
+  });
+  job.resumed = true;
+  console.log(
+    `[job ${job.id}] the same link was sent again — continuing it ` +
+      `(${bytes ? `${formatSize(bytes)} downloaded` : 'no source yet'}, ${keptParts} part(s) kept)`,
+  );
+  /* fetchThenCompress skips the transfer when the whole file is already here,
+     resumes it from the fragment when it is not, and hands over to the encoder
+     — which reuses the parts that were finished. */
+  fetchThenCompress(job, ref || job.ref);
+  return 'resumed';
+}
+
+/**
+ * What is actually behind this link?
+ *
+ * A file host answers in a second. A page behind a bot check does not: the HTML
+ * needs a browser, the page's player has to be allowed to run, and the playlist
+ * it names lives on another host that may want its own visit. Tens of seconds,
+ * sometimes two minutes — and a request that waits that long is answered by the
+ * host's proxy with a 504, *not* by this app. The job the person asked for was
+ * never created, so "Request failed (504)" is what they saw instead of a video.
+ *
+ * This is why the answer is planned here and awaited with a deadline by both
+ * callers: the job endpoint creates the job first and lets this finish
+ * underneath it, and the picker endpoint says "still reading" instead of dying.
+ */
+async function planUrlJob(url) {
+  // 1. A known share host or an obvious file URL resolves on its own.
+  let resolved = await resolve(url, { allowPage: false });
+  resolved = await fileBehindUrl(url, resolved);
+
+  // 2. Otherwise ask the host what it is: a video file, or a page to scrape?
+  if (!resolved) {
+    if (sources.isBlockedHost(url)) {
+      throw Object.assign(new Error('That address is not allowed.'), { code: 'BLOCKED_HOST' });
+    }
+    const remote = await sources.probeRemote(url);
+
+    if (remote.reachable && !remote.isHtml) {
+      let name = 'video';
+      try {
+        name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'video');
+      } catch {
+        /* keep default */
+      }
+      resolved = {
+        resolver: 'direct',
+        title: null,
+        files: [
+          {
+            name,
+            size: remote.contentLength || 0,
+            mime: remote.contentType || '',
+            kind: 'video',
+            ref: { resolver: 'direct', url, name },
+          },
+        ],
+      };
+    } else if (remote.isHtml) {
+      try {
+        resolved = await resolveLinkOnce(url);
+      } catch (err) {
+        throw err;
+      }
+    } else {
+      // The server cannot even reach it: a real browser may still be able to.
+      try {
+        const browser = require('./browser');
+        if (browser.available()) {
+          const captured = await browser.captureMedia(url);
+          const media = (captured && captured.media) || [];
+          if (media.length) {
+            resolved = {
+              resolver: 'browser',
+              title: null,
+              files: media.slice(0, 12).map((item, index) => {
+                let name = `video-${index + 1}.mp4`;
+                try {
+                  const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
+                  if (last) name = last;
+                } catch {
+                  /* keep default */
+                }
+                return {
+                  id: item.url,
+                  name,
+                  size: Number(item.size) || 0,
+                  mime: item.contentType || '',
+                  kind: 'video',
+                  ref: { resolver: 'direct', url: item.url, name },
+                };
+              }),
+            };
+          }
+        }
+      } catch {
+        /* fall through to the browser relay */
+      }
+      if (!resolved) {
+        throw Object.assign(
+          new Error('This server cannot reach that host. Retrying through your browser instead.'),
+          { code: 'NEED_BROWSER' },
+        );
+      }
+    }
+  }
+
+  const file = resolved.files.find((f) => f.kind === 'video') || resolved.files[0];
+  if (!file) {
+    throw Object.assign(new Error('No video was found behind that link.'), { code: 'NO_VIDEO_FOUND' });
+  }
+  return { file, resolved };
+
+}
+
+/**
+ * Finish reading a link into a job that already exists, then run it.
+ *
+ * Used twice: by the job endpoint when the page was too slow to wait for, and
+ * at startup for a job that was still being read when the machine stopped.
+ * Nothing has been downloaded at this point, so a second attempt costs a page
+ * read, not gigabytes.
+ */
+function readLinkIntoJob(job) {
+  return planUrlJob(job.url)
+    .then(({ file, resolved }) => {
+      jobsStore.updateJob(job, {
+        ref: file.ref,
+        name: job.name || file.name,
+        sourceTitle: resolved.pageTitle || null,
+        resolving: false,
+      });
+      return fetchThenCompress(job, file.ref);
+    })
+    .catch((err) => {
+      jobsStore.updateJob(job, { resolving: false });
+      return reportJobError(job, err);
+    });
+}
+
+app.post('/api/jobs', async (req, res) => {
+  const body = req.body || {};
+  const source = body.source || 'url';
+  const presetId = String(body.presetId || 'balanced');
+  const targetMb = Number(body.targetMb) > 0 ? Number(body.targetMb) : null;
+  const noCompress = Boolean(body.noCompress);
+  const hostOrder = Array.isArray(body.hostOrder)
+    ? body.hostOrder.map((id) => String(id).toLowerCase()).filter((id) => hosters.PROVIDERS[id])
+    : [];
+
+  if (source === 'ref') {
+    const ref = body.ref;
+    if (!ref || typeof ref !== 'object' || !ALLOWED_REF_RESOLVERS.has(String(ref.resolver))) {
+      return fail(res, 400, 'BAD_REF', 'That file reference is not valid.');
+    }
+    const pageUrl = body.pageUrl ? String(body.pageUrl) : null;
+    const revisit = findReusable({
+      url: pageUrl,
+      ref,
+      name: body.name || ref.name,
+      presetId,
+      targetMb,
+      noCompress,
+    });
+    if (revisit) {
+      const how = await adoptJob(revisit, ref);
+      if (how) return res.status(200).json({ job: jobsStore.publicView(revisit), reused: how });
+    }
+    const job = jobsStore.createJob({
+      source: 'link',
+      url: pageUrl,
+      presetId,
+      targetMb,
+      noCompress,
+      name: body.name,
+      ref,
+      hostOrder,
+      sourceTitle: body.sourceTitle ? String(body.sourceTitle).slice(0, 180) : null,
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+    fetchThenCompress(job, ref);
+    return undefined;
+  }
+
+  if (source === 'sample') {
+    const job = jobsStore.createJob({ source: 'sample', name: 'squeeze-sample', presetId, targetMb, noCompress });
+    const paths = jobsStore.jobPaths(job);
+    ensureSample()
+      .then((samplePath) => fsp.copyFile(samplePath, paths.source))
+      .then(() => {
+        const size = fs.statSync(paths.source).size;
+        jobsStore.updateJob(job, { sourceBytes: size });
+        startCompression(job);
+      })
+      .catch((err) => reportJobError(job, err));
+    return res.status(201).json({ job: jobsStore.publicView(job) });
+  }
+
+  if (source !== 'url') return fail(res, 400, 'BAD_SOURCE', 'Unknown job source.');
+
+  const url = sources.normalizeUrl(body.url);
+  if (!url) return fail(res, 400, 'BAD_URL', 'That does not look like a valid link.');
+
+  const platform = sources.platformFor(url);
+
+  // Platform links (YouTube, TikTok, …) need yt-dlp on the server.
+  if (platform) {
+    const ytdlp = await sources.hasYtdlp();
+    if (!ytdlp) {
+      return fail(
+        res,
+        409,
+        'NEED_BROWSER',
+        'This server cannot extract platform links. Retrying through your browser instead.',
+      );
+    }
+    const job = jobsStore.createJob({ source: 'ytdlp', url, presetId, targetMb, name: body.name, hostOrder, noCompress });
+    jobsStore.updateJob(job, { status: 'fetching', stage: 'Downloading from the platform' });
+    sources
+      .downloadPlatform(url, job.dir, {
+        onProgress: (p) => jobsStore.updateJob(job, { progress: p, stage: 'Downloading from the platform' }),
+      })
+      .then(() => {
+        jobsStore.updateJob(job, { progress: 0 });
+        startCompression(job);
+      })
+      .catch((err) => {
+        if (err.code === 'NO_VIDEO' || err.code === 'BAD_MEDIA') return;
+        reportJobError(job, err);
+      });
+    return res.status(201).json({ job: jobsStore.publicView(job) });
+  }
+
+  /* Read the link, but never make the browser wait for it.
+   *
+   * A file host answers in a second; missav takes a minute and a half, because
+   * the HTML needs a browser, the player has to run, and the playlist lives on
+   * another CDN that wants its own visit. `POST /api/jobs` used to await all of
+   * that before it created anything — so the host's proxy answered 504 first,
+   * the page said "Request failed (504)", and the job appeared afterwards from
+   * underneath a request that had already failed. That is the report.
+   *
+   * Now the job exists after a few seconds either way: a fast link resolves
+   * before the answer and behaves exactly as it always did, and a slow one gets
+   * a card straight away whose stage says what it is doing. The work continues
+   * whether or not anyone is still listening. */
+  const planned = planUrlJob(url).then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  const first = await Promise.race([planned, wait(Number(process.env.RESOLVE_WAIT_MS) || 7000).then(() => null)]);
+
+  if (first && first.error) {
+    const err = first.error;
+    const status = err.code === 'BAD_URL' || err.code === 'BLOCKED_HOST' ? 400 : 422;
+    return fail(res, status, err.code || 'RESOLVE_FAILED', err.message || 'Could not read that link.');
+  }
+
+  if (first) {
+    const { file, resolved } = first.value;
+
+    /* The same link, sent again — after a crash, or from a second tab. Continue
+       the job that is already holding this video instead of downloading and
+       encoding it a second time. */
+    const revisit = findReusable({
+      url,
+      ref: file.ref,
+      name: body.name || file.name,
+      presetId,
+      targetMb,
+      noCompress,
+    });
+    if (revisit) {
+      const how = await adoptJob(revisit, file.ref);
+      if (how) return res.status(200).json({ job: jobsStore.publicView(revisit), reused: how });
+    }
+
+    const job = jobsStore.createJob({
+      source: 'url',
+      url,
+      hostOrder,
+      presetId,
+      targetMb,
+      noCompress,
+      name: body.name || file.name,
+      ref: file.ref,
+      /* What a browser tab shows for the *link* — the page's own <title>, not
+         the name of the file that comes out of it. */
+      sourceTitle: resolved.pageTitle || null,
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+    fetchThenCompress(job, file.ref);
+    return undefined;
+  }
+
+  /* Still reading. The same link queued twice must still be one job, and the
+     ref is not known yet — the page is. */
+  const early = findReusable({
+    url,
+    ref: null,
+    name: body.name || '',
+    presetId,
+    targetMb,
+    noCompress,
+  });
+  if (early && ACTIVE_STATUSES.has(early.status) && !early.ref) {
+    return res.status(200).json({ job: jobsStore.publicView(early), reused: 'running' });
+  }
+
+  const job = jobsStore.createJob({
+    source: 'url',
+    url,
+    hostOrder,
+    presetId,
+    targetMb,
+    noCompress,
+    name: body.name || null,
+  });
+  jobsStore.updateJob(job, {
+    stage: 'Reading the link — this page takes a browser, so give it a minute',
+    resolving: true,
+  });
+  res.status(201).json({ job: jobsStore.publicView(job) });
+
+  /* The read is already in flight: attaching to it here would race the same
+     promise twice, so the job simply continues from the plan this request
+     started. */
+  planned.then(({ value, error }) => {
+    if (error) {
+      jobsStore.updateJob(job, { resolving: false });
+      return reportJobError(job, error);
+    }
+    const { file, resolved } = value;
+    jobsStore.updateJob(job, {
+      ref: file.ref,
+      name: job.name || file.name,
+      sourceTitle: resolved.pageTitle || null,
+      resolving: false,
+    });
+    return fetchThenCompress(job, file.ref);
+  });
+  return undefined;
+});
+
+
+
+/**
+ * A ".mp4" URL is only a file if it answers like one. Hotlink-protected hosts
+ * (fileditch among them) answer with an HTML challenge, which used to fail the
+ * job after the download had already started. Try the page path instead, then a
+ * real browser, before giving up.
+ */
+async function fileBehindUrl(url, resolved) {
+  if (!resolved || !resolved.files || !resolved.files.length) return resolved;
+  if (resolved.resolver !== 'direct') return resolved;
+  const remote = await sources.probeRemote(url);
+  if (!remote.reachable || !remote.isHtml) return resolved;
+  try {
+    /* The memoised read: a page that only answers slowly must not be read
+       twice for one request — once to find the file it names, once to check
+       that the file *is* a page. */
+    const viaPage = await resolveLinkOnce(url);
+    if (viaPage && viaPage.files && viaPage.files.length) return viaPage;
+  } catch {
+    /* fall through to the browser */
+  }
+  try {
+    const browser = require('./browser');
+    if (browser.available()) {
+      const captured = await browser.captureMedia(url);
+      const media = (captured && captured.media) || [];
+      if (media.length) {
+        return {
+          resolver: 'browser',
+          title: null,
+          files: media.slice(0, 12).map((item, index) => {
+            let name = `video-${index + 1}.mp4`;
+            try {
+              const last = decodeURIComponent(new URL(item.url).pathname.split('/').filter(Boolean).pop() || '');
+              if (last) name = last;
+            } catch {
+              /* keep default */
+            }
+            return {
+              id: item.url,
+              name,
+              size: Number(item.size) || 0,
+              mime: item.contentType || '',
+              kind: 'video',
+              ref: { resolver: 'direct', url: item.url, name },
+            };
+          }),
+        };
+      }
+    }
+  } catch {
+    /* nothing more to try */
+  }
+  return resolved;
+}
+
+/* ------------------------------------------------- chunked / resumable upload */
+
+/**
+ * A multi-GB video cannot be pushed as one request through every proxy, and a
+ * dropped connection should not lose the whole transfer. Uploads are therefore
+ * split into fixed-size chunks appended to a temp file, then finished in one call.
+ */
+const CHUNK_SIZE = 8 * 1024 * 1024;
+const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000;
+
+/** uploadId -> { dir, metaPath, blobPath, meta } held in memory while active. */
+const uploads = new Map();
+
+function uploadDirFor(id) {
+  return path.join(jobsStore.UPLOADS_DIR, id);
+}
+
+async function writeMeta(entry) {
+  await fsp.writeFile(entry.metaPath, JSON.stringify(entry.meta));
+}
+
+app.post('/api/upload/init', async (req, res) => {
+  const body = req.body || {};
+  const size = Number(body.size) || 0;
+  if (size > MAX_UPLOAD_BYTES) {
+    return fail(res, 413, 'TOO_BIG', `Files up to ${MAX_UPLOAD_MB} MB are supported.`);
+  }
+  let free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  if (size && size * 1.5 > free) {
+    // Old finished files are already on a host: their links survive without them.
+    free = (await reclaimSpace(size * 1.5)).free;
+  }
+  if (size && size * 1.5 > free) {
+    return fail(res, 507, 'NO_DISK', 'This server does not have enough free disk space for that file.');
+  }
+
+  const id = crypto.randomBytes(18).toString('base64url');
+  const dir = uploadDirFor(id);
+  await fsp.mkdir(dir, { recursive: true });
+
+  const entry = {
+    dir,
+    metaPath: path.join(dir, 'meta.json'),
+    blobPath: path.join(dir, 'blob.part'),
+    meta: {
+      id,
+      filename: String(body.filename || 'video').slice(0, 200),
+      size,
+      presetId: String(body.presetId || 'balanced'),
+      targetMb: Number(body.targetMb) > 0 ? Number(body.targetMb) : null,
+      noCompress: Boolean(body.noCompress),
+      url: body.url ? String(body.url).slice(0, 2000) : null,
+      chunks: 0,
+      createdAt: Date.now(),
+    },
+  };
+  await fsp.writeFile(entry.blobPath, '');
+  await writeMeta(entry);
+  uploads.set(id, entry);
+
+  res.status(201).json({ uploadId: id, chunkSize: CHUNK_SIZE });
+});
+
+function liveUpload(id) {
+  const entry = uploads.get(id);
+  if (!entry) return null;
+  if (Date.now() - entry.meta.createdAt > UPLOAD_TTL_MS) {
+    uploads.delete(id);
+    fsp.rm(uploadDirFor(id), { recursive: true, force: true }).catch(() => {});
+    return null;
+  }
+  return entry;
+}
+
+app.get('/api/upload/status/:id', (req, res) => {
+  const entry = liveUpload(req.params.id);
+  if (!entry) return fail(res, 410, 'UPLOAD_EXPIRED', 'That upload expired. Start again.');
+  res.json({ chunks: entry.meta.chunks, chunkSize: CHUNK_SIZE });
+});
+
+app.put('/api/upload/chunk/:id/:index', async (req, res) => {
+  const entry = liveUpload(req.params.id);
+  if (!entry) return fail(res, 410, 'UPLOAD_EXPIRED', 'That upload expired. Start again.');
+
+  const index = Number(req.params.index);
+  if (!Number.isInteger(index) || index < 0) return fail(res, 400, 'BAD_CHUNK', 'Invalid chunk index.');
+  if (index > entry.meta.chunks) {
+    return fail(res, 409, 'OUT_OF_ORDER', `Chunk ${entry.meta.chunks} expected, got ${index}.`);
+  }
+  if (index < entry.meta.chunks) {
+    // Re-sent chunk after a retry: treat as already stored.
+    return res.json({ chunks: entry.meta.chunks, skipped: true });
+  }
+
+  const sizeBefore = (await fsp.stat(entry.blobPath)).size;
+  try {
+    await pipeline(req, fs.createWriteStream(entry.blobPath, { flags: 'a' }));
+  } catch {
+    return fail(res, 400, 'CHUNK_FAILED', 'That chunk did not arrive completely.');
+  }
+
+  const sizeAfter = (await fsp.stat(entry.blobPath)).size;
+  if (sizeAfter > MAX_UPLOAD_BYTES) {
+    uploads.delete(entry.meta.id);
+    await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+    return fail(res, 413, 'TOO_BIG', `Files up to ${MAX_UPLOAD_MB} MB are supported.`);
+  }
+  if (sizeAfter === sizeBefore) return fail(res, 400, 'EMPTY_CHUNK', 'That chunk was empty.');
+
+  entry.meta.chunks = index + 1;
+  await writeMeta(entry);
+  res.json({ chunks: entry.meta.chunks, bytes: sizeAfter });
+});
+
+app.post('/api/upload/finish/:id', async (req, res) => {
+  const entry = liveUpload(req.params.id);
+  if (!entry) return fail(res, 410, 'UPLOAD_EXPIRED', 'That upload expired. Start again.');
+
+  try {
+    const stat = await fsp.stat(entry.blobPath);
+    if (!stat.size) throw Object.assign(new Error('No data was received.'), { code: 'EMPTY' });
+    if (entry.meta.size && stat.size < entry.meta.size * 0.98) {
+      return fail(res, 400, 'INCOMPLETE', `Only ${stat.size} of ${entry.meta.size} bytes arrived.`);
+    }
+
+    const tmp = path.join(jobsStore.TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.part`);
+    await fsp.rename(entry.blobPath, tmp);
+    uploads.delete(entry.meta.id);
+    await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+
+    const job = await adoptUpload(tmp, {
+      source: 'relay',
+      name: entry.meta.filename,
+      url: entry.meta.url,
+      presetId: entry.meta.presetId,
+      targetMb: entry.meta.targetMb,
+      noCompress: entry.meta.noCompress,
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+  } catch (err) {
+    await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+    uploads.delete(entry.meta.id);
+    if (err.code === 'NO_VIDEO' || err.code === 'INVALID_MEDIA') {
+      return fail(
+        res,
+        415,
+        'NO_VIDEO',
+        `That file is not a video this server can read.${err.advice ? ` ${err.advice}` : ''}`,
+      );
+    }
+    if (err.code === 'TOO_BIG') return fail(res, 413, 'TOO_BIG', err.message);
+    return fail(res, 400, 'UPLOAD_FAILED', err.message);
+  }
+});
+
+/** Upload straight from the browser (drag & drop). */
+app.post('/api/upload', async (req, res) => {
+  const tmp = path.join(jobsStore.TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.part`);
+  try {
+    await saveRequestToFile(req, tmp);
+    const presets = req.query.presetId ? String(req.query.presetId) : 'balanced';
+    const job = await adoptUpload(tmp, {
+      source: 'upload',
+      name: req.query.name ? String(req.query.name) : null,
+      presetId: presets,
+      targetMb: Number(req.query.targetMb) > 0 ? Number(req.query.targetMb) : null,
+      noCompress: req.query.noCompress === '1' || req.query.noCompress === 'true',
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+  } catch (err) {
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+    if (err.code === 'TOO_BIG') return fail(res, 413, 'TOO_BIG', err.message);
+    if (err.code === 'NO_VIDEO') return fail(res, 415, 'NO_VIDEO', 'That file does not contain a video track.');
+    if (err.code === 'INVALID_MEDIA') {
+      return fail(
+        res,
+        415,
+        'INVALID_MEDIA',
+        `That file is not a video this server can read.${err.advice ? ` ${err.advice}` : ''}`,
+      );
+    }
+    return fail(res, 400, 'UPLOAD_FAILED', err.message);
+  }
+});
+
+/**
+ * Browser relay: the browser fetched the video itself (it can reach hosts this
+ * server cannot) and streams the bytes here for compression.
+ */
+app.put('/api/relay/:token', async (req, res) => {
+  const token = req.params.token;
+  if (!validRelayToken(token)) return fail(res, 410, 'TOKEN_EXPIRED', 'This transfer link expired. Try again.');
+  relayTokens.delete(token);
+
+  const tmp = path.join(jobsStore.TMP_DIR, `${crypto.randomBytes(8).toString('hex')}.part`);
+  try {
+    const bytes = await saveRequestToFile(req, tmp);
+    if (!bytes) throw Object.assign(new Error('No data was received.'), { code: 'EMPTY' });
+    const job = await adoptUpload(tmp, {
+      source: 'relay',
+      url: req.query.url ? String(req.query.url) : null,
+      name: req.query.filename ? String(req.query.filename) : null,
+      presetId: req.query.presetId ? String(req.query.presetId) : 'balanced',
+      targetMb: Number(req.query.targetMb) > 0 ? Number(req.query.targetMb) : null,
+    });
+    res.status(201).json({ job: jobsStore.publicView(job) });
+  } catch (err) {
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+    if (err.code === 'TOO_BIG') return fail(res, 413, 'TOO_BIG', err.message);
+    if (err.code === 'NO_VIDEO' || err.code === 'INVALID_MEDIA') {
+      return fail(res, 415, 'NO_VIDEO', 'That link did not download as a playable video file.');
+    }
+    return fail(res, 400, 'RELAY_FAILED', err.message);
+  }
+});
+
+/** Recent jobs, newest first — the "start it and walk away" list. */
+app.get('/api/jobs', (req, res) => {
+  const jobs = jobsStore.listJobs().slice(0, 50).map((job) => jobsStore.publicView(job));
+  res.json({ jobs });
+});
+
+app.get('/api/hosters', (req, res) => {
+  res.json({
+    server: hosters.describeProviders(),
+    browser: ['gofile', 'pixeldrain'],
+    autoHost: AUTO_HOST,
+  });
+});
+
+/** Upload the finished file to a free host and return the share link. */
+app.post('/api/jobs/:id/host', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  if (!['done', 'hosted'].includes(job.status)) {
+    return fail(res, 409, 'NOT_READY', 'That file is not ready yet.');
+  }
+  if (job.status === 'hosted' && job.hostedUrl && !req.body?.force) {
+    return res.json({ job: jobsStore.publicView(job) });
+  }
+
+  const order = Array.isArray(req.body?.order)
+    ? req.body.order.filter((id) => hosters.PROVIDERS[id])
+    : undefined;
+
+  // Run in the background so a slow upload cannot hold the request open; the
+  // UI follows /api/jobs/:id/events for progress.
+  res.status(202).json({ job: jobsStore.publicView(job) });
+  hostJob(job, { order }).catch(() => {});
+  return undefined;
+});
+
+/** Record a link the browser obtained itself (used when the server has no network). */
+app.post('/api/jobs/:id/hosted', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+
+  const url = String(req.body?.url || '').trim();
+  const provider = String(req.body?.provider || 'browser').slice(0, 40);
+  if (!/^https?:\/\/[^\s]+$/i.test(url) || url.length > 2000) {
+    return fail(res, 400, 'BAD_URL', 'That share link is not valid.');
+  }
+
+  jobsStore.updateJob(job, {
+    status: 'hosted',
+    stage: 'Link ready',
+    hostedUrl: url,
+    hostProvider: provider,
+    hostedBy: 'browser',
+    hostError: null,
+    hostedAt: Date.now(),
+    progress: 1,
+  });
+  writeResultsFile();
+  persistHostedLink(job, url, provider).catch(() => {});
+  queueEarlyPost(job);
+  res.json({ job: jobsStore.publicView(job) });
+});
+
+app.get('/api/jobs/:id', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  res.json({ job: jobsStore.publicView(job) });
+});
+
+/** Live progress stream. */
+app.get('/api/jobs/:id/events', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write('retry: 2000\n\n');
+
+  const send = (j) => {
+    if (j.id !== job.id) return;
+    res.write(`data: ${JSON.stringify(jobsStore.publicView(j))}\n\n`);
+  };
+  send(job);
+
+  const onUpdate = (j) => {
+    if (j.id !== job.id) return;
+    send(j);
+    if (j.status === 'done' || j.status === 'error') cleanup();
+  };
+  const cleanup = () => {
+    jobsStore.bus.off('update', onUpdate);
+    clearInterval(ping);
+    res.end();
+  };
+  const ping = setInterval(() => res.write(': ping\n\n'), 15000);
+
+  jobsStore.bus.on('update', onUpdate);
+  req.on('close', cleanup);
+});
+
+app.get('/api/jobs/:id/thumb', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'Not found.');
+  const { thumb } = jobsStore.jobPaths(job);
+  if (!fs.existsSync(thumb)) return fail(res, 404, 'NO_THUMB', 'No preview yet.');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.sendFile(thumb);
+});
+
+const CONTENT_TYPES = {
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
+  '.ts': 'video/mp2t',
+};
+const contentTypeFor = (name) => CONTENT_TYPES[path.extname(String(name)).toLowerCase()] || 'video/mp4';
+
+/**
+ * A Content-Disposition that survives a real file name.
+ *
+ * `filename` is the plain ASCII fallback; `filename*` carries the UTF-8 name, so
+ * "Vidéo d'été.mp4" arrives with its accents instead of turning into an
+ * underscore soup — and a quote or a newline in a name cannot break the header.
+ */
+const rfc5987 = (value) =>
+  encodeURIComponent(String(value)).replace(
+    /['()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+
+function dispositionFor(kind, name) {
+  const clean = String(name || 'video.mp4').replace(/[\r\n]/g, ' ');
+  const fallback = clean.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return `${kind}; filename="${fallback}"; filename*=UTF-8''${rfc5987(clean)}`;
+}
+
+function serveOutput(req, res, disposition) {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  const { output } = jobsStore.jobPaths(job);
+  /* The file was here and was deleted on purpose: the bytes are on the host,
+     which is the point of the disk policy. Say that instead of "not ready". */
+  if (job.localDeleted || (['done', 'hosted'].includes(job.status) && !fs.existsSync(output))) {
+    if (job.hostedUrl) {
+      return fail(
+        res,
+        410,
+        'DELETED_AFTER_UPLOAD',
+        `The local copy was deleted to free space — the file is on ${job.hostProvider || 'the host'}: ${job.hostedUrl}`,
+      );
+    }
+    return fail(res, 410, 'GONE', 'The local copy of this file is gone.');
+  }
+  if (!['done', 'hosting', 'hosted'].includes(job.status) || !fs.existsSync(output)) {
+    return fail(res, 409, 'NOT_READY', 'This file is not ready yet.');
+  }
+  res.sendFile(
+    output,
+    {
+      headers: {
+        'Content-Type': /\.[a-z0-9]+$/i.test(job.outputName || '')
+          ? contentTypeFor(job.outputName)
+          : 'video/mp4',
+        'Content-Disposition': dispositionFor(disposition, job.outputName || job.name),
+      },
+    },
+    (err) => {
+      if (err && !res.headersSent) fail(res, 500, 'SEND_FAILED', 'Could not send the file.');
+    },
+  );
+}
+
+/* ------------------------------------------------------------------ results */
+/* Everything that finished, in one place, so the links survive the machine:
+   they are also written to data/results.txt on every completion. */
+
+/** Best-effort finish time: jobs carry createdAt, and the ledger keeps the rest. */
+function jobFinishedAt(view) {
+  return view.createdAt || null;
+}
+
+/** Keep a copy of the share links on disk, so they survive a stopped machine. */
+async function writeResultsFile() {
+  try {
+    const lines = finishedJobs()
+      .filter((view) => view.hostedUrl)
+      .map((view) => `${view.hostedUrl}\t${view.outputName || view.name || view.id}`);
+    await fsp.writeFile(path.join(jobsStore.DATA_DIR, 'results.txt'), lines.length ? `${lines.join('\n')}\n` : '');
+  } catch {
+    /* the results endpoint still works without the file */
+  }
+}
+
+function finishedJobs() {
+  return jobsStore
+    .listJobs()
+    .filter((job) => job.status === 'done' || job.status === 'hosted' || job.error)
+    .map((job) => jobsStore.publicView(job))
+    .filter((view) => view.status === 'done' || view.status === 'hosted');
+}
+
+/**
+ * Every share link ever produced, newest first.
+ *
+ * Job records are pruned; the ledger is not. This is what the user sees after
+ * closing the tab, restarting the Codespace, or coming back the next morning.
+ */
+async function allLinks() {
+  const [saved, live] = await Promise.all([ledger.list(), Promise.resolve(finishedJobs())]);
+  const byUrl = new Map();
+  for (const entry of saved) byUrl.set(entry.url, { ...entry, live: false });
+  for (const view of live) {
+    if (!view.hostedUrl) continue;
+    const existing = byUrl.get(view.hostedUrl);
+    byUrl.set(view.hostedUrl, {
+      ...(existing || {}),
+      at: existing?.at || new Date(jobFinishedAt(view) || Date.now()).toISOString(),
+      jobId: view.id,
+      provider: view.hostProvider,
+      url: view.hostedUrl,
+      name: view.outputName || view.name || null,
+      sourceBytes: view.sourceBytes ?? existing?.sourceBytes ?? null,
+      outputBytes: view.outputBytes ?? existing?.outputBytes ?? null,
+      live: view.hasFile === true,
+      saved: view.saved ?? null,
+      usedOriginal: Boolean(view.usedOriginal),
+    });
+  }
+  return [...byUrl.values()].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+}
+
+app.get('/api/links', async (req, res) => {
+  res.json({ links: await allLinks() });
+});
+
+/**
+ * Mail the links. Without SMTP configured this answers with a mailto: URL
+ * instead of failing — a machine with no credentials can still get the links
+ * out, the user's own mail client just does the sending.
+ */
+app.post('/api/links/email', async (req, res) => {
+  const to = String(req.body?.to || '').trim() || undefined;
+  if (to && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) {
+    return fail(res, 400, 'BAD_EMAIL', 'That does not look like an email address.');
+  }
+  const result = await emailLinks({ to, force: true, reason: 'Sent from the app.' });
+  if (result.sent) return res.json({ ok: true, ...result });
+  if (result.needsConfig) {
+    return res.status(200).json({
+      ok: false,
+      ...result,
+      settings: mailsettings.describe(),
+      hint: 'Fill in the mail panel once — the password is saved on this machine and works on every run.',
+    });
+  }
+  return res.status(502).json({ ok: false, error: result.error || 'The mail could not be sent.' });
+});
+
+/* ------------------------------------------------------- mail setup (one time) */
+/* The settings live in data/mail.json, so they are typed once and are still
+   there after a restart, a rebuilt Codespace or a fresh shell. */
+
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+app.get('/api/email/settings', (req, res) => {
+  res.json({ settings: mailsettings.describe() });
+});
+
+app.post('/api/email/settings', async (req, res) => {
+  const body = req.body || {};
+  if (body.to != null && body.to !== '' && !EMAIL_RE.test(String(body.to).trim())) {
+    return fail(res, 400, 'BAD_EMAIL', 'That does not look like an email address.');
+  }
+  const host = String(body.host || '').trim();
+  /* The form names a server to connect to, which is a way to probe this box's
+     network. Same guard as the downloader: no loopback or metadata address
+     unless the operator opted in. */
+  if (host && sources.isBlockedHost(`http://${host}:${Number(body.port) || 587}`)) {
+    return fail(res, 400, 'BLOCKED_HOST', 'That mail server address is not allowed.');
+  }
+  try {
+    const settings = await mailsettings.save({
+      host,
+      port: body.port,
+      secure: body.secure,
+      user: body.user,
+      pass: body.pass,
+      from: body.from,
+      to: body.to,
+    });
+    console.log(`[email] settings saved for ${settings.host} — links go to ${settings.to}`);
+    res.json({ ok: true, settings });
+  } catch (err) {
+    return fail(res, 400, 'BAD_SETTINGS', err.message);
+  }
+});
+
+app.delete('/api/email/settings', async (req, res) => {
+  const settings = await mailsettings.forget();
+  res.json({ ok: true, settings });
+});
+
+app.post('/api/email/test', async (req, res) => {
+  const to = String(req.body?.to || '').trim() || undefined;
+  if (to && !EMAIL_RE.test(to)) return fail(res, 400, 'BAD_EMAIL', 'That does not look like an email address.');
+  if (!notify.configured()) {
+    return res.status(400).json({
+      ok: false,
+      needsConfig: true,
+      error: 'Mail is not set up yet — fill in the mail server first.',
+      settings: mailsettings.describe(),
+    });
+  }
+  try {
+    await notify.sendMail({
+      to,
+      subject: 'Squeeze: mail is working',
+      text: [
+        'This is a test from Squeeze.',
+        '',
+        'If you can read this, share links will reach this address on their own —',
+        'including when the machine finishes and switches itself off.',
+      ].join('\n'),
+    });
+    res.json({ ok: true, to: to || notify.defaultTo() });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err.message });
+  }
+});
+
+/* ------------------------------------------------- where the links go (cheap) */
+/* No SMTP needed: a gist, a webhook, a phone notification, or a paste. */
+
+app.get('/api/publish', async (req, res) => {
+  res.json({ publish: await publish.describe() });
+});
+
+app.post('/api/links/publish', async (req, res) => {
+  const result = await publishLinks({ reason: 'Posted from the app.' });
+  if (result.ok) return res.json({ ok: true, ...result });
+  const code = result.reason === 'nothing-to-publish' ? 200 : 502;
+  return res.status(code).json({ ok: false, ...result, publish: await publish.describe() });
+});
+
+app.get('/api/publish/settings', async (req, res) => {
+  res.json({ settings: publish.publishsettings.describe(), publish: await publish.describe() });
+});
+
+/* Save the webhook / ntfy topic once, from the page. The value is a credential
+   and is never returned. */
+app.post('/api/publish/settings', async (req, res) => {
+  const body = req.body || {};
+  try {
+    const settings = await publish.publishsettings.save({
+      webhook: body.webhook,
+      ntfy: body.ntfy,
+      paste: body.paste,
+      repo: body.repo,
+    });
+    console.log(`[publish] settings saved — ${settings.hasWebhook ? `${settings.webhookKind || 'webhook'} ` : ''}${settings.ntfy ? `ntfy ${settings.ntfy}` : ''}`.trim());
+    res.json({ ok: true, settings, publish: await publish.describe() });
+  } catch (err) {
+    return fail(res, 400, 'BAD_SETTINGS', err.message);
+  }
+});
+
+app.delete('/api/publish/settings', async (req, res) => {
+  const settings = await publish.publishsettings.forget();
+  res.json({ ok: true, settings, publish: await publish.describe() });
+});
+
+/**
+ * Prove the webhook works *now*, with a sentence rather than a link: if this
+ * arrives in the channel, the rest is wiring that has already been tested.
+ */
+app.post('/api/publish/test', async (req, res) => {
+  const result = await publish.publish(
+    [
+      {
+        name: 'Squeeze test message',
+        url: 'https://github.com/aaqwzsxedc272-svg/download_compress',
+        provider: 'test',
+      },
+    ],
+    { reason: 'This is a test — if you can read it, share links will arrive here on their own.' },
+  );
+  if (result.ok) return res.json({ ok: true, ...result });
+  return res.status(502).json({ ok: false, ...result, publish: await publish.describe() });
+});
+
+app.get('/api/links.txt', async (req, res) => {
+  const text = await ledger.text();
+  res.type('text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', 'inline; filename="squeeze-links.txt"');
+  res.send(text || 'No share links yet.\n');
+});
+
+app.get('/api/results', (req, res) => {
+  res.json({
+    results: finishedJobs().map((view) => ({
+      id: view.id,
+      name: view.outputName || view.name || `video-${view.id}.mp4`,
+      shareUrl: view.hostedUrl || null,
+      provider: view.hostProvider || null,
+      downloadPath: view.hasFile ? view.downloadPath : null,
+      previewPath: view.hasFile ? view.previewPath : null,
+      sourceBytes: view.sourceBytes,
+      outputBytes: view.outputBytes,
+      saved: view.saved,
+      usedOriginal: view.usedOriginal,
+      finishedAt: jobFinishedAt(view),
+    })),
+  });
+});
+
+app.get('/api/results.txt', (req, res) => {
+  const lines = finishedJobs()
+    .filter((view) => view.hostedUrl)
+    .map((view) => `${view.hostedUrl}\t${view.outputName || view.name || view.id}`);
+  res.type('text/plain').send(lines.length ? `${lines.join('\n')}\n` : '');
+});
+
+/* The name is in the URL on purpose: a browser tab, a "Save as" box and a
+   download manager all take the file name from it, so what the page promises
+   is what the browser shows. The bare form still works for old links. */
+app.get('/api/jobs/:id/preview/:name?', (req, res) => serveOutput(req, res, 'inline'));
+app.get('/api/jobs/:id/download/:name?', (req, res) => serveOutput(req, res, 'attachment'));
+
+/**
+ * The untouched download, handed straight to the browser.
+ *
+ * "Just download it" used to only *decide* not to encode: the file then had to
+ * finish downloading and be copied, and the user had to find a second button.
+ * This is the bytes that are already on this machine, sent as they are — which
+ * is all that was ever asked for.
+ */
+app.get('/api/jobs/:id/original/:name?', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  const { source } = jobsStore.jobPaths(job);
+  const name = job.name || 'original.mp4';
+  if (!fs.existsSync(source)) {
+    return fail(res, 409, 'ORIGINAL_NOT_READY', 'Nothing has been downloaded for this file yet.');
+  }
+  if (!jobsStore.publicView(job).originalReady) {
+    const total = Number(job.downloadTotal) || 0;
+    const got = fs.statSync(source).size;
+    return fail(
+      res,
+      409,
+      'ORIGINAL_NOT_READY',
+      total
+        ? `Still downloading — ${formatSize(got)} of ${formatSize(total)} so far. It starts saving on its own when it is complete.`
+        : 'Still downloading — it starts saving on its own when it is complete.',
+    );
+  }
+  res.sendFile(
+    source,
+    {
+      headers: {
+        'Content-Type': contentTypeFor(name),
+        'Content-Disposition': dispositionFor('attachment', name),
+      },
+    },
+    (err) => {
+      if (err && !res.headersSent) fail(res, 500, 'SEND_FAILED', 'Could not send the file.');
+    },
+  );
+});
+
+/**
+ * "Save the original" — the file that was downloaded, handed over now.
+ *
+ * This is deliberately not the same thing as the *Skip the encoder* switch: it
+ * does not touch the encode. Pressing it means "I want the bytes I already
+ * downloaded, and I still want the smaller file you are making" — which is what
+ * people expect from a button that says download.
+ */
+app.post('/api/jobs/:id/save-original', (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+
+  /* Remembered, so the source is not deleted the moment the encode ends: the
+     download starts in a browser and a 2 GB transfer outlives the render. */
+  if (!job.wantOriginal) jobsStore.updateJob(job, { wantOriginal: true });
+
+  const view = jobsStore.publicView(job);
+  const paths = jobsStore.jobPaths(job);
+  /* A finished "just download" job keeps its bytes in the output file. */
+  const originalIsOutput = view.noCompress && ['done', 'hosted'].includes(view.status) && fs.existsSync(paths.output);
+  const gone = ['done', 'hosted'].includes(view.status) && !view.originalReady && !originalIsOutput;
+
+  res.json({
+    ok: true,
+    ready: view.originalReady || originalIsOutput,
+    gone,
+    download: view.originalReady
+      ? `/api/jobs/${job.id}/original/${encodeURIComponent(view.originalName)}`
+      : originalIsOutput
+        ? `/api/jobs/${job.id}/download/${encodeURIComponent(view.outputName || view.name)}`
+        : null,
+    job: view,
+  });
+});
+
+/**
+ * Carry on with a job that failed or was interrupted.
+ *
+ * A failure near the end of a long encode used to take the whole job with it.
+ * The parts and the source are kept now, so this is cheap: the download is not
+ * repeated and the parts already encoded are not encoded again.
+ */
+app.post('/api/jobs/:id/retry', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  if (runningJobs.has(job.id) || jobsStore.isActive(job)) {
+    return fail(res, 409, 'ALREADY_RUNNING', 'That job is already running.');
+  }
+  if (['done', 'hosted'].includes(job.status)) return fail(res, 409, 'ALREADY_DONE', 'That job has already finished.');
+  if (job.status !== 'error') return fail(res, 409, 'NOTHING_TO_RETRY', 'That job has not failed.');
+
+  const paths = jobsStore.jobPaths(job);
+  const sourceBytes = await fsp.stat(paths.source).then((stat) => stat.size).catch(() => 0);
+  const parts = await segments.finishedParts(job.dir, await segments.read(job.dir));
+
+  /* "Try again" on a file that is not a video is not a retry: the source is on
+     disk, unchanged, and the next attempt will fail at the same byte. Three
+     identical failures in a row is what that looks like from the outside, and
+     it teaches the person nothing. Say what the file is instead — unless the
+     download itself was the problem (a web page, a short file), where fetching
+     it again really is the fix. */
+  if (sourceBytes && job.errorCode === 'INVALID_MEDIA') {
+    const whatis = require('./whatis');
+    const found = await whatis.explainFile(paths.source, { expected: Number(job.downloadTotal) || 0 });
+    const redo = whatis.shouldRedownload(found.shape, {
+      bytes: found.shape.bytes,
+      expected: Number(job.downloadTotal) || 0,
+    });
+    if (!redo) {
+      return fail(
+        res,
+        409,
+        'NOT_RETRYABLE',
+        `${job.error || 'That file is not a video this server can read.'} ` +
+          'Trying again would read the same bytes, so the file has to come from somewhere else.',
+      );
+    }
+    /* The bytes on disk are the wrong bytes: start the download over. */
+    await fsp.rm(paths.source, { force: true }).catch(() => {});
+    console.log(`[job ${job.id}] retry: the download was ${found.shape.kind}, fetching it again`);
+  }
+
+  if (!sourceBytes && !parts.size && !job.ref) {
+    return fail(
+      res,
+      409,
+      'NOTHING_TO_RETRY',
+      'Nothing survived from that attempt, so there is nothing to carry on from — paste the link again.',
+    );
+  }
+
+  jobsStore.updateJob(job, {
+    status: 'queued',
+    stage: parts.size
+      ? `Picking it up again — ${parts.size} encoded part(s) were kept`
+      : sourceBytes
+        ? 'Picking it up again — the download is still on disk'
+        : 'Starting again',
+    error: null,
+    interrupted: false,
+    progress: 0,
+    resumed: true,
+  });
+  console.log(
+    `[job ${job.id}] retry requested — ${formatSize(sourceBytes)} of source, ${parts.size} part(s) kept`,
+  );
+
+  if (job.ref && !(sourceBytes > 0)) {
+    /* Nothing on disk: the download has to happen again (it resumes from a
+       fragment when there is one). */
+    fetchThenCompress(job, job.ref);
+  } else {
+    startCompression(job);
+  }
+  return res.json({ ok: true, job: jobsStore.publicView(job) });
+});
+
+/**
+ * "Just download it" for a file that is already here or on its way.
+ *
+ * This is the *stop treating it* switch, and it is deliberately not what the
+ * card's download button calls: wanting the original is not a reason to give up
+ * the smaller file. It stays for links created before the composer toggle
+ * existed, and for anyone driving the API.
+ */
+app.post('/api/jobs/:id/keep-original', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  if (['done', 'hosted', 'hosting'].includes(job.status)) {
+    return fail(
+      res,
+      409,
+      'ALREADY_DONE',
+      'The encode has already finished — the original is not what this job is holding any more.',
+    );
+  }
+  if (job.status === 'error') {
+    return fail(res, 409, 'JOB_FAILED', 'That job already failed. Start it again with “Just download it” switched on.');
+  }
+
+  const was = job.status;
+  job.skipRequested = true;
+  jobsStore.updateJob(job, {
+    noCompress: true,
+    stage: was === 'compressing' ? 'Stopping the encode — the original is kept' : 'The original will be kept',
+  });
+
+  /* Mid-encode: abort ffmpeg. compressJob() turns that into "copy the source",
+     so the seconds already spent are the only thing lost. */
+  if (was === 'compressing' && job.abort) job.abort();
+
+  const view = jobsStore.publicView(job);
+  res.json({ ok: true, was, job: view });
+});
+
+app.delete('/api/jobs/:id', async (req, res) => {
+  const job = jobsStore.getJob(req.params.id);
+  if (!job) return fail(res, 404, 'NOT_FOUND', 'That job no longer exists.');
+  const queuedAt = queue.findIndex((q) => q.id === job.id);
+  if (queuedAt !== -1) queue.splice(queuedAt, 1);
+  if (job.abort) job.abort();
+  await jobsStore.removeJob(req.params.id);
+  res.json({ ok: true });
+});
+
+// Drop half-finished chunked uploads so abandoned transfers do not fill the disk.
+setInterval(async () => {
+  const now = Date.now();
+  for (const [id, entry] of [...uploads]) {
+    if (now - entry.meta.createdAt > UPLOAD_TTL_MS) {
+      uploads.delete(id);
+      await fsp.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  // Also clear files left behind by a previous process.
+  const dirs = await fsp.readdir(jobsStore.UPLOADS_DIR).catch(() => []);
+  for (const name of dirs) {
+    if (uploads.has(name)) continue;
+    const full = uploadDirFor(name);
+    const stat = await fsp.stat(full).catch(() => null);
+    if (stat && now - stat.mtimeMs > UPLOAD_TTL_MS) {
+      await fsp.rm(full, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}, 10 * 60 * 1000).unref();
+
+/* -------------------------------------------------------------------- static */
+
+app.use('/shared', express.static(path.join(__dirname, '..', 'shared')));
+app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['html'] }));
+
+app.get('/j/:id', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'job.html')));
+
+app.get('/diagnostics', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'diagnostics.html')));
+
+app.use((req, res) => {
+  if (req.path.startsWith('/api/')) return fail(res, 404, 'NOT_FOUND', 'Unknown endpoint.');
+  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+});
+
+/* ------------------------------------------------------------------ survival */
+
+/**
+ * A bug in one observer must not end the process, and the process must not hide
+ * that it happened.
+ *
+ * What this is for, concretely: a page listener inside the browser helper threw
+ * a ReferenceError, Playwright's event loop surfaced it as an uncaught
+ * exception, and Node exited — taking with it a running job and the server
+ * itself, with nothing but a stack trace in a terminal that may not even be
+ * open. A crashed process is worse than a noisy one: the download can be
+ * resumed, but the person has to notice first.
+ *
+ * So: log loudly, keep running, and record it where the app can show it. If the
+ * same fault repeats it is visible in `npm run doctor` instead of being retold.
+ */
+const CRASH_LOG = path.join(jobsStore.DATA_DIR, 'crash.log');
+
+function recordCrash(kind, err) {
+  const when = new Date().toISOString();
+  const message = err && err.stack ? err.stack : String(err);
+  console.error(`\n[survived] ${kind} — the server is still running:\n${message}\n`);
+  try {
+    jobsStore.DATA_DIR && require('fs').mkdirSync(jobsStore.DATA_DIR, { recursive: true });
+    require('fs').appendFileSync(
+      CRASH_LOG,
+      `${when} ${kind} · ${version.describe().commit || '?'}\n${message}\n\n`,
+    );
+  } catch {
+    /* the log is best effort; the console line above is not */
+  }
+}
+
+process.on('uncaughtException', (err) => recordCrash('uncaughtException', err));
+process.on('unhandledRejection', (reason) => recordCrash('unhandledRejection', reason));
+
+/* --------------------------------------------------------------------- boot */
+
+async function main() {
+  await jobsStore.init();
+  ensureSample().catch((err) => console.warn('Sample clip unavailable:', err.message));
+  const ytdlp = await sources.hasYtdlp();
+  console.log(`Squeeze listening on http://0.0.0.0:${PORT} (yt-dlp: ${ytdlp ? ytdlp.version : 'not installed'})`);
+  /* The first line after a crash: which build is this, and are the fixes in? */
+  console.log(version.banner());
+  /* ...and is it the *published* build? Twice now, "still broken" meant "the
+     machine never pulled". Asked in the background so a slow remote cannot
+     delay the first request. */
+  if (process.env.BUILD_CHECK !== '0') {
+    version
+      .checkRemote()
+      .then((status) => {
+        const line = version.freshnessLine(status);
+        if (line) console.log(line);
+      })
+      .catch(() => {});
+  }
+
+  const mail = mailsettings.describe();
+  if (mail.configured) {
+    console.log(`Mail: links go to ${mail.to} via ${mail.host}:${mail.port} (${mail.source === 'saved' ? 'saved in the app' : 'environment'})`);
+  } else {
+    console.log('Mail: not set up — the app offers a mailto: link instead (see the mail panel on the page)');
+  }
+  if (envFile.loaded && envFile.keys.length) {
+    console.log(`Loaded ${envFile.keys.join(', ')} from ${path.basename(envFile.path)}`);
+  }
+
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  console.log(`Free disk: ${formatGb(free)} in ${jobsStore.DATA_DIR}`);
+  if (free < 5 * 1024 ** 3) {
+    console.warn(
+      `[disk] Only ${formatGb(free)} free. A 4K file needs roughly three times its own size ` +
+        `while it encodes. Reclaim space with: npm run disk -- --clean`,
+    );
+  }
+  /* The allowance meter: sample the size of data/ once a minute and credit the
+     time to the month. It starts after the data directory exists. */
+  const meter = await usage.init();
+  if (meter.month.coreHours > 0) {
+    console.log(
+      `Usage: ${meter.month.coreHours} of ${meter.month.quotaCoreHours} core-hours this month ` +
+        `(~${meter.month.machineHoursLeft} h of this ${meter.settings.cores}-core machine left)`,
+    );
+  }
+  setInterval(async () => {
+    usage.tick(await storage.dirSize(jobsStore.DATA_DIR).catch(() => 0));
+  }, usageFactory.TICK_MS).unref();
+
+  app.listen(PORT, '0.0.0.0');
+  await resumeInterrupted();
+  resumeHosting();
+}
+
+/**
+ * A machine that stops mid-encode (a closed laptop, a stopped Codespace, a
+ * reboot) leaves the source file behind. Pick those jobs up instead of leaving
+ * the user to guess whether it finished. Set RESUME_INTERRUPTED=0 to opt out.
+ */
+async function resumeInterrupted() {
+  if (process.env.RESUME_INTERRUPTED === '0') return;
+
+  /* Stopped while a link was still being read: nothing was fetched and nothing
+     is on disk, so the work to redo is one page read — and the card would
+     otherwise sit on "Reading the link" forever. */
+  const stillReading = jobsStore
+    .listJobs()
+    .filter((job) => job.resolving && job.url && !job.ref && job.source === 'url');
+  if (stillReading.length) {
+    console.log(`[resume] ${stillReading.length} job(s) were still reading their link — reading them again`);
+    for (const job of stillReading.reverse()) {
+      jobsStore.updateJob(job, { status: 'queued', stage: 'Reading the link again after the restart', progress: 0 });
+      readLinkIntoJob(job);
+    }
+  }
+
+  const interrupted = jobsStore
+    .listJobs()
+    .filter((job) => job.interrupted && !job.hostedUrl);
+
+  /* Stopped after the download, before or during the encode: the source is
+     whole, so the encoder just starts again. */
+  const encode = interrupted
+    .filter((job) => ['compressing', 'queued'].includes(job.interruptedFrom))
+    .filter((job) => fs.existsSync(jobsStore.jobPaths(job).source));
+
+  /* Stopped in the middle of the download: the fragment on disk is kept and the
+     transfer continues from there with a Range request — a 1 GB file on a slow
+     host should not be paid for twice. */
+  const fetchAgain = interrupted
+    .filter((job) => job.interruptedFrom === 'fetching' && job.ref && (job.url || job.ref.url))
+    .filter((job) => ['url', 'relay', 'ytdlp'].includes(job.source));
+
+  const candidates = [...encode, ...fetchAgain];
+  if (!candidates.length) return;
+
+  const free = await sources.freeDiskBytes(jobsStore.DATA_DIR);
+  const resumable = [];
+  for (const job of candidates) {
+    const need = Math.max((Number(job.sourceBytes) || 0) * 1.2, 512 * 1024 ** 2);
+    if (free < need) {
+      console.warn(`[resume] not enough space to finish ${job.id} (${formatGb(free)} free)`);
+      continue;
+    }
+    resumable.push(job);
+  }
+  if (!resumable.length) return;
+  console.log(
+    `[resume] picking up ${resumable.length} interrupted job(s) ` +
+      `(${encode.length} to finish encoding, ${fetchAgain.length} to download again)`,
+  );
+
+  for (const job of resumable.reverse()) {
+    job.resumed = true;
+    if (encode.includes(job)) {
+      startCompression(job);
+      continue;
+    }
+    jobsStore.updateJob(job, {
+      status: 'queued',
+      stage: 'Picking up the download again',
+      progress: 0,
+      error: null,
+      interrupted: false,
+      resumed: true,
+    });
+    fetchThenCompress(job, job.ref);
+  }
+}
+
+/**
+ * A finished encode whose upload never happened (the machine stopped, the tab
+ * closed, the host timed out) still has its MP4 on disk. Pick those up at
+ * startup instead of making the user notice and press a button.
+ */
+async function resumeHosting() {
+  if (!AUTO_HOST) return;
+  const stale = jobsStore
+    .listJobs()
+    .filter((job) => job.status === 'done' && !job.hostedUrl && !job.hosting)
+    .filter((job) => fs.existsSync(jobsStore.jobPaths(job).output));
+  if (!stale.length) return;
+  console.log(`[resume] ${stale.length} finished file(s) still need a share link`);
+  for (const job of stale) {
+    await hostJob(job, { order: job.hostOrder }).catch((err) => {
+      console.warn(`[resume] ${job.id}: ${err.message}`);
+    });
+  }
+}
+
+if (require.main === module) main();
+
+module.exports = app;

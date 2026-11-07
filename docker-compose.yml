@@ -1,0 +1,20 @@
+services:
+  squeeze:
+    build: .
+    image: squeeze:latest
+    container_name: squeeze
+    ports:
+      - "3000:3000"
+    environment:
+      DATA_DIR: /data
+      MAX_UPLOAD_MB: "6144"
+      MAX_CONCURRENT: "1"
+      # HOSTERS: gofile,pixeldrain,catbox
+      # GOFILE_TOKEN: ""        # optional: keep uploads in one gofile account
+      # PIXELDRAIN_KEY: ""      # optional: keep uploads in one pixeldrain account
+    volumes:
+      - squeeze-data:/data
+    restart: unless-stopped
+
+volumes:
+  squeeze-data:

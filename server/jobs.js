@@ -1,0 +1,451 @@
+'use strict';
+
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { EventEmitter } = require('node:events');
+
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const JOBS_DIR = path.join(DATA_DIR, 'jobs');
+const TMP_DIR = path.join(DATA_DIR, 'tmp');
+const UPLOADS_DIR = path.join(TMP_DIR, 'uploads');
+
+const MAX_AGE_MS = 3 * 60 * 60 * 1000; // finished jobs are cleared after 3h
+/* Unfinished work is kept far longer: it is the only copy of a file the user
+   has already waited for. Coming back the next morning should still find the
+   download and the encoded parts where they were left. */
+const KEEP_UNFINISHED_MS = Number(process.env.KEEP_UNFINISHED_HOURS || 24) * 60 * 60 * 1000;
+const STORE_PATH = path.join(DATA_DIR, 'jobs.json');
+const MAX_RECORDS = 300;
+
+/** @type {Map<string, any>} */
+const jobs = new Map();
+const bus = new EventEmitter();
+bus.setMaxListeners(0);
+
+async function init() {
+  await fsp.mkdir(JOBS_DIR, { recursive: true });
+  await fsp.mkdir(TMP_DIR, { recursive: true });
+  await fsp.mkdir(UPLOADS_DIR, { recursive: true });
+
+  // Restore job records (and their hosted links) from the previous run.
+  const raw = await fsp.readFile(STORE_PATH, 'utf8').catch(() => null);
+  if (raw) {
+    try {
+      for (const record of JSON.parse(raw)) {
+        if (!record || !record.id) continue;
+        const job = { ...record, dir: path.join(JOBS_DIR, record.id), abort: null };
+        // Anything mid-flight when the process died is not running now.
+        if (!['done', 'hosted', 'error'].includes(job.status)) {
+          const wasDoing = job.status;
+          job.interrupted = true;
+          job.interruptedFrom = wasDoing;
+          job.status = 'error';
+          /* Stopped during the upload: the encode is finished and its MP4 is on
+             disk, so there is nothing left but the upload. (This used to test
+             job.status after overwriting it with "error", so it never fired.) */
+          if (wasDoing === 'hosting' && fs.existsSync(path.join(job.dir, 'output.mp4'))) {
+            job.status = 'done';
+            job.stage = 'Ready (upload interrupted)';
+            job.error = null;
+            job.hostError = 'The upload was interrupted when the machine stopped. It is retried automatically.';
+          } else {
+            job.stage = 'Interrupted';
+            job.error =
+              'The machine stopped before this finished. It is picked up again automatically when the server starts.';
+          }
+        }
+        jobs.set(job.id, job);
+      }
+    } catch {
+      /* corrupt store: start clean */
+    }
+  }
+
+  // Remove working files from jobs that are too old (kept for their links).
+  const now = Date.now();
+  const entries = await fsp.readdir(JOBS_DIR).catch(() => []);
+  for (const name of entries) {
+    const job = jobs.get(name);
+    if (expired(job, now)) {
+      await fsp.rm(path.join(JOBS_DIR, name), { recursive: true, force: true }).catch(() => {});
+      if (job) jobs.delete(name);
+    }
+  }
+}
+
+let persistTimer = null;
+
+async function writeStore() {
+  const records = [...jobs.values()]
+    /* A queued job with nothing on disk is a request that has not become work
+       yet — except while it is reading its link, when the card is the only
+       visible thing the user has. That one is kept, or a restart makes it
+       vanish from the list and the work with it. */
+    .filter((job) => job.status !== 'queued' || job.sourceBytes || job.resolving)
+    .slice(-MAX_RECORDS)
+    .map((job) => {
+      const { abort, ...rest } = job; // eslint-disable-line no-unused-vars
+      return rest;
+    });
+  const tmp = `${STORE_PATH}.tmp`;
+  try {
+    await fsp.writeFile(tmp, JSON.stringify(records));
+    await fsp.rename(tmp, STORE_PATH);
+  } catch {
+    /* disk full or race: the in-memory index is still correct */
+  }
+}
+
+/** Write the job index to disk (debounced, atomic). */
+function persist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    writeStore();
+  }, 400);
+  if (persistTimer.unref) persistTimer.unref();
+}
+
+/** Write immediately — used for terminal states so a crash cannot lose a link. */
+function persistNow() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  return writeStore();
+}
+
+function createJob(fields = {}) {
+  const id = crypto.randomBytes(6).toString('base64url');
+  const job = {
+    id,
+    createdAt: Date.now(),
+    status: 'queued', // queued | fetching | awaiting-upload | uploading | compressing | done | error
+    stage: 'Queued',
+    progress: 0,
+    speed: null,
+    etaSeconds: null,
+    source: fields.source || 'upload', // upload | url | ytdlp | sample | relay
+    url: fields.url || null,
+    name: fields.name || null,
+    /* The <title> of the page the link points at: what a browser tab shows. */
+    sourceTitle: fields.sourceTitle || null,
+    presetId: fields.presetId || 'balanced',
+    targetMb: fields.targetMb || null,
+    /* "Just download": fetch the file and hand it back untouched, no encode. */
+    noCompress: Boolean(fields.noCompress),
+    ref: fields.ref || null,
+    /* Preferred upload hosts for this job, in order; empty means the server's
+       default chain. */
+    hostOrder: Array.isArray(fields.hostOrder) ? fields.hostOrder.slice(0, 6) : [],
+    sourceBytes: 0,
+    outputBytes: 0,
+    meta: null,
+    outputName: null,
+    note: null,
+    error: null,
+  };
+  job.dir = path.join(JOBS_DIR, id);
+  fs.mkdirSync(job.dir, { recursive: true });
+  jobs.set(id, job);
+  persist();
+  return job;
+}
+
+const getJob = (id) => jobs.get(id) || null;
+
+const TERMINAL = new Set(['done', 'hosted', 'error']);
+
+/* Statuses where a file is open, being written or about to be. A job in one of
+   these is *working*, not old, however long it has been working for. */
+const ACTIVE = new Set(['queued', 'fetching', 'uploading', 'awaiting-upload', 'compressing', 'hosting']);
+const isActive = (job) => ACTIVE.has(job && job.status);
+
+function updateJob(job, patch) {
+  Object.assign(job, patch);
+  /* When it ended, not when it began. A 4K encode can take hours, and a job
+     that has just finished must not look three hours old to the sweeper. */
+  if (patch.status && TERMINAL.has(patch.status)) {
+    if (!job.finishedAt) job.finishedAt = Date.now();
+  } else if (patch.status && !TERMINAL.has(patch.status)) {
+    job.finishedAt = null;
+  }
+  bus.emit('update', job);
+  // A share link or a failure must survive an immediate crash.
+  if (patch.status && TERMINAL.has(patch.status)) persistNow();
+  else persist();
+}
+
+/** Recent jobs, newest first. */
+function listJobs() {
+  return [...jobs.values()].sort((a, b) => b.createdAt - a.createdAt);
+}
+
+function jobPaths(job) {
+  return {
+    dir: job.dir,
+    source: path.join(job.dir, 'source'),
+    output: path.join(job.dir, 'output.mp4'),
+    thumb: path.join(job.dir, 'thumb.jpg'),
+  };
+}
+
+const jobsStorePath = (job) => path.join(job.dir, 'output.mp4');
+
+/* The server knows how a finished file will be named; jobs.js does not, and
+   duplicating that rule here would drift. The server installs a hook instead. */
+let viewHook = null;
+
+function setViewHook(fn) {
+  viewHook = typeof fn === 'function' ? fn : null;
+}
+
+/** Bytes of the original download on disk (0 when there is none yet). */
+function sourceBytesOf(job) {
+  try {
+    return fs.statSync(path.join(job.dir, 'source')).size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * True when the source file is complete: the whole download is on disk, so it
+ * can be handed to the browser instead of the encode's output.
+ *
+ * A file being written cannot be served — a truncated MP4 does not play — so a
+ * transfer that is still running is reported as not ready, and the page waits
+ * for it rather than saving half a video.
+ */
+function sourceIsWhole(job) {
+  const bytes = sourceBytesOf(job);
+  if (!bytes) return false;
+  const total = Number(job.downloadTotal) || 0;
+  if (total > 0) return bytes >= total;
+  /* No size was ever reported: the only proof the transfer finished is that
+     the job moved past it. A failed download is not "whole". */
+  return ['compressing', 'awaiting-upload', 'done', 'hosting', 'hosted'].includes(job.status);
+}
+
+/**
+ * Is another attempt worth offering?
+ *
+ * Yes when something survived that a retry can use: a whole source (no download
+ * needed), a partial one (the transfer resumes), or any finished parts (the
+ * encoder skips them). A job that failed before a single byte arrived has
+ * nothing to continue, and gets no button that would lie.
+ */
+function canRetry(job) {
+  if (!job || job.status !== 'error') return false;
+  if (job.interrupted) return false;
+  try {
+    if (fs.statSync(path.join(job.dir, 'source')).size > 0) return true;
+  } catch {
+    /* no source */
+  }
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(job.dir, 'segments.json'), 'utf8'));
+    if (state && Array.isArray(state.done) && state.done.length) return true;
+  } catch {
+    /* no parts */
+  }
+  return false;
+}
+
+function publicView(job) {
+  job.canRetry = canRetry(job);
+  const view = {
+    id: job.id,
+    status: job.status,
+    stage: job.stage,
+    progress: Math.round(job.progress * 1000) / 1000,
+    speed: job.speed,
+    etaSeconds: job.etaSeconds,
+    source: job.source,
+    url: job.url,
+    resolver: job.ref ? job.ref.resolver : null,
+    name: job.name,
+    presetId: job.presetId,
+    targetMb: job.targetMb,
+    sourceBytes: job.sourceBytes,
+    outputBytes: job.outputBytes,
+    meta: job.meta,
+    outputName: job.outputName,
+    saved: job.saved ?? null,
+    audioMode: job.audioMode || null,
+    twoPass: Boolean(job.twoPass),
+    scaledTo: job.scaledTo || null,
+    outputSize: job.outputSize || null,
+    usedOriginal: Boolean(job.usedOriginal),
+    noCompress: Boolean(job.noCompress),
+    localDeleted: Boolean(job.localDeleted),
+    downloadSpeed: job.downloadSpeed || null,
+    downloadEta: job.downloadEta || null,
+    downloadResumed: Boolean(job.downloadResumed),
+    /* The link is still being read (a page behind a bot check takes a minute).
+       The card must not look stuck while it happens. */
+    resolving: Boolean(job.resolving),
+    /* True when the video had to be fetched inside a browser because its CDN
+       refuses every request the app can make. The card says so. */
+    streamViaBrowser: Boolean(job.streamViaBrowser),
+    projection: job.projection || null,
+    hostedUrl: job.hostedUrl || null,
+    /* Keep this job's files through the sweeper (the storage panel toggles it). */
+    pinLocal: Boolean(job.pinLocal),
+    hostProvider: job.hostProvider || null,
+    hostError: job.hostError || null,
+    hostedBy: job.hostedBy || null,
+    note: job.note,
+    error: job.error,
+    hasThumb: fs.existsSync(path.join(job.dir, 'thumb.jpg')),
+    hasFile:
+      ['done', 'hosting', 'hosted'].includes(job.status) && fs.existsSync(jobsStorePath(job)),
+    /* The untouched download. "Just download it" hands this back, so the page
+       has to know whether it is already whole — and the job card can offer the
+       original before the encode finishes. */
+    originalBytes: sourceBytesOf(job),
+    originalReady: sourceIsWhole(job),
+    originalName: job.name || 'original.mp4',
+    /* The user asked for the untouched file as well as the compressed one. It
+       is delivered now and the encode carries on, so this is a request, not a
+       mode: the job still ends with a share link for the smaller file. */
+    wantOriginal: Boolean(job.wantOriginal),
+    /* A failure kept enough on disk to carry on from. The card offers "Try
+       again" only when that is true, so the button is never a bluff. */
+    canRetry: Boolean(job.canRetry),
+    hosting: Boolean(job.hosting),
+    /* True once the queue picked this up after the machine stopped. */
+    resumed: Boolean(job.resumed),
+    /* Resumable encodes: how many parts exist, and where a restart picked up. */
+    sourceTitle: job.sourceTitle || null,
+    segmentsDone: Number(job.segmentsDone) || 0,
+    segmentsTotal: Number(job.segmentsTotal) || 0,
+    resumeFrom: typeof job.resumeFrom === 'number' ? job.resumeFrom : null,
+  };
+  if (viewHook) {
+    try {
+      Object.assign(view, viewHook(job) || {});
+    } catch {
+      /* a view hook must never break a status update */
+    }
+  }
+  return view;
+}
+
+async function removeJob(id) {
+  const job = jobs.get(id);
+  if (!job) return false;
+  jobs.delete(id);
+  await fsp.rm(job.dir, { recursive: true, force: true }).catch(() => {});
+  return true;
+}
+
+const HOSTED_RECORD_MS = 30 * 24 * 60 * 60 * 1000; // a share link stays useful for a month
+
+/* Installed by the server: "is an encoder working on this id right now?". */
+let busyHook = null;
+function setBusyHook(fn) {
+  busyHook = typeof fn === 'function' ? fn : null;
+}
+/** Is an encoder (or a download) actually on this job right now? */
+const isBusy = (id) => Boolean(busyHook && busyHook(id));
+
+/**
+ * Should this job's working files go?
+ *
+ * One rule, used by the startup scan and the sweeper, because two places that
+ * disagree are how a job that is still encoding gets deleted: a busy job is
+ * never expired, a finished job is measured from when it finished, and an
+ * unfinished one gets the long limit (its files are what makes a retry cheap).
+ */
+function expired(job, now = Date.now()) {
+  if (!job) return true; // a directory with no record is debris
+  if (job.pinLocal) return false;
+  if (ACTIVE.has(job.status)) return false;
+  /* Belt and braces. The status is the first line of defence, but a status can
+     be wrong for a second (a retry starting, a failure handler running), and
+     deleting a directory an encoder is writing into destroys hours of work.
+     The server knows which job ids have an encoder on them; it says so here. */
+  if (busyHook && busyHook(job.id)) return false;
+  if (job.hostedUrl) return now - job.createdAt > HOSTED_RECORD_MS;
+  const finished = job.status === 'done' || job.status === 'error';
+  const since = finished ? Number(job.finishedAt) || job.createdAt : job.createdAt;
+  return now - since > (finished ? FINISHED_MS : KEEP_UNFINISHED_MS);
+}
+
+/* How long the *local* copy lingers once a job no longer needs it. The app is
+   for saving a video to a computer, and a computer can be across the room: two
+   hours is long enough to arrive, short enough that a 32 GB Codespace does not
+   fill up. The storage panel shows the deadline for every file, and a pinned
+   job is never swept. */
+const HOSTED_LOCAL_MS = Number(process.env.HOSTED_LOCAL_KEEP_MINUTES || 120) * 60 * 1000;
+const FINISHED_MS = Number(process.env.FINISHED_KEEP_MINUTES || 180) * 60 * 1000;
+
+function sweep() {
+  const now = Date.now();
+  for (const job of jobs.values()) {
+    /* Pinned: the user asked for these files to stay. Disk pressure is handled
+       before a job starts (reclaimSpace), which also respects the pin. */
+    if (job.pinLocal) continue;
+
+    /* A job that is running is not old, it is busy: a 4K encode on a 2-core
+       machine can take longer than MAX_AGE_MS, and this sweep used to delete
+       its directory out from under the encoder — which surfaced as
+       "ENOENT: no such file or directory, stat …/segments/part-0011.mp4" and
+       threw away hours of work. Nothing that is being worked on is swept. */
+    if (ACTIVE.has(job.status)) continue;
+
+    const age = now - job.createdAt;
+
+    if (job.hostedUrl) {
+      /* The file lives on the host now, so only the local copy is expendable.
+         The clock starts when the upload finished, not when the job was
+         created: a three-hour encode would otherwise have its local copy
+         deleted the moment it became shareable. */
+      const sinceHosted = now - (Number(job.hostedAt) || job.createdAt);
+      if (age > HOSTED_RECORD_MS) removeJob(job.id);
+      else if (sinceHosted > HOSTED_LOCAL_MS) {
+        fsp.rm(job.dir, { recursive: true, force: true }).catch(() => {});
+      }
+      continue;
+    }
+
+    if (expired(job, now)) {
+      /* Say what went, and why. A directory that disappears without a line in
+         the log is how a bug like this one stays invisible for days. */
+      const ageH = Math.round((now - job.createdAt) / 36e5);
+      const since = Number(job.finishedAt) ? `${Math.round((now - job.finishedAt) / 36e5)}h after finishing` : 'never finished';
+      console.log(`[sweep] removing ${job.id} — ${job.status}, ${ageH}h old (${since})`);
+      removeJob(job.id);
+    }
+  }
+  persist();
+}
+
+setInterval(sweep, 10 * 60 * 1000).unref();
+
+module.exports = {
+  setViewHook,
+  bus,
+  DATA_DIR,
+  JOBS_DIR,
+  TMP_DIR,
+  UPLOADS_DIR,
+  init,
+  createJob,
+  getJob,
+  updateJob,
+  listJobs,
+  persist,
+  persistNow,
+  jobPaths,
+  publicView,
+  removeJob,
+  sweep,
+  isActive,
+  ACTIVE,
+  setBusyHook,
+  isBusy,
+};

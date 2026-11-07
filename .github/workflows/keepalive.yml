@@ -1,0 +1,34 @@
+# Keeps a free-tier host (Render sleeps after 15 idle minutes) awake without
+# any third-party account: GitHub's scheduler pings the health endpoint.
+#
+# Set the repository variable SQUEEZE_URL to your app, e.g.
+#   Settings -> Secrets and variables -> Actions -> Variables -> New variable
+#   SQUEEZE_URL = https://squeeze-xxxx.onrender.com
+#
+# If the variable is missing the job is a no-op, so forks stay quiet.
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the app
+        env:
+          URL: ${{ vars.SQUEEZE_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "SQUEEZE_URL is not set; nothing to ping."
+            exit 0
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "$URL/api/health" || true)
+          echo "GET $URL/api/health -> $code"
+          # A cold start can take a minute; only fail on a real error code.
+          case "$code" in
+            200|502|503|000) exit 0 ;;
+            *) exit 1 ;;
+          esac

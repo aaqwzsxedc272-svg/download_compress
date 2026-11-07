@@ -1,0 +1,41 @@
+name: Compress a video
+description: Paste a link and get a compressed file plus a share link back. Runs on GitHub's own machines.
+title: "[compress] "
+labels: ["compress"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill this in and press **Submit**. A runner picks it up, downloads the video,
+        compresses it and replies here with a **share link** and a downloadable file.
+        Takes a few minutes; you can close the tab and come back.
+  - type: input
+    id: link
+    attributes:
+      label: Video link
+      description: gofile, pixeldrain, turbo.cr, bunkr, filester, a direct .mp4/.webm, or any page with a video on it.
+      placeholder: https://pixeldrain.com/u/xxxxxxxx
+    validations:
+      required: true
+  - type: dropdown
+    id: quality
+    attributes:
+      label: Quality
+      description: High keeps the full resolution; the smaller presets shrink the picture too.
+      options:
+        - High quality
+        - Balanced
+        - Small
+        - Tiny
+        - Max quality
+      default: 0
+    validations:
+      required: true
+  - type: input
+    id: fit
+    attributes:
+      label: Fit in N MB (optional)
+      description: Leave blank to let the preset decide. Set it to guarantee a size, e.g. 25.
+      placeholder: "25"
+    validations:
+      required: false
